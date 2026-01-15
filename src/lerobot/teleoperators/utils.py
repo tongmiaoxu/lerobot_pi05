@@ -81,6 +81,14 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .reachy2_teleoperator import Reachy2Teleoperator
 
         return Reachy2Teleoperator(config)
+    elif config.type == "aloha_leader":
+        from .aloha_leader import AlohaLeader
+
+        return AlohaLeader(config)
+    elif config.type == "bi_aloha_leader":
+        from .aloha_leader import BiAlohaLeader
+
+        return BiAlohaLeader(config)
     else:
         try:
             return cast(Teleoperator, make_device_from_device_class(config))
