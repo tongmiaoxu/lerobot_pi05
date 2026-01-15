@@ -1,0 +1,18 @@
+python src/lerobot/scripts/lerobot_train.py \
+    --dataset.repo_id=pick_cuber_v30 \
+    --dataset.root=/home/tongmiao/Documents/pick_cuber_v30 \
+    --policy.type=pi05 \
+    --policy.pretrained_path=lerobot/pi05_base \
+    --policy.repo_id=tongmiao/pi05_pick_cube \
+    --policy.push_to_hub=true \
+    --output_dir=./outputs/pi05_pick_cube \
+    --job_name=pi05_pick_cube \
+    --policy.compile_model=false \
+    --policy.gradient_checkpointing=true \
+    --policy.train_expert_only=true \
+    --policy.dtype=bfloat16 \
+    --policy.device=cuda \
+    --batch_size=4 \
+    --steps=3000 \
+    --wandb.enable=true \
+    --wandb.project=pi05_aloha
