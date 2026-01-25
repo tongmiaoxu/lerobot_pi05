@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config import TeleoperatorConfig
 
@@ -31,8 +32,16 @@ class AlohaLeaderConfig(TeleoperatorConfig):
     - xc430-w150 for gripper
     """
 
+    # Default calibration directory for ALOHA leader arms
+    calibration_dir: Path | None = Path(".cache/calibration/aloha_leader")
+
     # Port to connect to the leader arm
     port: str = "/dev/ttyDXL_master_left"
+
+    # Use raw motor positions instead of normalized positions
+    # Must match follower's use_raw_positions setting!
+    # Set to False for proper teleoperation (normalized positions work across different motor models)
+    use_raw_positions: bool = False
 
 
 @TeleoperatorConfig.register_subclass("bi_aloha_leader")
@@ -47,6 +56,23 @@ class BiAlohaLeaderConfig(TeleoperatorConfig):
     The leader arms are used for teleoperation to control the follower arms.
     Each arm has 9 motors (including shadow motors for shoulder and elbow).
     """
+
+    # Default id for ALOHA teleoperator
+    id: str = "aloha"
+
+    # Default calibration directory for ALOHA leader arms
+    # Contains aloha_left.json and aloha_right.json converted from old ALOHA calibration files
+    calibration_dir: Path | None = Path(".cache/calibration/aloha_leader")
+
+    # Which arms to use (set to False to disable an arm for single-arm operation)
+    # Left arm disabled by default for testing
+    use_left_arm: bool = True
+    use_right_arm: bool = True
+
+    # Use raw motor positions instead of normalized positions
+    # Must match follower's use_raw_positions setting!
+    # Set to False for proper teleoperation (normalized positions work across different motor models)
+    use_raw_positions: bool = False
 
     # Ports to connect to the left and right leader arms
     left_port: str = "/dev/ttyDXL_master_left"

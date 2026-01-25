@@ -45,27 +45,36 @@ class BiAlohaLeader(Teleoperator):
         super().__init__(config)
         self.config = config
 
-        # Create left and right leader arms
-        left_arm_config = AlohaLeaderConfig(
-            id=f"{config.id}_left" if config.id else "left",
-            calibration_dir=config.calibration_dir,
-            port=config.left_port,
-        )
+        # Create left and right leader arms based on config
+        self.left_arm = None
+        self.right_arm = None
 
-        right_arm_config = AlohaLeaderConfig(
-            id=f"{config.id}_right" if config.id else "right",
-            calibration_dir=config.calibration_dir,
-            port=config.right_port,
-        )
+        if config.use_left_arm:
+            left_arm_config = AlohaLeaderConfig(
+                id=f"{config.id}_left" if config.id else "left",
+                calibration_dir=config.calibration_dir,
+                port=config.left_port,
+                use_raw_positions=config.use_raw_positions,
+            )
+            self.left_arm = AlohaLeader(left_arm_config)
 
-        self.left_arm = AlohaLeader(left_arm_config)
-        self.right_arm = AlohaLeader(right_arm_config)
+        if config.use_right_arm:
+            right_arm_config = AlohaLeaderConfig(
+                id=f"{config.id}_right" if config.id else "right",
+                calibration_dir=config.calibration_dir,
+                port=config.right_port,
+                use_raw_positions=config.use_raw_positions,
+            )
+            self.right_arm = AlohaLeader(right_arm_config)
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return {f"left_{motor}.pos": float for motor in self.left_arm.bus.motors} | {
-            f"right_{motor}.pos": float for motor in self.right_arm.bus.motors
-        }
+        features = {}
+        if self.left_arm is not None:
+            features.update({f"left_{motor}.pos": float for motor in self.left_arm.bus.motors})
+        if self.right_arm is not None:
+            features.update({f"right_{motor}.pos": float for motor in self.right_arm.bus.motors})
+        return features
 
     @cached_property
     def feedback_features(self) -> dict[str, type]:
@@ -73,31 +82,47 @@ class BiAlohaLeader(Teleoperator):
 
     @property
     def is_connected(self) -> bool:
-        return self.left_arm.is_connected and self.right_arm.is_connected
+        connected = True
+        if self.left_arm is not None:
+            connected = connected and self.left_arm.is_connected
+        if self.right_arm is not None:
+            connected = connected and self.right_arm.is_connected
+        return connected
 
     def connect(self, calibrate: bool = True) -> None:
-        """Connect both leader arms."""
-        self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        """Connect enabled leader arms."""
+        if self.left_arm is not None:
+            self.left_arm.connect(calibrate)
+        if self.right_arm is not None:
+            self.right_arm.connect(calibrate)
         logger.info(f"{self} connected.")
 
     @property
     def is_calibrated(self) -> bool:
-        return self.left_arm.is_calibrated and self.right_arm.is_calibrated
+        calibrated = True
+        if self.left_arm is not None:
+            calibrated = calibrated and self.left_arm.is_calibrated
+        if self.right_arm is not None:
+            calibrated = calibrated and self.right_arm.is_calibrated
+        return calibrated
 
     def calibrate(self) -> None:
-        """Calibrate both leader arms."""
-        self.left_arm.calibrate()
-        self.right_arm.calibrate()
+        """Calibrate enabled leader arms."""
+        if self.left_arm is not None:
+            self.left_arm.calibrate()
+        if self.right_arm is not None:
+            self.right_arm.calibrate()
 
     def configure(self) -> None:
-        """Configure both leader arms."""
-        self.left_arm.configure()
-        self.right_arm.configure()
+        """Configure enabled leader arms."""
+        if self.left_arm is not None:
+            self.left_arm.configure()
+        if self.right_arm is not None:
+            self.right_arm.configure()
 
     def get_action(self) -> dict[str, float]:
         """
-        Read positions from both leader arms.
+        Read positions from enabled leader arms.
 
         Returns:
             Dictionary with keys like "left_waist.pos", "right_gripper.pos", etc.
@@ -105,12 +130,14 @@ class BiAlohaLeader(Teleoperator):
         action_dict = {}
 
         # Get left arm action with "left_" prefix
-        left_action = self.left_arm.get_action()
-        action_dict.update({f"left_{key}": value for key, value in left_action.items()})
+        if self.left_arm is not None:
+            left_action = self.left_arm.get_action()
+            action_dict.update({f"left_{key}": value for key, value in left_action.items()})
 
         # Get right arm action with "right_" prefix
-        right_action = self.right_arm.get_action()
-        action_dict.update({f"right_{key}": value for key, value in right_action.items()})
+        if self.right_arm is not None:
+            right_action = self.right_arm.get_action()
+            action_dict.update({f"right_{key}": value for key, value in right_action.items()})
 
         return action_dict
 
@@ -119,25 +146,29 @@ class BiAlohaLeader(Teleoperator):
         Send feedback to the leader arms (not implemented for ALOHA).
         """
         # Split feedback by arm prefix
-        left_feedback = {
-            key.removeprefix("left_"): value
-            for key, value in feedback.items()
-            if key.startswith("left_")
-        }
-        right_feedback = {
-            key.removeprefix("right_"): value
-            for key, value in feedback.items()
-            if key.startswith("right_")
-        }
+        if self.left_arm is not None:
+            left_feedback = {
+                key.removeprefix("left_"): value
+                for key, value in feedback.items()
+                if key.startswith("left_")
+            }
+            if left_feedback:
+                self.left_arm.send_feedback(left_feedback)
 
-        if left_feedback:
-            self.left_arm.send_feedback(left_feedback)
-        if right_feedback:
-            self.right_arm.send_feedback(right_feedback)
+        if self.right_arm is not None:
+            right_feedback = {
+                key.removeprefix("right_"): value
+                for key, value in feedback.items()
+                if key.startswith("right_")
+            }
+            if right_feedback:
+                self.right_arm.send_feedback(right_feedback)
 
     def disconnect(self) -> None:
-        """Disconnect both leader arms."""
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        """Disconnect enabled leader arms."""
+        if self.left_arm is not None:
+            self.left_arm.disconnect()
+        if self.right_arm is not None:
+            self.right_arm.disconnect()
         logger.info(f"{self} disconnected.")
 

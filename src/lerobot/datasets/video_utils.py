@@ -16,15 +16,38 @@
 import glob
 import importlib
 import logging
+import os
 import shutil
 import tempfile
 import warnings
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar
 
 import av
+
+
+@contextmanager
+def suppress_stderr():
+    """Context manager to suppress stderr output from C libraries (e.g., SVT-AV1 encoder).
+    
+    This uses os.dup2 to redirect the actual file descriptor, not just Python's sys.stderr,
+    which is necessary to suppress output from C libraries that write directly to stderr.
+    """
+    # Save original stderr file descriptor
+    original_stderr_fd = os.dup(2)
+    # Open /dev/null and redirect stderr to it
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        # Restore original stderr
+        os.dup2(original_stderr_fd, 2)
+        os.close(original_stderr_fd)
 import fsspec
 import pyarrow as pa
 import torch
@@ -362,14 +385,23 @@ def encode_video_frames(
 
     if vcodec == "libsvtav1":
         video_options["preset"] = str(preset) if preset is not None else "12"
+        # Suppress SVT-AV1 verbose output by setting log level to silent (0=fatal only)
+        # Append to existing svtav1-params if present
+        if "svtav1-params" in video_options:
+            video_options["svtav1-params"] += ":loglevel=0"
+        else:
+            video_options["svtav1-params"] = "loglevel=0"
 
     # Set logging level
     if log_level is not None:
         # "While less efficient, it is generally preferable to modify logging with Python's logging"
         logging.getLogger("libav").setLevel(log_level)
 
+    # Suppress verbose encoder output for libsvtav1 (SVT-AV1 writes directly to stderr)
+    stderr_ctx = suppress_stderr() if vcodec == "libsvtav1" else nullcontext()
+
     # Create and open output file (overwrite by default)
-    with av.open(str(video_path), "w") as output:
+    with stderr_ctx, av.open(str(video_path), "w") as output:
         output_stream = output.add_stream(vcodec, fps, options=video_options)
         output_stream.pix_fmt = pix_fmt
         output_stream.width = width

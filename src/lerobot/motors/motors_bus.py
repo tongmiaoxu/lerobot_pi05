@@ -435,7 +435,9 @@ class MotorsBus(abc.ABC):
         try:
             if not self.port_handler.openPort():
                 raise OSError(f"Failed to open port '{self.port}'.")
-            elif handshake:
+            # Set the baud rate before handshake to ensure communication works
+            self.port_handler.setBaudRate(self.default_baudrate)
+            if handshake:
                 self._handshake()
         except (FileNotFoundError, OSError, serial.SerialException) as e:
             raise ConnectionError(

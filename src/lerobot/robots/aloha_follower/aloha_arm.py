@@ -23,7 +23,7 @@ import logging
 import time
 from typing import Any
 
-from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.dynamixel import (
     DynamixelMotorsBus,
@@ -53,25 +53,29 @@ class AlohaArm:
         calibration: dict[str, MotorCalibration] | None = None,
         disable_torque_on_disconnect: bool = True,
         max_relative_target: float | None = 5.0,
+        use_raw_positions: bool = False,
     ):
         self.port = port
         self.arm_id = arm_id
         self.disable_torque_on_disconnect = disable_torque_on_disconnect
         self.max_relative_target = max_relative_target
+        # Use raw positions for teleoperation, normalized for policy deployment
+        self.use_raw_positions = use_raw_positions
 
         # ALOHA follower arm motors configuration
-        # Uses xm540-w270 for main joints and xm430-w350 for wrist_rotate and gripper
+        # Uses xm540-w270 for most joints and xm430-w350 for wrist_rotate and gripper
+        # Using DEGREES mode for joints (like original ALOHA) and RANGE_0_100 for gripper (percentage)
         self.bus = DynamixelMotorsBus(
             port=port,
             motors={
-                "waist": Motor(1, "xm540-w270", MotorNormMode.RANGE_M100_100),
-                "shoulder": Motor(2, "xm540-w270", MotorNormMode.RANGE_M100_100),
-                "shoulder_shadow": Motor(3, "xm540-w270", MotorNormMode.RANGE_M100_100),
-                "elbow": Motor(4, "xm540-w270", MotorNormMode.RANGE_M100_100),
-                "elbow_shadow": Motor(5, "xm540-w270", MotorNormMode.RANGE_M100_100),
-                "forearm_roll": Motor(6, "xm540-w270", MotorNormMode.RANGE_M100_100),
-                "wrist_angle": Motor(7, "xm540-w270", MotorNormMode.RANGE_M100_100),
-                "wrist_rotate": Motor(8, "xm430-w350", MotorNormMode.RANGE_M100_100),
+                "waist": Motor(1, "xm540-w270", MotorNormMode.DEGREES),
+                "shoulder": Motor(2, "xm540-w270", MotorNormMode.DEGREES),
+                "shoulder_shadow": Motor(3, "xm540-w270", MotorNormMode.DEGREES),
+                "elbow": Motor(4, "xm540-w270", MotorNormMode.DEGREES),
+                "elbow_shadow": Motor(5, "xm540-w270", MotorNormMode.DEGREES),
+                "forearm_roll": Motor(6, "xm540-w270", MotorNormMode.DEGREES),
+                "wrist_angle": Motor(7, "xm540-w270", MotorNormMode.DEGREES),
+                "wrist_rotate": Motor(8, "xm430-w350", MotorNormMode.DEGREES),
                 "gripper": Motor(9, "xm430-w350", MotorNormMode.RANGE_0_100),
             },
             calibration=calibration,
@@ -90,7 +94,11 @@ class AlohaArm:
             raise DeviceAlreadyConnectedError(f"AlohaArm {self.arm_id} already connected")
 
         self.bus.connect()
-        if not self.is_calibrated and calibrate:
+        
+        # Skip calibration if calibration data was loaded from file
+        if self.bus.calibration is not None and len(self.bus.calibration) > 0:
+            logger.info(f"Using existing calibration data for {self.arm_id}, skipping calibration check")
+        elif not self.is_calibrated and calibrate:
             logger.info(
                 f"Mismatch between calibration values in the motor and the calibration file "
                 f"or no calibration file found for {self.arm_id}"
@@ -168,12 +176,17 @@ class AlohaArm:
             self.bus.write("Operating_Mode", "gripper", OperatingMode.CURRENT_POSITION.value)
 
     def get_observation(self) -> dict[str, Any]:
-        """Read the current position of all motors."""
+        """Read the current position of all motors.
+        
+        When use_raw_positions=True: Returns raw motor positions for direct teleoperation.
+        When use_raw_positions=False: Returns normalized positions for policy deployment.
+        """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"AlohaArm {self.arm_id} is not connected.")
 
         start = time.perf_counter()
-        obs_dict = self.bus.sync_read("Present_Position")
+        # Use raw or normalized based on mode
+        obs_dict = self.bus.sync_read("Present_Position", normalize=not self.use_raw_positions)
         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"AlohaArm {self.arm_id} read state: {dt_ms:.1f}ms")
@@ -183,6 +196,9 @@ class AlohaArm:
     def send_action(self, action: dict[str, float]) -> dict[str, float]:
         """
         Command arm to move to a target joint configuration.
+
+        When use_raw_positions=True: Expects raw motor positions for direct teleoperation.
+        When use_raw_positions=False: Expects normalized positions for policy deployment.
 
         Args:
             action: Dictionary of motor positions (e.g., {"waist.pos": 0.5, ...})
@@ -197,12 +213,16 @@ class AlohaArm:
 
         # Cap goal position when too far away from present position for safety
         if self.max_relative_target is not None:
-            present_pos = self.bus.sync_read("Present_Position")
+            present_pos = self.bus.sync_read("Present_Position", normalize=not self.use_raw_positions)
             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.max_relative_target)
 
+        # For raw mode, convert to integers (Dynamixel requires int values)
+        if self.use_raw_positions:
+            goal_pos = {key: int(round(val)) for key, val in goal_pos.items()}
+
         # Send goal position to the arm
-        self.bus.sync_write("Goal_Position", goal_pos)
+        self.bus.sync_write("Goal_Position", goal_pos, normalize=not self.use_raw_positions)
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
     def disconnect(self) -> None:

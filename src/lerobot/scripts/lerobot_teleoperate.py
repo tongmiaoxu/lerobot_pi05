@@ -79,6 +79,7 @@ from lerobot.robots import (  # noqa: F401
     reachy2,
     so_follower,
 )
+from lerobot.robots.aloha_follower import AlohaFollower, AlohaFollowerConfig  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -91,6 +92,12 @@ from lerobot.teleoperators import (  # noqa: F401
     omx_leader,
     reachy2_teleoperator,
     so_leader,
+)
+from lerobot.teleoperators.aloha_leader import (  # noqa: F401
+    AlohaLeader,
+    AlohaLeaderConfig,
+    BiAlohaLeader,
+    BiAlohaLeaderConfig,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep

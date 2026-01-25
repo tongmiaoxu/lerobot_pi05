@@ -23,7 +23,7 @@ import time
 from functools import cached_property
 from typing import Any
 
-from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.dynamixel import (
     DynamixelMotorsBus,
@@ -57,19 +57,20 @@ class AlohaLeader(Teleoperator):
         self.config = config
 
         # ALOHA leader arm motors configuration
-        # Uses xm430-w350 for main joints, xl430-w250 for wrist_rotate, xc430-w150 for gripper
+        # Uses xm430-w350 for most joints, xl430-w250 for wrist_rotate and gripper
+        # Using DEGREES mode for joints (like original ALOHA) and RANGE_0_100 for gripper (percentage)
         self.bus = DynamixelMotorsBus(
             port=config.port,
             motors={
-                "waist": Motor(1, "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "shoulder": Motor(2, "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "shoulder_shadow": Motor(3, "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "elbow": Motor(4, "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "elbow_shadow": Motor(5, "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "forearm_roll": Motor(6, "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "wrist_angle": Motor(7, "xm430-w350", MotorNormMode.RANGE_M100_100),
-                "wrist_rotate": Motor(8, "xl430-w250", MotorNormMode.RANGE_M100_100),
-                "gripper": Motor(9, "xc430-w150", MotorNormMode.RANGE_0_100),
+                "waist": Motor(1, "xm430-w350", MotorNormMode.DEGREES),
+                "shoulder": Motor(2, "xm430-w350", MotorNormMode.DEGREES),
+                "shoulder_shadow": Motor(3, "xm430-w350", MotorNormMode.DEGREES),
+                "elbow": Motor(4, "xm430-w350", MotorNormMode.DEGREES),
+                "elbow_shadow": Motor(5, "xm430-w350", MotorNormMode.DEGREES),
+                "forearm_roll": Motor(6, "xm430-w350", MotorNormMode.DEGREES),
+                "wrist_angle": Motor(7, "xm430-w350", MotorNormMode.DEGREES),
+                "wrist_rotate": Motor(8, "xl430-w250", MotorNormMode.DEGREES),
+                "gripper": Motor(9, "xl430-w250", MotorNormMode.RANGE_0_100),
             },
             calibration=self.calibration if self.calibration else None,
         )
@@ -91,7 +92,11 @@ class AlohaLeader(Teleoperator):
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
         self.bus.connect()
-        if not self.is_calibrated and calibrate:
+        
+        # Skip calibration if calibration data was loaded from file
+        if self.calibration is not None and len(self.calibration) > 0:
+            logger.info(f"Using existing calibration data for {self}, skipping calibration check")
+        elif not self.is_calibrated and calibrate:
             logger.info(
                 f"Mismatch between calibration values in the motor and the calibration file "
                 f"or no calibration file found for {self}"
@@ -168,12 +173,18 @@ class AlohaLeader(Teleoperator):
         self.bus.write("Secondary_ID", "elbow_shadow", elbow_id)
 
     def get_action(self) -> dict[str, float]:
-        """Read the current position of all motors as the action to send to follower."""
+        """Read the current position of all motors as the action to send to follower.
+        
+        When use_raw_positions=True: Returns raw motor positions for direct teleoperation.
+        When use_raw_positions=False: Returns normalized positions.
+        """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         start = time.perf_counter()
-        action = self.bus.sync_read("Present_Position")
+        # Use raw or normalized based on config
+        use_raw = getattr(self.config, 'use_raw_positions', True)
+        action = self.bus.sync_read("Present_Position", normalize=not use_raw)
         action = {f"{motor}.pos": val for motor, val in action.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")

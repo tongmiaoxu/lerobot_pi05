@@ -108,6 +108,7 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1,
 )
+from lerobot.robots.aloha_follower import AlohaFollower, AlohaFollowerConfig  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -118,6 +119,12 @@ from lerobot.teleoperators import (  # noqa: F401
     omx_leader,
     reachy2_teleoperator,
     so_leader,
+)
+from lerobot.teleoperators.aloha_leader import (  # noqa: F401
+    AlohaLeader,
+    AlohaLeaderConfig,
+    BiAlohaLeader,
+    BiAlohaLeaderConfig,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -156,8 +163,8 @@ class DatasetRecordConfig:
     num_episodes: int = 50
     # Encode frames in the dataset into video
     video: bool = True
-    # Upload dataset to Hugging Face hub.
-    push_to_hub: bool = True
+    # Upload dataset to Hugging Face hub (default False to avoid auth errors).
+    push_to_hub: bool = False
     # Upload on private repository on the Hugging Face hub.
     private: bool = False
     # Add tags to your dataset on the hub.
@@ -201,8 +208,8 @@ class RecordConfig:
     display_port: int | None = None
     # Whether to  display compressed images in Rerun
     display_compressed_images: bool = False
-    # Use vocal synthesis to read events.
-    play_sounds: bool = True
+    # Use vocal synthesis to read events (disabled by default to avoid Speech Dispatcher errors).
+    play_sounds: bool = False
     # Resume recording on an existing dataset.
     resume: bool = False
 
@@ -487,36 +494,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
+            # State machine: WARMUP <-> RECORDING (ALOHA-style)
+            state = "WARMUP"
+
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                    display_compressed_images=display_compressed_images,
-                )
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
-                    # reset g1 robot
-                    if robot.name == "unitree_g1":
-                        robot.reset()
+                if state == "WARMUP":
+                    # WARMUP state: wait indefinitely for right arrow to start recording
+                    print(f"\n{'='*50}")
+                    print(f"WARMUP - Press RIGHT to start recording episode {dataset.num_episodes}")
+                    print(f"{'='*50}")
 
                     record_loop(
                         robot=robot,
@@ -526,22 +513,67 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
+                        control_time_s=float("inf"),  # Wait indefinitely
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
 
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
+                    if events["stop_recording"]:
+                        break
 
-                dataset.save_episode()
-                recorded_episodes += 1
+                    if events["right_arrow"]:
+                        # Reset event flags and transition to RECORDING
+                        events["right_arrow"] = False
+                        events["exit_early"] = False
+                        state = "RECORDING"
+                        print(">>> Start recording")
+
+                elif state == "RECORDING":
+                    # RECORDING state: record episode, wait for right arrow (save) or left arrow (discard)
+                    print(f"\n{'='*50}")
+                    print(f"RECORDING episode {dataset.num_episodes} - RIGHT=save, LEFT=discard, ESC=stop")
+                    print(f"{'='*50}")
+
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        teleop=teleop,
+                        policy=policy,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        dataset=dataset,
+                        control_time_s=float("inf"),  # Wait indefinitely for keyboard
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
+                    )
+
+                    if events["stop_recording"]:
+                        break
+
+                    if events["right_arrow"]:
+                        # Save episode and go back to warmup
+                        events["right_arrow"] = False
+                        events["exit_early"] = False
+                        dataset.save_episode()
+                        recorded_episodes += 1
+                        print(f">>> Episode saved ({recorded_episodes}/{cfg.dataset.num_episodes})")
+                        state = "WARMUP"
+
+                    elif events["left_arrow"]:
+                        # Discard episode and go back to warmup
+                        events["left_arrow"] = False
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        dataset.clear_episode_buffer()
+                        print(">>> Episode discarded")
+                        state = "WARMUP"
     finally:
-        log_say("Stop recording", cfg.play_sounds, blocking=True)
+        print("\n>>> Stop recording")
 
         if dataset:
             dataset.finalize()
@@ -554,10 +586,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if cfg.dataset.push_to_hub and dataset is not None:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
-        log_say("Exiting", cfg.play_sounds)
+        print(">>> Done")
     return dataset
 
 

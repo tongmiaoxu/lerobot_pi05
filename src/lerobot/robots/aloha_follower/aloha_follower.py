@@ -51,27 +51,45 @@ class AlohaFollower(Robot):
         super().__init__(config)
         self.config = config
 
-        # Create left and right follower arms
-        self.left_arm = AlohaArm(
-            port=config.left_port,
-            arm_id=f"{config.id}_left" if config.id else "left",
-            calibration=self._get_arm_calibration("left"),
-            disable_torque_on_disconnect=config.left_disable_torque_on_disconnect,
-            max_relative_target=config.left_max_relative_target,
-        )
+        # Create left and right follower arms based on config
+        self.left_arm = None
+        self.right_arm = None
 
-        self.right_arm = AlohaArm(
-            port=config.right_port,
-            arm_id=f"{config.id}_right" if config.id else "right",
-            calibration=self._get_arm_calibration("right"),
-            disable_torque_on_disconnect=config.right_disable_torque_on_disconnect,
-            max_relative_target=config.right_max_relative_target,
-        )
+        if config.use_left_arm:
+            self.left_arm = AlohaArm(
+                port=config.left_port,
+                arm_id=f"{config.id}_left" if config.id else "left",
+                calibration=self._get_arm_calibration("left"),
+                disable_torque_on_disconnect=config.left_disable_torque_on_disconnect,
+                max_relative_target=config.left_max_relative_target,
+                use_raw_positions=config.use_raw_positions,
+            )
+
+        if config.use_right_arm:
+            self.right_arm = AlohaArm(
+                port=config.right_port,
+                arm_id=f"{config.id}_right" if config.id else "right",
+                calibration=self._get_arm_calibration("right"),
+                disable_torque_on_disconnect=config.right_disable_torque_on_disconnect,
+                max_relative_target=config.right_max_relative_target,
+                use_raw_positions=config.use_raw_positions,
+            )
 
         self.cameras = make_cameras_from_configs(config.cameras)
 
     def _get_arm_calibration(self, arm_name: str) -> dict | None:
-        """Extract calibration for a specific arm from the combined calibration."""
+        """Extract calibration for a specific arm from the combined calibration or individual files."""
+        import draccus
+        from lerobot.motors import MotorCalibration
+        
+        # First, try to load from individual arm calibration file (e.g., aloha_left.json, aloha_right.json)
+        arm_calibration_fpath = self.calibration_dir / f"{self.id}_{arm_name}.json"
+        if arm_calibration_fpath.is_file():
+            logger.info(f"Loading calibration from {arm_calibration_fpath}")
+            with open(arm_calibration_fpath) as f, draccus.config_type("json"):
+                return draccus.load(dict[str, MotorCalibration], f)
+        
+        # Fall back to extracting from combined calibration
         if not self.calibration:
             return None
 
@@ -86,10 +104,13 @@ class AlohaFollower(Robot):
 
     @property
     def _motors_ft(self) -> dict[str, type]:
-        """Get motor features for both arms with left/right prefixes."""
-        return {f"left_{motor}.pos": float for motor in self.left_arm.bus.motors} | {
-            f"right_{motor}.pos": float for motor in self.right_arm.bus.motors
-        }
+        """Get motor features for enabled arms with left/right prefixes."""
+        features = {}
+        if self.left_arm is not None:
+            features.update({f"left_{motor}.pos": float for motor in self.left_arm.bus.motors})
+        if self.right_arm is not None:
+            features.update({f"right_{motor}.pos": float for motor in self.right_arm.bus.motors})
+        return features
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -109,16 +130,19 @@ class AlohaFollower(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return (
-            self.left_arm.is_connected
-            and self.right_arm.is_connected
-            and all(cam.is_connected for cam in self.cameras.values())
-        )
+        arms_connected = True
+        if self.left_arm is not None:
+            arms_connected = arms_connected and self.left_arm.is_connected
+        if self.right_arm is not None:
+            arms_connected = arms_connected and self.right_arm.is_connected
+        return arms_connected and all(cam.is_connected for cam in self.cameras.values())
 
     def connect(self, calibrate: bool = True) -> None:
-        """Connect both follower arms and all cameras."""
-        self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        """Connect enabled follower arms and all cameras."""
+        if self.left_arm is not None:
+            self.left_arm.connect(calibrate)
+        if self.right_arm is not None:
+            self.right_arm.connect(calibrate)
 
         for cam in self.cameras.values():
             cam.connect()
@@ -127,12 +151,17 @@ class AlohaFollower(Robot):
 
     @property
     def is_calibrated(self) -> bool:
-        return self.left_arm.is_calibrated and self.right_arm.is_calibrated
+        calibrated = True
+        if self.left_arm is not None:
+            calibrated = calibrated and self.left_arm.is_calibrated
+        if self.right_arm is not None:
+            calibrated = calibrated and self.right_arm.is_calibrated
+        return calibrated
 
     def calibrate(self) -> None:
-        """Calibrate both arms."""
-        left_calib = self.left_arm.calibrate()
-        right_calib = self.right_arm.calibrate()
+        """Calibrate enabled arms."""
+        left_calib = self.left_arm.calibrate() if self.left_arm is not None else None
+        right_calib = self.right_arm.calibrate() if self.right_arm is not None else None
 
         # Combine calibrations with prefixes
         self.calibration = {}
@@ -147,21 +176,25 @@ class AlohaFollower(Robot):
             self._save_calibration()
 
     def configure(self) -> None:
-        """Configure both arms."""
-        self.left_arm.configure()
-        self.right_arm.configure()
+        """Configure enabled arms."""
+        if self.left_arm is not None:
+            self.left_arm.configure()
+        if self.right_arm is not None:
+            self.right_arm.configure()
 
     def get_observation(self) -> dict[str, Any]:
-        """Get observations from both arms and all cameras."""
+        """Get observations from enabled arms and all cameras."""
         obs_dict = {}
 
         # Get left arm observations with "left_" prefix
-        left_obs = self.left_arm.get_observation()
-        obs_dict.update({f"left_{key}": value for key, value in left_obs.items()})
+        if self.left_arm is not None:
+            left_obs = self.left_arm.get_observation()
+            obs_dict.update({f"left_{key}": value for key, value in left_obs.items()})
 
         # Get right arm observations with "right_" prefix
-        right_obs = self.right_arm.get_observation()
-        obs_dict.update({f"right_{key}": value for key, value in right_obs.items()})
+        if self.right_arm is not None:
+            right_obs = self.right_arm.get_observation()
+            obs_dict.update({f"right_{key}": value for key, value in right_obs.items()})
 
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
@@ -174,7 +207,7 @@ class AlohaFollower(Robot):
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """
-        Send action commands to both arms.
+        Send action commands to enabled arms.
 
         Args:
             action: Dictionary with keys like "left_waist.pos", "right_gripper.pos", etc.
@@ -182,31 +215,40 @@ class AlohaFollower(Robot):
         Returns:
             The actions actually sent to the motors, potentially clipped.
         """
-        # Split actions by arm prefix
-        left_action = {
-            key.removeprefix("left_"): value
-            for key, value in action.items()
-            if key.startswith("left_")
-        }
-        right_action = {
-            key.removeprefix("right_"): value
-            for key, value in action.items()
-            if key.startswith("right_")
-        }
+        result = {}
 
-        # Send actions to each arm
-        sent_left = self.left_arm.send_action(left_action)
-        sent_right = self.right_arm.send_action(right_action)
+        # Split and send actions for left arm
+        if self.left_arm is not None:
+            left_action = {
+                key.removeprefix("left_"): value
+                for key, value in action.items()
+                if key.startswith("left_")
+            }
+            # Only send if there are actions for this arm
+            if left_action:
+                sent_left = self.left_arm.send_action(left_action)
+                result.update({f"left_{k}": v for k, v in sent_left.items()})
 
-        # Combine sent actions with prefixes
-        return {f"left_{k}": v for k, v in sent_left.items()} | {
-            f"right_{k}": v for k, v in sent_right.items()
-        }
+        # Split and send actions for right arm
+        if self.right_arm is not None:
+            right_action = {
+                key.removeprefix("right_"): value
+                for key, value in action.items()
+                if key.startswith("right_")
+            }
+            # Only send if there are actions for this arm
+            if right_action:
+                sent_right = self.right_arm.send_action(right_action)
+                result.update({f"right_{k}": v for k, v in sent_right.items()})
+
+        return result
 
     def disconnect(self) -> None:
-        """Disconnect both arms and all cameras."""
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        """Disconnect enabled arms and all cameras."""
+        if self.left_arm is not None:
+            self.left_arm.disconnect()
+        if self.right_arm is not None:
+            self.right_arm.disconnect()
 
         for cam in self.cameras.values():
             cam.disconnect()

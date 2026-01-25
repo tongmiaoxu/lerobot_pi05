@@ -128,13 +128,17 @@ def init_keyboard_listener():
         - The `pynput.keyboard.Listener` instance, or `None` if in a headless environment.
         - A dictionary of event flags (e.g., `exit_early`) that are set by key presses.
     """
-    # Allow to exit early while recording an episode or resetting the environment,
-    # by tapping the right arrow key '->'. This might require a sudo permission
-    # to allow your terminal to monitor keyboard events.
+    # Keyboard events for state machine control (ALOHA-style):
+    # - Right arrow: transition from warmup to recording, or save episode during recording
+    # - Left arrow: discard current episode during recording
+    # - ESC: exit completely
+    # This might require a sudo permission to allow your terminal to monitor keyboard events.
     events = {}
-    events["exit_early"] = False
-    events["rerecord_episode"] = False
-    events["stop_recording"] = False
+    events["right_arrow"] = False  # Start recording / Save episode
+    events["left_arrow"] = False   # Discard episode
+    events["stop_recording"] = False  # ESC - exit completely
+    events["exit_early"] = False  # Generic exit flag (for compatibility)
+    events["rerecord_episode"] = False  # Alias for left_arrow (for compatibility)
 
     if is_headless():
         logging.warning(
@@ -149,18 +153,17 @@ def init_keyboard_listener():
     def on_press(key):
         try:
             if key == keyboard.Key.right:
-                print("Right arrow key pressed. Exiting loop...")
-                events["exit_early"] = True
+                events["right_arrow"] = True
+                events["exit_early"] = True  # Also set for compatibility
             elif key == keyboard.Key.left:
-                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
-                events["rerecord_episode"] = True
+                events["left_arrow"] = True
+                events["rerecord_episode"] = True  # Alias for compatibility
                 events["exit_early"] = True
             elif key == keyboard.Key.esc:
-                print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
         except Exception as e:
-            print(f"Error handling key press: {e}")
+            pass  # Silently ignore keyboard errors
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
