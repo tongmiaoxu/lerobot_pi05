@@ -70,3 +70,15 @@ lerobot-teleoperate \
     --teleop.type=bi_aloha_leader \
     --fps=30
 ```
+### Replay in mujoco 
+```bash
+python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path /home/tongmiao/Documents/pick_cuber_v30     --episode 0
+```
+### Compare Recorded vs MuJoCo
+
+```bash
+python visual_match/compare_recorded_vs_mujoco.py \
+    --dataset-path /home/tongmiao/Documents/pick_cuber_v30 \
+    --episode 0 
+ 
+```
