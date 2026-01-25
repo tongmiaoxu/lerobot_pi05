@@ -45,22 +45,16 @@ from mujoco import MjModel, MjData
 # Check if OpenCV has GUI support
 _HAS_OPENCV_GUI = False
 try:
+    # Check if cv2 is properly loaded (not just a namespace package)
+    if not hasattr(cv2, 'namedWindow'):
+        raise AttributeError("cv2 module is not properly loaded")
     # Try to create a test window to check GUI support
     test_window = "___opencv_gui_test___"
     cv2.namedWindow(test_window, cv2.WINDOW_NORMAL)
     cv2.destroyWindow(test_window)
     _HAS_OPENCV_GUI = True
-except cv2.error:
+except (AttributeError, cv2.error) as e:
     _HAS_OPENCV_GUI = False
-
-if not _HAS_OPENCV_GUI:
-    print("[ERROR] OpenCV was built without GUI support (no GTK/Qt/Cocoa).")
-    print("[ERROR] This script requires OpenCV with GUI support for visualization.")
-    print("[ERROR] To fix this, install OpenCV with GUI support:")
-    print("[ERROR]   conda install -c conda-forge opencv")
-    print("[ERROR]   OR")
-    print("[ERROR]   pip install opencv-python (not opencv-python-headless)")
-    sys.exit(1)
 
 # Lerobot dataset loader
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -349,7 +343,8 @@ def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None =
             dataset = LeRobotDataset(
                 repo_id=repo_id,
                 root=dataset_path_obj,  # Pass dataset directory as root
-                episodes=[episode_idx]
+                episodes=[episode_idx],
+                video_backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
             )
         else:
             # Path might be a parent directory - try using directory name as repo_id
@@ -358,14 +353,16 @@ def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None =
             dataset = LeRobotDataset(
                 repo_id=repo_id,
                 root=root,
-                episodes=[episode_idx]
+                episodes=[episode_idx],
+                video_backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
             )
     else:
         # Assume it's a repo_id - load from Hub or local cache
         dataset = LeRobotDataset(
             repo_id=dataset_path,
             root=dataset_root,
-            episodes=[episode_idx]
+            episodes=[episode_idx],
+            video_backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
         )
     
     # Get episode metadata
@@ -445,6 +442,160 @@ def convert_actions_to_mujoco_delta(actions_raw: np.ndarray, mujoco_keyframe_ctr
             else:
                 ctrl[ctrl_idx] = mujoco_keyframe_ctrl[ctrl_idx] + sign * deltas_rad[frame_idx, rec_idx]
         ctrl_sequence[frame_idx] = ctrl
+    
+    return ctrl_sequence
+
+
+# -------- PI05 normalization method -------------------------------------------
+def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray, mujoco_keyframe_ctrl: np.ndarray,
+                                    gripper_ctrl_range: tuple = (0.002, 0.041)):
+    """
+    PI05 NORMALIZATION: Convert lerobot normalized degrees to MuJoCo (Interbotix) radians.
+    
+    Uses PI05 normalization formula:
+        1. normalized_degrees = (raw - mid) * 360 / max_res (recorded data)
+        2. raw_encoder = (normalized_degrees * max_res / 360) + mid (inverse)
+        3. raw_encoder → interbotix_radians: rad = (raw - 2048) * (2π / 4096)
+    
+    Where:
+        - mid = (range_min + range_max) / 2
+        - max_res = 4095 (for ALOHA motors: 4096 - 1)
+    
+    Calibration data from .cache/calibration/aloha_follower/*.json
+    """
+    import json
+    from pathlib import Path
+    
+    num_frames = len(actions_raw)
+    ctrl_sequence = np.zeros((num_frames, 14))
+    
+    # Load calibration files (relative to project root)
+    project_root = Path(__file__).parent.parent
+    calib_dir = project_root / ".cache" / "calibration" / "aloha_follower"
+    
+    # Try to load calibration, fall back to hardcoded defaults if not found
+    try:
+        with open(calib_dir / "aloha_left.json") as f:
+            left_calib = json.load(f)
+        with open(calib_dir / "aloha_right.json") as f:
+            right_calib = json.load(f)
+        print(f"[INFO] Loaded PI05 calibration from: {calib_dir}")
+    except FileNotFoundError:
+        print(f"[WARN] Calibration files not found at {calib_dir}, using defaults")
+        # Default calibration (fallback)
+        right_calib = {
+            "waist": {"range_min": -974, "range_max": 2042},
+            "shoulder": {"range_min": -1921, "range_max": 2886},
+            "elbow": {"range_min": 1215, "range_max": 2163},
+            "forearm_roll": {"range_min": -1003, "range_max": 2047},
+            "wrist_angle": {"range_min": 2021, "range_max": 3036},
+            "wrist_rotate": {"range_min": -1061, "range_max": 2055},
+            "gripper": {"range_min": 1710, "range_max": 2733},
+        }
+        left_calib = right_calib.copy()
+    
+    # PI05 constants
+    MAX_RES = 4095  # For ALOHA motors: 4096 - 1
+    
+    def normalized_degrees_to_raw(normalized_degrees: float, range_min: int, range_max: int) -> float:
+        """Convert PI05 normalized degrees to raw encoder value."""
+        mid = (range_min + range_max) / 2
+        raw = (normalized_degrees * MAX_RES / 360) + mid
+        return raw
+    
+    def raw_encoder_to_radians(raw: float) -> float:
+        """Convert raw encoder to Interbotix/MuJoCo radians."""
+        return (raw - 2048) * (2 * np.pi) / 4096
+    
+    gripper_min, gripper_max = gripper_ctrl_range
+    gripper_range = gripper_max - gripper_min
+    
+    # Calculate slope and intercept from control range and lerobot percentage range
+    RIGHT_GRIPPER_SLOPE = (LEROBOT_CLOSED_PCT - LEROBOT_OPEN_PCT) / gripper_range
+    RIGHT_GRIPPER_INTERCEPT = LEROBOT_OPEN_PCT - RIGHT_GRIPPER_SLOPE * gripper_min
+    
+    # Left arm gripper calibration (using same as right for now)
+    LEFT_GRIPPER_SLOPE = RIGHT_GRIPPER_SLOPE
+    LEFT_GRIPPER_INTERCEPT = RIGHT_GRIPPER_INTERCEPT
+    
+    def gripper_lerobot_to_interbotix(lerobot_percent: float, arm_side: str = "right") -> float:
+        """
+        Convert gripper from lerobot percentage to Interbotix radians.
+        """
+        if arm_side == "right":
+            return (lerobot_percent - RIGHT_GRIPPER_INTERCEPT) / RIGHT_GRIPPER_SLOPE
+        else:  # left
+            return (lerobot_percent - LEFT_GRIPPER_INTERCEPT) / LEFT_GRIPPER_SLOPE
+    
+    # Mapping: recorded index → (mujoco ctrl index, calibration dict, joint name, arm_side)
+    # Recorded format: [left_arm(9), right_arm(9)] = 18 total
+    #   Left:  [0]=waist, [1]=shoulder, [2]=shoulder_shadow, [3]=elbow, [4]=elbow_shadow,
+    #          [5]=forearm_roll, [6]=wrist_angle, [7]=wrist_rotate, [8]=gripper
+    #   Right: [9]=waist, [10]=shoulder, [11]=shoulder_shadow, [12]=elbow, [13]=elbow_shadow,
+    #          [14]=forearm_roll, [15]=wrist_angle, [16]=wrist_rotate, [17]=gripper
+    #
+    # MuJoCo ctrl format: [right_arm(7), left_arm(7)] = 14 total
+    #   [0-6]: right waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, gripper
+    #   [7-13]: left waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, gripper
+    
+    # Mapping: (recorded_idx, ctrl_idx, calib, joint_name, arm_side)
+    # Skip shadow joints (indices 2, 4, 11, 13)
+    joint_mapping = [
+        # Right arm: recorded[9-17] → ctrl[0-6]
+        (9,  0, right_calib, "waist", "right"),
+        (10, 1, right_calib, "shoulder", "right"),
+        # skip 11 (shoulder_shadow)
+        (12, 2, right_calib, "elbow", "right"),
+        # skip 13 (elbow_shadow)
+        (14, 3, right_calib, "forearm_roll", "right"),
+        (15, 4, right_calib, "wrist_angle", "right"),
+        (16, 5, right_calib, "wrist_rotate", "right"),
+        (17, 6, right_calib, "gripper", "right"),
+        # Left arm: recorded[0-8] → ctrl[7-13]
+        (0,  7, left_calib, "waist", "left"),
+        (1,  8, left_calib, "shoulder", "left"),
+        # skip 2 (shoulder_shadow)
+        (3,  9, left_calib, "elbow", "left"),
+        # skip 4 (elbow_shadow)
+        (5, 10, left_calib, "forearm_roll", "left"),
+        (6, 11, left_calib, "wrist_angle", "left"),
+        (7, 12, left_calib, "wrist_rotate", "left"),
+        (8, 13, left_calib, "gripper", "left"),
+    ]
+    
+    print("[INFO] Converting using PI05 normalization method:")
+    print("       normalized_degrees = (raw - mid) * 360 / max_res")
+    print("       where mid = (range_min + range_max) / 2, max_res = 4095")
+    
+    for frame_idx in range(num_frames):
+        for rec_idx, ctrl_idx, calib, joint_name, arm_side in joint_mapping:
+            lerobot_val = actions_raw[frame_idx, rec_idx]
+            
+            if joint_name == "gripper":
+                # Gripper: percentage → Interbotix radians (with arm-specific calibration)
+                mujoco_rad = gripper_lerobot_to_interbotix(lerobot_val, arm_side)
+            else:
+                # Regular joint: PI05 normalized degrees → raw → radians
+                range_min = calib[joint_name]["range_min"]
+                range_max = calib[joint_name]["range_max"]
+                raw = normalized_degrees_to_raw(lerobot_val, range_min, range_max)
+                mujoco_rad = raw_encoder_to_radians(raw)
+            
+            ctrl_sequence[frame_idx, ctrl_idx] = mujoco_rad
+        
+        # Debug: print first frame conversion
+        if frame_idx == 0:
+            print(f"       Frame 0 sample conversions:")
+            for rec_idx, ctrl_idx, calib, joint_name, arm_side in joint_mapping[:3]:  # First 3 joints
+                lerobot_val = actions_raw[0, rec_idx]
+                if joint_name != "gripper":
+                    range_min = calib[joint_name]["range_min"]
+                    range_max = calib[joint_name]["range_max"]
+                    mid = (range_min + range_max) / 2
+                    raw = normalized_degrees_to_raw(lerobot_val, range_min, range_max)
+                    mujoco_val = raw_encoder_to_radians(raw)
+                    print(f"         {joint_name} ({arm_side}): {lerobot_val:.2f}° (normalized) → "
+                          f"mid={mid:.1f}, raw={raw:.1f} → {mujoco_val:.4f} rad ({np.rad2deg(mujoco_val):.2f}°)")
     
     return ctrl_sequence
 
@@ -580,26 +731,35 @@ def convert_actions_to_mujoco_absolute(actions_raw: np.ndarray, mujoco_keyframe_
 
 
 def convert_actions_to_mujoco(actions_raw: np.ndarray, mujoco_keyframe_ctrl: np.ndarray, 
-                              use_absolute: bool = True, gripper_ctrl_range: tuple = (0.002, 0.041)):
+                              use_absolute: bool = True, use_new_normalization: bool = False,
+                              gripper_ctrl_range: tuple = (0.002, 0.041)):
     """
     Main conversion function. 
     
     Args:
         use_absolute: If True, use absolute motor positions with calibration offsets.
                       If False, use delta-based replay from keyframe.
+        use_new_normalization: If True, use PI05 normalization method (degrees = (raw - mid) * 360 / max_res).
+                  Only applies when use_absolute=True.
         gripper_ctrl_range: (min, max) control range for gripper from MuJoCo model.
     
     Both modes use the SAME joint mapping. The difference:
     - DELTA: ctrl = keyframe + sign * deg2rad(recorded[N] - recorded[0])
-    - ABSOLUTE: ctrl = sign * deg2rad(recorded[N] - offset)
+    - ABSOLUTE (legacy): ctrl = sign * deg2rad(recorded[N] - offset)
              where offset = recorded[0] - sign * rad2deg(keyframe)
+    - ABSOLUTE (PI05): ctrl = rad((normalized_degrees * max_res / 360) + mid)
+             where mid = (range_min + range_max) / 2, max_res = 4095
     
     At frame 0, both produce identical results (keyframe_ctrl).
     At frame N, ABSOLUTE uses true motor positions; DELTA uses relative change.
     """
     if use_absolute:
-        print("[INFO] Using ABSOLUTE joint replay (motor encoder → MuJoCo with calibration)")
-        return convert_actions_to_mujoco_absolute(actions_raw, mujoco_keyframe_ctrl, gripper_ctrl_range)
+        if use_new_normalization:
+            print("[INFO] Using PI05 normalization method (motor encoder → MuJoCo with PI05 calibration)")
+            return convert_actions_to_mujoco_pi05(actions_raw, mujoco_keyframe_ctrl, gripper_ctrl_range)
+        else:
+            print("[INFO] Using ABSOLUTE joint replay (motor encoder → MuJoCo with legacy calibration)")
+            return convert_actions_to_mujoco_absolute(actions_raw, mujoco_keyframe_ctrl, gripper_ctrl_range)
     else:
         print("[INFO] Using DELTA-based joint replay (from MuJoCo keyframe)")
         return convert_actions_to_mujoco_delta(actions_raw, mujoco_keyframe_ctrl)
@@ -643,6 +803,8 @@ def parse_args():
                    help="Path to Gaussian Splatting scene file")
     p.add_argument("--replay-mode", type=str, default="absolute", choices=["absolute", "delta"],
                    help="Joint replay mode: 'absolute' uses calibrated motor positions, 'delta' uses keyframe + deltas")
+    p.add_argument("--new", action="store_true",
+                   help="Use PI05 normalization method: degrees = (raw - mid) * 360 / max_res")
     return p.parse_args()
 
 
@@ -698,7 +860,7 @@ def main():
         video_path, 
         absolute_timestamps, 
         tolerance_s=1e-4,
-        backend=dataset.video_backend
+        backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
     )
     # Convert from torch tensor (N, C, H, W) to list of numpy (H, W, C) for OpenCV
     video_frames = []
@@ -809,6 +971,7 @@ def main():
     use_absolute = (args.replay_mode == "absolute")
     ctrl_sequence = convert_actions_to_mujoco(actions_raw, mujoco_keyframe_ctrl, 
                                                use_absolute=use_absolute,
+                                               use_new_normalization=args.new,
                                                gripper_ctrl_range=gripper_ctrl_range)
     
     # Create windows
