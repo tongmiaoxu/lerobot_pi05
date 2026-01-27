@@ -1,6 +1,6 @@
 python src/lerobot/scripts/lerobot_train.py \
     --dataset.repo_id=pick_cuber_v30 \
-    --dataset.root=/home/tongmiao/Documents/pick_cuber_v30 \
+    --dataset.root=data \
     --policy.type=pi05 \
     --policy.pretrained_path=lerobot/pi05_base \
     --policy.repo_id=tongmiao/pi05_pick_cube \
@@ -45,14 +45,15 @@ src/lerobot/scripts/lerobot_record.py    ← Main entry point (lerobot-record co
 └── .cache/calibration/                      ← Calibration files
 ### Command (ALOHA-style state machine)
 ```bash
-# Data collection with default cameras (cam_high, cam_low, cam_left_wrist, cam_right_wrist)
+# Data collection with default cameras (cam_high, cam_low, cam_left_wrist, cam_right_wrist): the defalut dataset path is -/home/tongmiao/.cache/huggingface/lerobot/{repo_id}: Episode data: all episodes are in data/chunk-000/file-000.parquet
 lerobot-record \
     --robot.type=aloha_follower \
     --teleop.type=bi_aloha_leader \
     --dataset.repo_id=tongmiao/aloha_pick_cube \
     --dataset.single_task="Pick up the cube" \
-    --dataset.num_episodes=50 \
+    --dataset.num_episodes=20 \
     --dataset.fps=30 \
+    --dataset.root=data 
 
 ```
 or some other parameters:
@@ -60,6 +61,19 @@ or some other parameters:
     --resume=true \
     --dataset.push_to_hub=false \
     --display_data=true
+```
+
+### Policy Training
+```bash
+lerobot-train \
+  --policy.type=act \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=tongmiao/aloha_pick_cube \
+  --dataset.root=data/tongmiao/aloha_pick_cube \
+  --output_dir=./outputs/act_training \
+  --batch_size=32 \
+  --steps=40000
 ```
 
 ### Teleoperation (no data recording)
@@ -70,15 +84,26 @@ lerobot-teleoperate \
     --teleop.type=bi_aloha_leader \
     --fps=30
 ```
-### Replay in mujoco 
+### Load model
 ```bash
-python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path /home/tongmiao/Documents/pick_cuber_v30     --episode 0
+python visual_match/load_model.py
 ```
-### Compare Recorded vs MuJoCo
+### Replay in mujoco (--new means using new normalization method in lerobot0.4.3)
+```bash
+python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/  --episode 0 --new
+```
+### Compare Recorded vs MuJoCo (--new means using new normalization method in lerobot0.4.3)
 
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py \
-    --dataset-path /home/tongmiao/Documents/pick_cuber_v30 \
-    --episode 0 
+python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/ --episode 0 --new 
  
 ```
+### Policy rollout
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
+    --prompt "Pick up the cube" \
+    --fps 30
+```
+
+
