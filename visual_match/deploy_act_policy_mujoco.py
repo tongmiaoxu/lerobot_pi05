@@ -205,24 +205,11 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
     # Try to use specific cameras if they exist, otherwise use the default camera for all
     camera_names = {
         "observation.images.cam_high": "teleoperator_pov",  # Default to teleoperator view
-        "observation.images.cam_low": "teleoperator_pov",
-        "observation.images.cam_left_wrist": "teleoperator_pov",
-        "observation.images.cam_right_wrist": "teleoperator_pov",
+        "observation.images.cam_low": "depth_cam",
+        "observation.images.cam_left_wrist": "wrist_cam_left",
+        "observation.images.cam_right_wrist": "wrist_cam_right",
     }
-    
-    # Try to find cameras in MuJoCo model
-    for cam_id in range(model.ncam):
-        cam_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_id)
-        if cam_name:
-            # Map camera names if they match expected names
-            if "high" in cam_name.lower() or "top" in cam_name.lower():
-                camera_names["observation.images.cam_high"] = cam_name
-            elif "low" in cam_name.lower() or "bottom" in cam_name.lower():
-                camera_names["observation.images.cam_low"] = cam_name
-            elif "left" in cam_name.lower() and "wrist" in cam_name.lower():
-                camera_names["observation.images.cam_left_wrist"] = cam_name
-            elif "right" in cam_name.lower() and "wrist" in cam_name.lower():
-                camera_names["observation.images.cam_right_wrist"] = cam_name
+ 
     
     # Render each camera view
     for obs_key, cam_name_to_use in camera_names.items():
@@ -292,14 +279,7 @@ def convert_mujoco_state_to_lerobot(data: MjData, calib_dir: Path, gripper_ctrl_
         with open(calib_dir / "left_follower.json") as f:
             left_calib = json.load(f)
     except FileNotFoundError:
-        # Fallback to defaults
-        right_calib = {
-            "homing_offset": [-1024, 0, 0, -2048, -2048, -1024, -1024, -1024, -1024],
-            "drive_mode": [0, 0, 0, 0, 0, 0, 0, 0, 0],
-            "motor_names": ["waist", "shoulder", "shoulder_shadow", "elbow", "elbow_shadow", 
-                           "forearm_roll", "wrist_angle", "wrist_rotate", "gripper"]
-        }
-        left_calib = right_calib.copy()
+        raise FileNotFoundError(f"Calibration files not found: {calib_dir}")
     
     def radians_to_raw_encoder(mujoco_rad: float, resolution: int = 4096) -> float:
         """Convert MuJoCo radians to raw encoder value."""
@@ -382,7 +362,11 @@ def convert_mujoco_state_to_lerobot(data: MjData, calib_dir: Path, gripper_ctrl_
             state[lerobot_idx] = degrees
     
     # Convert grippers: qpos[14] = left, qpos[15] = right
-    if len(data.qpos) >= 16:
+    # DEBUG: Check actual lengths
+    qpos_len = len(data.qpos)
+    ctrl_len = len(data.ctrl)
+    
+    if qpos_len >= 16:
         # Left gripper
         left_gripper_rad = data.qpos[14]
         state[8] = gripper_interbotix_to_lerobot(left_gripper_rad, left_calib, "left")
@@ -390,12 +374,16 @@ def convert_mujoco_state_to_lerobot(data: MjData, calib_dir: Path, gripper_ctrl_
         # Right gripper
         right_gripper_rad = data.qpos[15]
         state[17] = gripper_interbotix_to_lerobot(right_gripper_rad, right_calib, "right")
-    elif len(data.ctrl) >= 14:
+        # DEBUG: This path was taken
+        print(f"[DEBUG] Using qpos path: qpos_len={qpos_len}, ctrl_len={ctrl_len}")
+    elif ctrl_len >= 14:
         # Fallback: use ctrl values
         left_gripper_rad = data.ctrl[13] if len(data.ctrl) > 13 else 0.0
         right_gripper_rad = data.ctrl[6] if len(data.ctrl) > 6 else 0.0
         state[8] = gripper_interbotix_to_lerobot(left_gripper_rad, left_calib, "left")
         state[17] = gripper_interbotix_to_lerobot(right_gripper_rad, right_calib, "right")
+        # DEBUG: This path was taken
+        print(f"[DEBUG] Using ctrl path: qpos_len={qpos_len}, ctrl_len={ctrl_len}")
     
     return state
 
