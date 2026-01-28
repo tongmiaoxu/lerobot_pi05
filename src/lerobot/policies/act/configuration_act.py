@@ -137,6 +137,11 @@ class ACTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # Camera filtering: if specified, only use image features whose keys contain any of these strings
+    # Example: ["cam_right_wrist", "cam_left_wrist"] to use only wrist cameras
+    # If None or empty, all image features from the dataset are used
+    image_keys_filter: list[str] | None = None
+
     def __post_init__(self):
         super().__post_init__()
 
