@@ -470,6 +470,22 @@ def make_policy(
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    
+    # Filter image features if image_keys_filter is specified
+    # This allows selecting only specific cameras (e.g., only wrist cameras)
+    if hasattr(cfg, 'image_keys_filter') and cfg.image_keys_filter:
+        filtered_input_features = {}
+        for key, ft in cfg.input_features.items():
+            # Keep non-visual features as-is
+            if ft.type != FeatureType.VISUAL:
+                filtered_input_features[key] = ft
+            # For visual features, only keep if key matches the filter
+            elif any(filter_key in key for filter_key in cfg.image_keys_filter):
+                filtered_input_features[key] = ft
+        cfg.input_features = filtered_input_features
+        logging.info(f"Filtered image features. Keeping only: {cfg.image_keys_filter}")
+        logging.info(f"Filtered input_features keys: {list(cfg.input_features.keys())}")
+    
     kwargs["config"] = cfg
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)

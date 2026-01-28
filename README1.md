@@ -71,8 +71,9 @@ lerobot-train \
   --policy.push_to_hub=false \
   --dataset.repo_id=tongmiao/aloha_pick_cube \
   --dataset.root=data/tongmiao/aloha_pick_cube \
-  --output_dir=./outputs/act_training \
-  --batch_size=32 \
+  --output_dir=./outputs/act_training_wrist \
+  --policy.image_keys_filter='["cam_right_wrist", "cam_left_wrist"]' \
+  --batch_size=8 \
   --steps=40000
 ```
 
