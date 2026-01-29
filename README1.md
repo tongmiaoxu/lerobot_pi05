@@ -74,8 +74,18 @@ lerobot-train \
   --output_dir=./outputs/act_training_wrist \
   --policy.image_keys_filter='["cam_right_wrist", "cam_left_wrist"]' \
   --batch_size=8 \
-  --steps=40000
+  --steps=40000 \
+  --wandb.enable=true \
+  --wandb.project=aloha_pick_cube_lerobot0.4.3_wrist
 ```
+### Policy rollout in Simulation
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
+    --prompt "Pick up the cube" \
+    --fps 30
+```
+
 
 ### Teleoperation (no data recording)
 To config which arm to use: edit `config_aloha_follower.py` (line 48-49) and `config_aloha_leader.py` (line 68-69)
@@ -99,12 +109,6 @@ python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/  --e
 python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/ --episode 0 --new 
  
 ```
-### Policy rollout
-```bash
-python visual_match/deploy_act_policy_mujoco.py \
-    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
-    --prompt "Pick up the cube" \
-    --fps 30
-```
+
 
 
