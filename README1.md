@@ -1,34 +1,4 @@
-python src/lerobot/scripts/lerobot_train.py \
-    --dataset.repo_id=pick_cuber_v30 \
-    --dataset.root=data \
-    --policy.type=pi05 \
-    --policy.pretrained_path=lerobot/pi05_base \
-    --policy.repo_id=tongmiao/pi05_pick_cube \
-    --policy.push_to_hub=true \
-    --output_dir=./outputs/pi05_pick_cube \
-    --job_name=pi05_pick_cube \
-    --policy.compile_model=false \
-    --policy.gradient_checkpointing=true \
-    --policy.train_expert_only=true \
-    --policy.dtype=bfloat16 \
-    --policy.device=cuda \
-    --batch_size=4 \
-    --steps=3000 \
-    --wandb.enable=true \
-    --wandb.project=pi05_aloha
-
-    # Check GPU memory
-nvidia-smi
-
-# Policy evaluation (cameras are now default in aloha_follower config)
-lerobot-record \
-    --robot.type=aloha_follower \
-    --teleop.type=bi_aloha_leader \
-    --policy.path=/home/tongmiao/Documents/lerobot_pi05/outputs/pi05_pick_cube/checkpoints/last/pretrained_model \
-    --dataset.repo_id=tongmiao/eval_pi05_aloha \
-    --dataset.single_task="Pick up the cube" \
-    --dataset.num_episodes=10 \
-    --dataset.push_to_hub=false 2>&1 | tee eval_log.txt
+s
 
 ## Data Collection
 src/lerobot/scripts/lerobot_record.py    ← Main entry point (lerobot-record command)
@@ -85,6 +55,25 @@ python visual_match/deploy_act_policy_mujoco.py \
     --prompt "Pick up the cube" \
     --fps 30
 ```
+
+
+### Policy Deployment
+```bash
+lerobot-record \
+  --robot.type=aloha_follower \
+  --teleop.type=bi_aloha_leader \
+  --policy.path=outputs/act_training_wrist/checkpoints/last/pretrained_model \
+  --dataset.repo_id=tongmiao/eval_act_aloha \
+  --dataset.single_task="Pick up the cube" \
+  --dataset.num_episodes=10 \
+  --dataset.fps=30 \
+  --dataset.root=data_eval \
+  --dataset.push_to_hub=false \
+  --resume=true
+
+```
+
+
 
 
 ### Teleoperation (no data recording)
