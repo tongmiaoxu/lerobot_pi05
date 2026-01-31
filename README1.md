@@ -44,8 +44,36 @@ lerobot-train \
   --output_dir=./outputs/act_training_wrist \
   --policy.image_keys_filter='["cam_right_wrist", "cam_left_wrist"]' \
   --batch_size=8 \
-  --steps=40000
+  --steps=40000 \
+  --wandb.enable=true \
+  --wandb.project=aloha_pick_cube_lerobot0.4.3_wrist \
+  --dataset.image_transforms.enable=true
+
 ```
+```bash
+lerobot-train \
+  --policy.type=diffusion \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=tongmiao/aloha_pick_cube \
+  --dataset.root=data/tongmiao/aloha_pick_cube \
+  --output_dir=./outputs/diffusion_training_wrist \
+  --policy.image_keys_filter='["cam_right_wrist", "cam_left_wrist"]' \
+  --wandb.enable=true \
+  --wandb.project=aloha_pick_cube_lerobot0.4.3_wrist \
+  --dataset.image_transforms.enable=true \
+  --policy.horizon=64 \
+  --policy.n_action_steps=50 \
+  --batch_size=64
+```
+### Policy rollout in Simulation
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+    --policy-path outputs/act_training_wrist/checkpoints/last/pretrained_model \
+    --prompt "Pick up the cube" \
+    --fps 30
+```
+
 
 ### Policy Deployment
 ```bash
@@ -88,12 +116,6 @@ python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/  --e
 python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/ --episode 0 --new 
  
 ```
-### Policy rollout
-```bash
-python visual_match/deploy_act_policy_mujoco.py \
-    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
-    --prompt "Pick up the cube" \
-    --fps 30
-```
+
 
 

@@ -319,33 +319,37 @@ def convert_mujoco_state_to_lerobot(data: MjData, calib_dir: Path, gripper_ctrl_
         
         return np.clip(lerobot_pct, 0.0, 140.0)
     
-    # MuJoCo qpos structure: [left_arm(7), right_arm(7), left_gripper(1), right_gripper(1)]
+    # MuJoCo qpos structure: [right_arm(8), left_arm(8)]
+    # qpos[0:7] = right arm (waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, left_finger)
+    # qpos[7] = right/right_finger (excluded, coupled via equality constraint)
+    # qpos[8:14] = left arm (waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, left_finger)
+    # qpos[15] = left/right_finger (excluded, coupled via equality constraint)
     # Convert to lerobot format: [left_arm(9), right_arm(9)] with shadow joints
     state = np.zeros((18,), dtype=np.float32)
     
     # Mapping: (mujoco_qpos_idx, lerobot_state_idx, calib, calib_joint_idx, arm_side)
-    # Left arm: qpos[0:7] → state[0:9] (with shadow joints)
+    # Left arm: qpos[8:14] → state[0:7] (with shadow joints, excluding right_finger at qpos[15])
     left_mapping = [
-        (0, 0, left_calib, 0, "left"),   # waist
-        (1, 1, left_calib, 1, "left"),   # shoulder
-        (1, 2, left_calib, 1, "left"),   # shoulder_shadow (duplicate)
-        (2, 3, left_calib, 3, "left"),   # elbow
-        (2, 4, left_calib, 3, "left"),   # elbow_shadow (duplicate)
-        (3, 5, left_calib, 5, "left"),   # forearm_roll
-        (4, 6, left_calib, 6, "left"),   # wrist_angle
-        (5, 7, left_calib, 7, "left"),   # wrist_rotate
+        (8, 0, left_calib, 0, "left"),   # waist
+        (9, 1, left_calib, 1, "left"),   # shoulder
+        (9, 2, left_calib, 1, "left"),   # shoulder_shadow (duplicate)
+        (10, 3, left_calib, 3, "left"),   # elbow
+        (10, 4, left_calib, 3, "left"),   # elbow_shadow (duplicate)
+        (11, 5, left_calib, 5, "left"),   # forearm_roll
+        (12, 6, left_calib, 6, "left"),   # wrist_angle
+        (13, 7, left_calib, 7, "left"),   # wrist_rotate
     ]
     
-    # Right arm: qpos[7:14] → state[9:18] (with shadow joints)
+    # Right arm: qpos[0:6] → state[9:16] (with shadow joints, excluding right_finger at qpos[7])
     right_mapping = [
-        (7, 9, right_calib, 0, "right"),   # waist
-        (8, 10, right_calib, 1, "right"),  # shoulder
-        (8, 11, right_calib, 1, "right"),  # shoulder_shadow (duplicate)
-        (9, 12, right_calib, 3, "right"),  # elbow
-        (9, 13, right_calib, 3, "right"),  # elbow_shadow (duplicate)
-        (10, 14, right_calib, 5, "right"),  # forearm_roll
-        (11, 15, right_calib, 6, "right"),  # wrist_angle
-        (12, 16, right_calib, 7, "right"),  # wrist_rotate
+        (0, 9, right_calib, 0, "right"),   # waist
+        (1, 10, right_calib, 1, "right"),  # shoulder
+        (1, 11, right_calib, 1, "right"),  # shoulder_shadow (duplicate)
+        (2, 12, right_calib, 3, "right"),  # elbow
+        (2, 13, right_calib, 3, "right"),  # elbow_shadow (duplicate)
+        (3, 14, right_calib, 5, "right"),  # forearm_roll
+        (4, 15, right_calib, 6, "right"),  # wrist_angle
+        (5, 16, right_calib, 7, "right"),  # wrist_rotate
     ]
     
     # Convert joints (skip grippers for now)
@@ -361,30 +365,16 @@ def convert_mujoco_state_to_lerobot(data: MjData, calib_dir: Path, gripper_ctrl_
             degrees = raw_to_calibrated_degrees(raw, homing_offset, drive_mode)
             state[lerobot_idx] = degrees
     
-    # Convert grippers: qpos[14] = left, qpos[15] = right
-    # DEBUG: Check actual lengths
-    qpos_len = len(data.qpos)
-    ctrl_len = len(data.ctrl)
+    # Convert grippers: qpos[14] = left/left_finger, qpos[6] = right/left_finger
+ 
+    # Left gripper (left/left_finger at qpos[14])
+    left_gripper_rad = data.qpos[14]
+    state[8] = gripper_interbotix_to_lerobot(left_gripper_rad, left_calib, "left")
     
-    if qpos_len >= 16:
-        # Left gripper
-        left_gripper_rad = data.qpos[14]
-        state[8] = gripper_interbotix_to_lerobot(left_gripper_rad, left_calib, "left")
-        
-        # Right gripper
-        right_gripper_rad = data.qpos[15]
-        state[17] = gripper_interbotix_to_lerobot(right_gripper_rad, right_calib, "right")
-        # DEBUG: This path was taken
-        print(f"[DEBUG] Using qpos path: qpos_len={qpos_len}, ctrl_len={ctrl_len}")
-    elif ctrl_len >= 14:
-        # Fallback: use ctrl values
-        left_gripper_rad = data.ctrl[13] if len(data.ctrl) > 13 else 0.0
-        right_gripper_rad = data.ctrl[6] if len(data.ctrl) > 6 else 0.0
-        state[8] = gripper_interbotix_to_lerobot(left_gripper_rad, left_calib, "left")
-        state[17] = gripper_interbotix_to_lerobot(right_gripper_rad, right_calib, "right")
-        # DEBUG: This path was taken
-        print(f"[DEBUG] Using ctrl path: qpos_len={qpos_len}, ctrl_len={ctrl_len}")
-    
+    # Right gripper (right/left_finger at qpos[6])
+    right_gripper_rad = data.qpos[6]
+    state[17] = gripper_interbotix_to_lerobot(right_gripper_rad, right_calib, "right")
+
     return state
 
 
@@ -541,13 +531,6 @@ def main():
             
             # Convert action to MuJoCo control
             ctrl = convert_action_to_mujoco(action, mujoco_keyframe_ctrl, gripper_ctrl_range, calib_dir)
-            
-            # Disable left arm if requested (physically disabled in real world)
-            if args.disable_left_arm:
-                # Option 1: Set to zero (will cause arm to fall)
-                # ctrl[7:14] = 0.0
-                # Option 2: Hold current position (better for visualization)
-                ctrl[7:14] = data.qpos[0:7]  # Hold left arm at current qpos
             
             # Debug output
             if step == 0 or step % 100 == 0:
