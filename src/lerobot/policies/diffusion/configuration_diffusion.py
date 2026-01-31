@@ -151,6 +151,11 @@ class DiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # Camera filtering: if specified, only use image features whose keys contain any of these strings
+    # Example: ["cam_right_wrist", "cam_left_wrist"] to use only wrist cameras
+    # If None or empty, all image features from the dataset are used
+    image_keys_filter: list[str] | None = None
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)

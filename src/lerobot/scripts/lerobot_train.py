@@ -500,6 +500,28 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # increment `step` here.
         step += 1
         train_tracker.step()
+
+        # Lightweight per-iteration logging for diffusion policies so users see progress.
+        if is_main_process and getattr(cfg.policy, "type", None) == "diffusion":
+            # log more frequently for diffusion to show inner sampling/training progress
+            freq = 1 if cfg.log_freq <= 0 else min(10, cfg.log_freq)
+            if step % freq == 0:
+                # AverageMeter stores last value in `.val` and average in `.avg`.
+                try:
+                    loss_val = train_tracker.loss.val
+                except Exception:
+                    loss_val = None
+                try:
+                    lr_val = train_tracker.lr.val
+                except Exception:
+                    lr_val = None
+                if loss_val is not None and lr_val is not None:
+                    logging.info(f"diffusion step:{step} loss:{loss_val:.4f} lr:{lr_val:0.1e}")
+                elif loss_val is not None:
+                    logging.info(f"diffusion step:{step} loss:{loss_val:.4f}")
+                else:
+                    logging.info(f"diffusion step:{step}")
+
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
