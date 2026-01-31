@@ -231,7 +231,7 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
 
 
 def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndarray,
-                             gripper_ctrl_range: tuple, calib_dir: Path) -> np.ndarray:
+                             gripper_ctrl_range: tuple, calib_dir: Path, use_new_normalization: bool = False) -> np.ndarray:
     """
     Convert policy action (18 dims) to MuJoCo control (14 dims).
     
@@ -242,7 +242,7 @@ def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndar
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
-    from run_prerecorded_traj_mujoco import convert_actions_to_mujoco_absolute
+    from run_prerecorded_traj_mujoco import convert_actions_to_mujoco_pi05,convert_actions_to_mujoco_absolute
     
     # Convert to numpy and reshape for the conversion function
     action_np = action.cpu().numpy()
@@ -253,12 +253,18 @@ def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndar
     actions_raw = action_np.reshape(1, -1)
     
     # Use the same conversion function as run_prerecorded_traj_mujoco.py
-    ctrl_sequence = convert_actions_to_mujoco_absolute(
-        actions_raw, 
-        mujoco_keyframe_ctrl, 
-        gripper_ctrl_range
-    )
-    
+    if use_new_normalization:
+        ctrl_sequence = convert_actions_to_mujoco_pi05(
+            actions_raw, 
+            mujoco_keyframe_ctrl, 
+            gripper_ctrl_range
+        )
+    else:
+        ctrl_sequence = convert_actions_to_mujoco_absolute(
+            actions_raw, 
+            mujoco_keyframe_ctrl, 
+            gripper_ctrl_range
+        )
     # Return first frame (remove batch dimension)
     return ctrl_sequence[0]
 
@@ -422,6 +428,8 @@ def main():
         action="store_true",
         help="Disable left arm control (set to zero or hold position)"
     )
+    parser.add_argument("--new", action="store_true",
+                   help="Use PI05 normalization method: degrees = (raw - mid) * 360 / max_res")
     
     args = parser.parse_args()
     
@@ -530,7 +538,7 @@ def main():
                 )
             
             # Convert action to MuJoCo control
-            ctrl = convert_action_to_mujoco(action, mujoco_keyframe_ctrl, gripper_ctrl_range, calib_dir)
+            ctrl = convert_action_to_mujoco(action, mujoco_keyframe_ctrl, gripper_ctrl_range, calib_dir, use_new_normalization=args.new)
             
             # Debug output
             if step == 0 or step % 100 == 0:

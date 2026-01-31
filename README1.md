@@ -71,10 +71,16 @@ lerobot-train \
 python visual_match/deploy_act_policy_mujoco.py \
     --policy-path outputs/act_training_wrist/checkpoints/last/pretrained_model \
     --prompt "Pick up the cube" \
-    --fps 30
+    --fps 30 \
+    --new
 ```
 
-
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
+    --prompt "Pick up the cube" \
+    --fps 30
+```
 ### Policy Deployment
 ```bash
 lerobot-record \
