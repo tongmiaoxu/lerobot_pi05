@@ -115,7 +115,7 @@ class ACTPolicy(PreTrainedPolicy):
         # querying the policy.
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-
+            print("[INFO]policy called, actions shape:", actions.shape)
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))

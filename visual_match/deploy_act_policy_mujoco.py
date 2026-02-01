@@ -54,6 +54,55 @@ from lerobot.utils.utils import get_safe_torch_device
 from lerobot.utils.constants import OBS_STATE, OBS_IMAGES
 
 
+def display_camera_images(observation: dict, policy_config=None, window_name_prefix: str = "Camera"):
+    """
+    Display camera images from observation dict in OpenCV windows.
+    Only displays images that are actually used by the policy.
+    
+    Args:
+        observation: Observation dict containing image keys
+        policy_config: Policy configuration to determine which images are used
+        window_name_prefix: Prefix for window names
+    """
+    # Find all image keys in observation
+    all_image_keys = [k for k in observation.keys() if "image" in k.lower()]
+    
+    # Filter to only images actually used by the policy
+    if policy_config is not None and hasattr(policy_config, 'image_features') and policy_config.image_features:
+        # Only display images that the policy actually uses
+        image_keys = [k for k in all_image_keys if k in policy_config.image_features]
+    else:
+        # No filtering, show all images
+        image_keys = all_image_keys
+    
+    for img_key in image_keys:
+        img = observation[img_key]
+        
+        # Convert from [0, 1] float32 to [0, 255] uint8 for display
+        if img.dtype == np.float32 and img.max() <= 1.0:
+            img_display = (img * 255).astype(np.uint8)
+        else:
+            img_display = img.astype(np.uint8)
+        
+        # Convert RGB to BGR for OpenCV
+        img_bgr = cv2.cvtColor(img_display, cv2.COLOR_RGB2BGR)
+        
+        # Extract a nice window name from the key
+        # e.g., "observation.images.cam_high" -> "cam_high"
+        if "." in img_key:
+            window_name = img_key.split(".")[-1]
+        else:
+            window_name = img_key
+        
+        window_full_name = f"{window_name_prefix}: {window_name}"
+        
+        # Display image
+        cv2.imshow(window_full_name, img_bgr)
+    
+    # Wait 1ms to allow windows to update (non-blocking)
+    cv2.waitKey(1)
+
+
 def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
     """Load ACT policy from checkpoint path."""
     print(f"[INFO] Loading policy from: {policy_path}")
@@ -493,10 +542,26 @@ def main():
     # Reset policy
     policy.reset()
     
+    # Create OpenCV windows for camera display (if not headless)
+    # Only create windows for cameras actually used by the policy
+    if not args.headless:
+        if hasattr(policy.config, 'image_features') and policy.config.image_features:
+            print(f"[INFO] Policy uses {len(policy.config.image_features)} camera(s): {list(policy.config.image_features)}")
+            for img_key in policy.config.image_features:
+                # Extract camera name from key (e.g., "observation.images.cam_high" -> "cam_high")
+                cam_name = img_key.split(".")[-1] if "." in img_key else img_key
+                cv2.namedWindow(f"Camera: {cam_name}", cv2.WINDOW_NORMAL)
+            print(f"[INFO] Created {len(policy.config.image_features)} camera display window(s)")
+        else:
+            print("[WARN] Policy config has no image_features, creating windows for all cameras")
+            cv2.namedWindow("Camera: cam_high", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Camera: cam_low", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Camera: cam_left_wrist", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Camera: cam_right_wrist", cv2.WINDOW_NORMAL)
+            print("[INFO] Camera display windows created")
+    
     # Control loop
     print(f"[INFO] Starting policy deployment (max {args.max_steps} steps)")
-    print(f"[INFO] Task prompt: '{args.prompt}'")
-    print(f"[INFO] Control frequency: {args.fps} Hz")
     
     step_dt = 1.0 / args.fps
     step = 0
@@ -506,9 +571,7 @@ def main():
     if not args.headless and _HAS_DISPLAY:
         try:
             viewer = mujoco.viewer.launch_passive(model, data)
-            print("[INFO] MuJoCo viewer opened (close window to stop)")
         except Exception as e:
-            print(f"[WARN] Could not open viewer: {e}")
             viewer = None
     
     try:
@@ -519,6 +582,10 @@ def main():
             observation = build_observation_from_mujoco(
                 model, data, renderer, calib_dir, gripper_ctrl_range, args.camera
             )
+            
+            # Display camera images (if not headless)
+            if not args.headless:
+                display_camera_images(observation, policy_config=policy.config, window_name_prefix="Camera")
             
             # Add prompt if policy supports it
             if hasattr(policy.config, 'language_features') and policy.config.language_features:
@@ -545,17 +612,17 @@ def main():
                 action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
                 if action_np.ndim > 1:
                     action_np = action_np[0]
-                print(f"\n[DEBUG Step {step}]")
-                print(f"Policy action shape: {action_np.shape}")
-                print(f"  Left arm (0:9):  {action_np[:9]}")
-                print(f"  Right arm (9:18): {action_np[9:18]}")
-                print(f"MuJoCo ctrl shape: {ctrl.shape}")
-                print(f"  Right arm ctrl (0:7):  {ctrl[:7]}")
-                print(f"  Left arm ctrl (7:14):  {ctrl[7:14]} {'[DISABLED]' if args.disable_left_arm else ''}")
-                print(f"MuJoCo qpos (current state):")
-                print(f"  Left arm qpos (0:7):  {data.qpos[0:7]}")
-                print(f"  Right arm qpos (7:14): {data.qpos[7:14]}")
-                print(f"  Grippers qpos (14:16): {data.qpos[14:16] if len(data.qpos) >= 16 else 'N/A'}")
+                # print(f"\n[DEBUG Step {step}]")
+                # print(f"Policy action shape: {action_np.shape}")
+                # print(f"  Left arm (0:9):  {action_np[:9]}")
+                # print(f"  Right arm (9:18): {action_np[9:18]}")
+                # print(f"MuJoCo ctrl shape: {ctrl.shape}")
+                # print(f"  Right arm ctrl (0:7):  {ctrl[:7]}")
+                # print(f"  Left arm ctrl (7:14):  {ctrl[7:14]} {'[DISABLED]' if args.disable_left_arm else ''}")
+                # print(f"MuJoCo qpos (current state):")
+                # print(f"  Left arm qpos (0:7):  {data.qpos[0:7]}")
+                # print(f"  Right arm qpos (7:14): {data.qpos[7:14]}")
+                # print(f"  Grippers qpos (14:16): {data.qpos[14:16] if len(data.qpos) >= 16 else 'N/A'}")
             
             # Apply control
             data.ctrl[:] = ctrl
@@ -584,6 +651,9 @@ def main():
     finally:
         if viewer is not None:
             viewer.close()
+        # Close OpenCV windows
+        if not args.headless:
+            cv2.destroyAllWindows()
         print("[INFO] Deployment finished")
 
 

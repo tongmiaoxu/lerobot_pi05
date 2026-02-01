@@ -257,20 +257,8 @@ def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray, mujoco_keyframe_ctrl
             left_calib = json.load(f)
         with open(calib_dir / "aloha_right.json") as f:
             right_calib = json.load(f)
-        print(f"[INFO] Loaded PI05 calibration from: {calib_dir}")
     except FileNotFoundError:
-        print(f"[WARN] Calibration files not found at {calib_dir}, using defaults")
-        # Default calibration (fallback)
-        right_calib = {
-            "waist": {"range_min": -974, "range_max": 2042},
-            "shoulder": {"range_min": -1921, "range_max": 2886},
-            "elbow": {"range_min": 1215, "range_max": 2163},
-            "forearm_roll": {"range_min": -1003, "range_max": 2047},
-            "wrist_angle": {"range_min": 2021, "range_max": 3036},
-            "wrist_rotate": {"range_min": -1061, "range_max": 2055},
-            "gripper": {"range_min": 1710, "range_max": 2733},
-        }
-        left_calib = right_calib.copy()
+        raise FileNotFoundError(f"Calibration files not found at {calib_dir}, cannot proceed with PI05 normalization")
     
     # PI05 constants
     MAX_RES = 4095  # For ALOHA motors: 4096 - 1
@@ -341,9 +329,9 @@ def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray, mujoco_keyframe_ctrl
         (8, 13, left_calib, "gripper", "left"),
     ]
     
-    print("[INFO] Converting using PI05 normalization method:")
-    print("       normalized_degrees = (raw - mid) * 360 / max_res")
-    print("       where mid = (range_min + range_max) / 2, max_res = 4095")
+    # print("[INFO] Converting using PI05 normalization method:")
+    # print("       normalized_degrees = (raw - mid) * 360 / max_res")
+    # print("       where mid = (range_min + range_max) / 2, max_res = 4095")
     
     for frame_idx in range(num_frames):
         for rec_idx, ctrl_idx, calib, joint_name, arm_side in joint_mapping:
@@ -361,19 +349,6 @@ def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray, mujoco_keyframe_ctrl
             
             ctrl_sequence[frame_idx, ctrl_idx] = mujoco_rad
         
-        # Debug: print first frame conversion
-        if frame_idx == 0:
-            print(f"       Frame 0 sample conversions:")
-            for rec_idx, ctrl_idx, calib, joint_name, arm_side in joint_mapping[:3]:  # First 3 joints
-                lerobot_val = actions_raw[0, rec_idx]
-                if joint_name != "gripper":
-                    range_min = calib[joint_name]["range_min"]
-                    range_max = calib[joint_name]["range_max"]
-                    mid = (range_min + range_max) / 2
-                    raw = normalized_degrees_to_raw(lerobot_val, range_min, range_max)
-                    mujoco_val = raw_encoder_to_radians(raw)
-                    print(f"         {joint_name} ({arm_side}): {lerobot_val:.2f}° (normalized) → "
-                          f"mid={mid:.1f}, raw={raw:.1f} → {mujoco_val:.4f} rad ({np.rad2deg(mujoco_val):.2f}°)")
     
     return ctrl_sequence
 
@@ -506,15 +481,7 @@ def convert_actions_to_mujoco_absolute(actions_raw: np.ndarray, mujoco_keyframe_
             
             ctrl_sequence[frame_idx, ctrl_idx] = mujoco_rad
         
-        # Debug: print first frame conversion
-        if frame_idx == 0:
-            print(f"       Frame 0 sample conversions:")
-            for rec_idx, ctrl_idx, calib, calib_idx, arm_side in joint_mapping[:3]:  # First 3 joints
-                joint_name = calib["motor_names"][calib_idx]
-                lerobot_val = actions_raw[0, rec_idx]
-                mujoco_val = ctrl_sequence[0, ctrl_idx]
-                print(f"         {joint_name} ({arm_side}): {lerobot_val:.2f}° → {mujoco_val:.4f} rad ({np.rad2deg(mujoco_val):.2f}°)")
-    
+     
     return ctrl_sequence
 
 # -------- Main ----------------------------------------------------------------
