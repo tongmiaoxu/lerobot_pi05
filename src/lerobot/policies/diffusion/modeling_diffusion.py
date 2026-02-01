@@ -292,11 +292,13 @@ class DiffusionModel(nn.Module):
 
         # run sampling
         actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        print(f"[USED] Sampled {actions.shape[1]} actions (horizon={self.config.horizon})")
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
+        print(f"[USED] Final action chunk shape: {actions.shape}")
 
         return actions
 

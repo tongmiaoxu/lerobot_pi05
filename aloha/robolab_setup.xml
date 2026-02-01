@@ -1,0 +1,212 @@
+<mujoco model="aloha_scene" >
+<!-- tells mujoco where to find mesh and texture files (in the assets/ directory) -->
+  <compiler meshdir="assets" texturedir="assets"/>
+
+
+  <!-- includes the aloha robot description -->
+  <include file="robolab_aloha.xml"/>
+
+<!-- statistical properties used for autoscaling visualizations (doesn't really matter i don't think). center -> center point of scene; extent -> spatial extent/size of visualization; meansize -> avg size of moving bodies (to scale contact) -->
+  <statistic center="0 -0.1 0.2" extent="0.6" meansize="0.05"/>
+
+  <!-- lighting stuff.  will probably need to tune this according to our environment. headlight numbers are RGB values-->
+  <!-- "In your scene, this lighting setup creates a fairly neutral, evenly-lit environment without any sharp, shiny highlights." - Claude -->
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="90" elevation="-20"/>
+    <quality shadowsize="8192"/>
+  </visual>
+
+  <!-- all assets used in the scene (meshes and textures) -->
+  <asset>
+    <!-- table extrusions and frame -->
+    <mesh file="extrusion_2040_880.stl"/>
+    <mesh file="extrusion_150.stl"/>
+    <mesh file="corner_bracket.stl"/>
+    <mesh file="extrusion_1220.stl"/>
+    <mesh file="extrusion_1000.stl"/>
+    <mesh file="angled_extrusion.stl"/>
+    <mesh file="extrusion_600.stl"/>
+    <mesh file="overhead_mount.stl"/>
+    <mesh file="extrusion_2040_1000.stl"/>
+    <mesh file="wormseye_mount.stl"/>
+    <mesh file="block.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="battery.stl" scale="0.001 0.001 0.001" />
+    <mesh file="crate.stl" scale="0.001 0.001 0.001"/>
+
+    <!-- Table dimensions (length x width x height in meters): 1.21x0.76x0.75 -->
+    <!-- REAL - 122 X 77 X 86 -->
+    <mesh file="tablelegs.obj"/>
+    <mesh file="tabletop.obj"/>
+
+    <!-- skybox shows the gradient from "sky" to below the floor (just look at the viz and you'll understand) -->
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <!-- checkered pattern for ground plane -->
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+      <!-- wood texture -->
+    <texture type="2d" file="small_meta_table_diffuse.png"/>
+    <!-- defining materials that can be applied to geometries -->
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="table" texture="small_meta_table_diffuse"/>
+    <material name="metal" rgba="0.517 0.529 0.537 1"/>
+    <material name="purple" rgba="0.6 0.2 0.8 1"/>
+  </asset>
+
+  <!-- default properties for all geometries with class = "frame".  mesh type -> use 3d model for shape, group 1 -> visual geometry (usually used for detailed meshes), material black-->
+  <default>
+    <default class="frame">
+      <geom group="1" type="mesh" material="black"/>
+    </default>
+    <default class="object_collision">
+      <!-- Use a visible group (for example, group 1) and set a material -->
+      <geom group="1" type="mesh" friction="1 5e-3 5e-4" solref=".01 1" condim="6"/>
+    </default>
+
+
+  </default>
+
+<!-- where actual physical elements of the scene are defined -->
+  <worldbody>
+    <!-- adds light source here -->
+    <light pos="0 0.1 2.5"/>
+    <!-- 2x2 meter floor plane -->
+    <geom name="floor" size="2 2 0.05" type="plane" material="groundplane" pos="0 0 -.75"/>
+    <!-- defines a reference point (i should probably learn how to use site) -->
+    <site name="worldref" pos="0 0 -0.75"/>
+    <!-- <site name="origin_ref" pos="0 0 0" type="sphere" rgba="1 0 0 1" size="0.05"/> -->
+
+    <!--  -->
+    <geom mesh="tabletop" material="black" class="visual" pos="0 0 -0.75" quat="1 0 0 1"/>
+    <geom mesh="tablelegs" material="table" class="visual" pos="0 0 -0.75" quat="1 0 0 1"/>
+    <geom name="table" pos="0 0 -0.1009" size="0.61 0.37 0.1" type="box" class="collision"/>
+    
+    <!-- Purple cube (3cm = 0.03m, centered on table) -->
+    <body name="purple_cube" pos="0  -0.019 0.015">
+      <freejoint/>
+      <geom name="cube" type="box" size="0.015 0.015 0.015" material="purple" 
+            mass="0.05" friction="1 0.005 0.0001" solref="0.01 1" condim="6"/>
+    </body>
+    <!-- <camera name="overhead_cam" focal="1.93e-3 1.93e-3" resolution="1280 720" sensorsize="3896e-6 2140e-6"
+            pos="0 -0.303794 1.02524" mode="fixed" quat="0.976332 0.216277 0 0"/>
+    <camera name="worms_eye_cam" focal="1.93e-3 1.93e-3" resolution="1280 720" sensorsize="3896e-6 2140e-6"
+            pos="0 -0.377167 0.0316055" mode="fixed" quat="0.672659 0.739953 0 0"/> -->
+    <!-- <geom class="frame" pos="0.44 -0.361 1.03" quat="0 1 0 1" mesh="extrusion_2040_880" /> -->
+    <!-- <geom class="frame" pos="0.44 -0.371 0.61" quat="1 0 -1 0" mesh="extrusion_150" /> -->
+    <!-- <geom class="frame" pos="0 -0.303794 1.02524" quat="0 0 0.976296 0.21644" mesh="d405_solid"/> -->
+    <!-- <geom class="frame" pos="0.44 -0.383 1.04" quat="0 0 -1 1" mesh="corner_bracket" /> -->
+    <geom class="frame" pos="-0.61 -0.391 -0.01" quat="0 -1 0 1" mesh="extrusion_1220" />
+    <!-- <geom class="frame" pos="-0.59 -0.371 0.61" quat="0 -1 0 1" mesh="extrusion_150" /> -->
+    <!-- <geom class="frame" pos="0.42 -0.383 0.62" quat="1 1 1 -1" mesh="corner_bracket"/> -->
+    <geom class="frame" pos="0 -0.377167 0.0316055" quat="0 0 -0.672367 -0.740218" mesh="d405_solid"/>
+    <!-- <geom class="frame" pos="0.61 -0.383 0.62" quat="0 0 1 -1" mesh="corner_bracket" /> -->
+    <!-- <geom class="frame" pos="-0.43 -0.361 1.02" quat="0 0 0 1" mesh="extrusion_2040_1000" /> -->
+    <!-- <geom class="frame" pos="-0.61 -0.383 0.62" quat="1 1 1 -1" mesh="corner_bracket" /> -->
+    <!-- <geom class="frame" pos="-0.43 -0.24 0.12" quat="0.923 0.382 0 0" material="metal" mesh="angled_extrusion"/> -->
+    <!-- <geom class="frame" pos="-0.59 -0.066 0.01" quat="0 1 0 -1" mesh="extrusion_150" /> -->
+    <!-- TODO: NEED TO REPLACE 600 WITH LONGER EXTRUSION -->
+    <!-- <geom class="frame" pos="-0.6 -0.371 0.62" quat="0 0 0 -1" mesh="extrusion_600" /> -->
+        <geom class="frame" pos="-0.6 -0.371 1.24" quat="1 0 0 1" mesh="extrusion_1220" />
+
+    <geom class="frame" pos="0.44 -0.631 0.01" quat="1 0 -1 0" mesh="extrusion_150" />
+    <!-- <geom class="frame" pos="0 -0.351 1.03" quat="0 0 1 1" mesh="overhead_mount" /> -->
+    <geom class="frame" pos="-0.43 -0.641 0.01" quat="1 1 -1 1" mesh="extrusion_1000" />
+    <!-- <geom class="frame" pos="0.6 -0.26 0.12" quat="0.923 0.382 0 0" material="metal" mesh="angled_extrusion"/> -->
+    <geom class="frame" pos="0.44 -0.066 0.01" quat="1 0 -1 0" mesh="extrusion_150" />
+    <!-- <geom class="frame" pos="-0.44 -0.383 1.04" quat="1 1 1 -1" mesh="corner_bracket" /> -->
+    <geom class="frame" pos="-0.61 0.369 0.01" quat="0 1 0 -1" mesh="extrusion_1220"/>
+    <!-- right inner extrusion -->
+    <geom class="frame" pos="0.43 -0.641 0.01" quat="0 0 -1 1" mesh="extrusion_1000" />
+    <!-- right outer extrusion -->
+    <geom class="frame" pos="0.6 -0.641 0.01" quat="0 0 -1 1" mesh="extrusion_1000" />
+    <geom class="frame" pos="-0.59 -0.631 0.01" quat="0 1 0 -1" mesh="extrusion_150" />
+    <!-- <geom class="frame" pos="-0.42 -0.383 0.62" quat="0 0 -1 1" mesh="corner_bracket" /> -->
+    <!-- left outer extrusion -->
+    <geom class="frame" pos="-0.6 -0.641 0.01" quat="0 0 -1 1" mesh="extrusion_1000" />
+    <!-- TODO: NEED TO REPLACE 600 WITH LONGER EXTRUSION -->
+    <!-- <geom class="frame" pos="0.6 -0.371 0.62" quat="1 0 0 1" mesh="extrusion_600" /> -->
+    <geom class="frame" pos="0.6 -0.371 1.24" quat="1 0 0 1" mesh="extrusion_1220" />
+
+    <!-- <geom class="frame" pos="0.43 -0.24 0.12" quat="0.923 0.382 0 0" material="metal" mesh="angled_extrusion"/>
+    <geom class="frame" pos="-0.6 -0.26 0.12" quat="0.923 0.382 0 0" material="metal" mesh="angled_extrusion"/> -->
+    <!-- <geom class="frame" pos="0.43 -0.361 1.02" quat="0 0 0 1" mesh="extrusion_2040_1000" /> -->
+    <!-- <geom class="frame" pos="0 -0.391 -0.01" quat="0 0 0 1" mesh="wormseye_mount"/> -->
+    <!-- block to put the batteries on - 0.59 x 0.52 x 0.02 -->
+    <!-- <geom name="block" type="mesh" mesh="block" pos="-0.195 0.16 0" material="table"/> -->
+
+    <!-- far left tall extrusion -->
+    <geom class="frame" pos="-0.6 0.369 1.24" quat="1 0 0 1" mesh="extrusion_1220" />
+    <!-- far right tall extrusion -->
+    <geom class="frame" pos="0.6 0.369 1.24" quat="1 0 0 1" mesh="extrusion_1220" />
+    <!-- connect far extrusions -->
+    <geom class="frame" pos="-0.61 0.369 1.25" quat="0 1 0 -1" mesh="extrusion_1220"/>
+
+    <!-- NOTE: UNCOMMENT THIS -->
+    <!-- <geom name="battery1" class="object_collision" pos="0 0 0.02" mesh="battery" />
+    <geom name="battery2" class="object_collision"  pos="0.05 0 0.02" mesh="battery" />
+    <geom name="battery3" class="object_collision"  pos="0 0.05 0.02" mesh="battery" />
+    <geom name="battery4" class="object_collision"  pos="0.05 0.05 0.02" mesh="battery" />
+    <geom name="crate" class="object_collision"  pos="-0.1 0 0.02" mesh="crate" /> -->
+
+<!-- <site name="connection" 
+      type="cylinder" 
+      fromto="-0.469 -0.019 0.02 0.469 -0.019 0.02" 
+      size="0.005 0.5" 
+      rgba="1 0 0 1"/>
+<site name="blockref" type="sphere" size="0.05" pos="-0.195 0.16 0" rgba="0 1 0 1" /> -->
+<!-- from top edge of block to top -> 0.1 m -->
+<!-- from left edge of block to left extrusion (inner) -> 0.135 m -->
+<!-- <site name="right_outer_tall" type="sphere" size="0.05" pos="0.6 -0.371 0.62" rgba="1 0 0 1" /> -->
+<!-- <site name="far_ref" type="sphere" size="0.05" pos="-0.61 0.369 0.01" /> -->
+    <camera name="depth_cam" pos="0 -1 0"
+      quat="0.7071 0.7071 0 0" mode="fixed" />
+
+
+    <camera name="cam_215122252880" pos="0.39643233190549854 -0.21379312123789546 0.545367862232795" 
+      quat="0.795615912356056 0.33023237081467627 0.16445501452980676 0.4805168565908588" mode="fixed" />
+    <camera name="cam_215322078948" pos="0.5230283320859281 0.28404983686638324 0.37696659561329027" 
+      quat="0.4329444640543674 0.2501244263760198 0.46248690170661266 0.7321903633103634" mode="fixed" />
+    <camera name="cam_243522072650" pos="-0.082368106251007 -0.04733979976004131 0.601729687993493" 
+      quat="0.7076266186353193 0.0028151769788193723 0.01178050144918497 0.7064827408811402" mode="fixed" />
+    <camera name="cam_311322303806" pos="-0.40646031907033603 0.30092040822973243 0.5365214336338845" 
+      quat="-0.4122612139659325 -0.13986685175416474 0.26533943555714595 0.8602749206956631" mode="fixed" />
+
+
+    <!-- <camera name="cam_215122252880_new" pos="0.6464323319054985 -0.3637931212378955 0.545367862232795" 
+      quat="0.795615912356056 0.33023237081467627 0.16445501452980676 0.4805168565908588" mode="fixed" />
+
+    <camera name="cam_215122252880_2" pos="0.6464323319054985 -0.21379312123789546 0.545367862232795" 
+      quat="0.795615912356056 0.33023237081467627 0.16445501452980676 0.4805168565908588" mode="fixed" /> -->
+    <!-- <camera name="cam_215122252880" pos="0.3764323319054985 -0.21379312123789546 0.545367862232795" 
+      quat="0.795615912356056 0.33023237081467627 0.16445501452980676 0.4805168565908588" mode="fixed" focal="" principalpixel=""/>
+    <camera name="cam_215322078948" pos="0.5030283320859281 0.28404983686638324 0.37696659561329027" 
+      quat="0.4329444640543674 0.2501244263760198 0.46248690170661266 0.7321903633103634" mode="fixed" />
+    <camera name="cam_243522072650" pos="-0.102368106251007 -0.04733979976004131 0.601729687993493" 
+      quat="0.7076266186353193 0.0028151769788193723 0.01178050144918497 0.7064827408811402" mode="fixed" />
+    <camera name="cam_311322303806" pos="-0.426460319070336 0.30092040822973243 0.5365214336338845" 
+      quat="-0.4122612139659325 -0.13986685175416474 0.26533943555714595 0.8602749206956631" mode="fixed" /> -->
+      <!-- <camera name="cam_215122252880" pos="0.3214323319054985 -0.12879312123789546 0.545367862232795" 
+      quat="0.795615912356056 0.33023237081467627 0.16445501452980674 0.4805168565908588" mode="fixed" /> -->
+      <!-- <camera name="cam_215322078948" pos="0.4480283320859281 0.36904983686638326 0.3769665956132902" 
+      quat="0.4329444640543673 0.2501244263760197 0.4624869017066126 0.7321903633103632" mode="fixed" />
+    <camera name="cam_243522072650" pos="-0.157368106251007 0.0376602002399587 0.601729687993493" 
+      quat="0.7076266186353193 0.0028151769788193723 0.01178050144918497 0.7064827408811402" mode="fixed" />
+    <camera name="cam_311322303806" pos="-0.48146031907033604 0.3859204082297324 0.5365214336338845" 
+      quat="-0.4122612139659325 -0.13986685175416474 0.26533943555714595 0.8602749206956631" mode="fixed" /> -->
+    <!-- <camera name="depth_cam" pos="0 -2 0.3"
+      quat="0.7071 0.7071 0 0" mode="fixed"/> -->
+    <!-- <camera name="origin_cam" pos="0.5 0 0.5" 
+      quat="1 0 0 0" mode="fixed"/> -->
+    <!-- <site name="origin_pt" pos="0 0 0" size="0.005" rgba="0.5 0.5 0.5 1"/>
+    <site name="x_axis" pos="0.3 0 0" size="0.05" rgba="1 0 0 1"/>
+    <site name="y_axis" pos="0 0.3 0" size="0.05" rgba="0 1 0 1"/>
+    <site name="z_axis" pos="0 0 0.3" size="0.05" rgba="0 0 1 1"/> -->
+
+    <!-- <geom name="x_axis_line" type="capsule" fromto="0 0 0 0.3 0 0" size="0.01" rgba="1 0 0 1"/>
+    <geom name="y_axis_line" type="capsule" fromto="0 0 0 0 0.3 0" size="0.01" rgba="0 1 0 1"/>
+    <geom name="z_axis_line" type="capsule" fromto="0 0 0 0 0 0.3" size="0.01" rgba="0 0 1 1"/>
+    <geom name="origin" type="sphere" pos="0 0 0" size="0.05" rgba="1 0 0 1"/> -->
+
+      </worldbody>
+</mujoco>

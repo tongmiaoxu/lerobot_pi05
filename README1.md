@@ -1,4 +1,3 @@
-s
 
 ## Data Collection
 src/lerobot/scripts/lerobot_record.py    ← Main entry point (lerobot-record command)
@@ -66,21 +65,6 @@ lerobot-train \
   --policy.n_action_steps=50 \
   --batch_size=64
 ```
-### Policy rollout in Simulation
-```bash
-python visual_match/deploy_act_policy_mujoco.py \
-    --policy-path outputs/act_training_wrist/checkpoints/last/pretrained_model \
-    --prompt "Pick up the cube" \
-    --fps 30 \
-    --new
-```
-
-```bash
-python visual_match/deploy_act_policy_mujoco.py \
-    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
-    --prompt "Pick up the cube" \
-    --fps 30
-```
 ### Policy Deployment
 ```bash
 lerobot-record \
@@ -114,12 +98,37 @@ python visual_match/load_model.py
 ```
 ### Replay in mujoco (--new means using new normalization method in lerobot0.4.3)
 ```bash
-python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/  --episode 0 --new
+python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/  tongmiao/aloha_pick_cube/ --episode 0 --new
 ```
-### Compare Recorded vs MuJoCo (--new means using new normalization method in lerobot0.4.3)
+
+### Policy rollout in Simulation
+Color calibration is applied automatically if calibration_pairs_wrist/calibrated/color_mapping.yaml exists.
 
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/ --episode 0 --new 
+python visual_match/deploy_act_policy_mujoco.py \
+    --policy-path outputs/act_training_wrist/checkpoints/last/pretrained_model \
+    --prompt "Pick up the cube" \
+    --fps 30 \
+    --new
+
+python visual_match/deploy_act_policy_mujoco.py \
+    --policy-path outputs/diffusion_training_wrist/checkpoints/last/pretrained_model \
+    --prompt "Pick up the cube" \
+    --fps 30 \
+    --new
+```
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
+    --prompt "Pick up the cube" \
+    --fps 30
+```
+
+### Compare Recorded vs MuJoCo (--new means using new normalization method in lerobot0.4.3)
+Color calibration is applied automatically if calibration_pairs_wrist/calibrated/color_mapping.yaml exists.
+
+```bash
+python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new 
  
 ```
 

@@ -14,6 +14,7 @@ Usage:
 
 import sys
 import os
+import re
 import argparse
 from pathlib import Path
 
@@ -59,6 +60,77 @@ except (AttributeError, cv2.error) as e:
 # Lerobot dataset loader
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
+
+# ============================================================================
+# Color calibration functions
+# ============================================================================
+
+def _get_aug(x: np.ndarray, add_ones: bool = False) -> np.ndarray:
+    """Augment input features for quadratic polynomial regression."""
+    if add_ones:
+        ones = np.ones((x.shape[0], 1), np.float64)
+        return np.hstack([x ** 2, x, ones])
+    return np.hstack([x ** 2, x])
+
+
+def load_color_mapping(yaml_path: str):
+    """
+    Load color transform from color_mapping.yaml file.
+    
+    Returns:
+        A: Transform matrix (3, 6) for [R², G², B², R, G, B] terms
+        b: Bias vector (3,), constant term
+    """
+    with open(yaml_path, 'r') as f:
+        content = f.read()
+    
+    # Parse color_A matrix (flattened 18 values)
+    a_match = re.search(r'color_A:\s*\[(.*?)\]', content, re.DOTALL)
+    if not a_match:
+        raise ValueError(f"Could not find color_A in {yaml_path}")
+    a_values = [float(x.strip()) for x in a_match.group(1).replace('\n', '').split(',')]
+    A = np.array(a_values, dtype=np.float32).reshape(3, 6)  # 3 channels, 6 features
+    
+    # Parse color_b vector (3 values)
+    b_match = re.search(r'color_b:\s*\[(.*?)\]', content, re.DOTALL)
+    if not b_match:
+        raise ValueError(f"Could not find color_b in {yaml_path}")
+    b_values = [float(x.strip()) for x in b_match.group(1).replace('\n', '').split(',')]
+    b = np.array(b_values, dtype=np.float32)
+    
+    return A, b
+
+
+def apply_color_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Apply quadratic color transform to image.
+    
+    Args:
+        img: Input image (H, W, 3) in BGR format, uint8 [0-255]
+        A: Transform matrix (3, 6) for [R², G², B², R, G, B] terms
+        b: Bias vector (3,), constant term
+    
+    Returns:
+        Transformed image (H, W, 3) in BGR format, uint8 [0-255]
+    """
+    # Convert BGR to RGB for transform
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Flatten and normalize to [0, 1]
+    flat = img_rgb.reshape(-1, 3).astype(np.float32) / 255.0
+    
+    # Apply quadratic transform: [R², G², B², R, G, B] @ A.T + b
+    flat_aug = _get_aug(flat, add_ones=False)  # Shape: (N, 6)
+    out = flat_aug @ A.T + b  # Shape: (N, 3)
+    
+    # Clip and convert back to uint8
+    out = np.clip(out, 0.0, 1.0)
+    out_rgb = (out.reshape(img_rgb.shape) * 255.0).astype(np.uint8)
+    
+    # Convert RGB back to BGR
+    out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+    
+    return out_bgr
 
 # ============================================================================
 # Gaussian Splatting imports (from eval_pipeline_advait_new.py)
@@ -109,11 +181,14 @@ T_splat2mj = np.load(ICP_TRANSFORM_PATH) if os.path.exists(ICP_TRANSFORM_PATH) e
 # ============================================================================
 
 def get_robot_geom_ids(model):
-    """Returns a set of geom indices that belong to the robot."""
+    """Returns a set of geom indices that belong to the robot and manipulatable objects (foreground)."""
     robot_body_ids = []
     for body_id in range(model.nbody):
         body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-        if body_name is not None and (body_name.startswith("left/") or body_name.startswith("right/")):
+        # Include robot arms and any manipulatable objects (e.g., purple_cube)
+        if body_name is not None and (body_name.startswith("left/") or 
+                                      body_name.startswith("right/") or
+                                      body_name in ["purple_cube"]):
             robot_body_ids.append(body_id)
     robot_geom_ids = set()
     for body_id in robot_body_ids:
@@ -801,6 +876,9 @@ def parse_args():
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--scene-path", type=str, default="pointclouds/N Goodwin Ave_w_o_Arm.npz",
                    help="Path to Gaussian Splatting scene file")
+    p.add_argument("--color-calib-path", type=str, 
+                   default="calibration_pairs_wrist/calibrated/color_mapping.yaml",
+                   help="Path to color calibration YAML file (optional)")
     p.add_argument("--replay-mode", type=str, default="absolute", choices=["absolute", "delta"],
                    help="Joint replay mode: 'absolute' uses calibrated motor positions, 'delta' uses keyframe + deltas")
     p.add_argument("--new", action="store_true",
@@ -966,6 +1044,20 @@ def main():
         'viz_near': 0.1, 'viz_far': 10.0
     }
     
+    # Load color calibration if available
+    color_calib = None
+    if args.color_calib_path and os.path.exists(args.color_calib_path):
+        try:
+            color_A, color_b = load_color_mapping(args.color_calib_path)
+            color_calib = (color_A, color_b)
+            print(f"[INFO] Loaded color calibration from: {args.color_calib_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to load color calibration: {e}")
+            print("[INFO] Continuing without color calibration")
+    else:
+        print(f"[INFO] Color calibration file not found at: {args.color_calib_path}")
+        print("[INFO] Continuing without color calibration")
+    
     # Convert actions
     print("[INFO] Converting actions to MuJoCo format...")
     use_absolute = (args.replay_mode == "absolute")
@@ -1042,6 +1134,11 @@ def main():
                     # Composite: background + foreground where mask is True
                     composite_frame = bg_bgr.copy()
                     composite_frame[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
+                    
+                    # Apply color calibration if available
+                    if color_calib is not None:
+                        color_A, color_b = color_calib
+                        composite_frame = apply_color_transform(composite_frame, color_A, color_b)
                 except Exception as e:
                     # Log error on first frame only to avoid spam
                     if frame_idx == 0:

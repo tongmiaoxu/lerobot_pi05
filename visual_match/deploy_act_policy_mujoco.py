@@ -15,6 +15,7 @@ Usage:
 
 import sys
 import os
+import re
 import argparse
 from pathlib import Path
 import time
@@ -52,6 +53,85 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.control_utils import predict_action, prepare_observation_for_inference
 from lerobot.utils.utils import get_safe_torch_device
 from lerobot.utils.constants import OBS_STATE, OBS_IMAGES
+
+# ============================================================================
+# Import Gaussian Splatting helpers from compare_recorded_vs_mujoco.py
+# ============================================================================
+sys.path.insert(0, str(Path(__file__).parent))
+from compare_recorded_vs_mujoco import (
+    get_robot_geom_ids,
+    load_scene_data,
+    render_gaussian,
+    get_mujoco_camera_pose,
+    mj_pose_to_gaussian_w2c,
+    get_camera_intrinsics_from_model,
+    T_splat2mj,
+)
+
+# ============================================================================
+# Color calibration functions
+# ============================================================================
+
+def _get_aug(x: np.ndarray, add_ones: bool = False) -> np.ndarray:
+    """Augment input features for quadratic polynomial regression."""
+    if add_ones:
+        ones = np.ones((x.shape[0], 1), np.float64)
+        return np.hstack([x ** 2, x, ones])
+    return np.hstack([x ** 2, x])
+
+
+def load_color_mapping(yaml_path: str):
+    """
+    Load color transform from color_mapping.yaml file.
+    
+    Returns:
+        A: Transform matrix (3, 6) for [R², G², B², R, G, B] terms
+        b: Bias vector (3,), constant term
+    """
+    with open(yaml_path, 'r') as f:
+        content = f.read()
+    
+    # Parse color_A matrix (flattened 18 values)
+    a_match = re.search(r'color_A:\s*\[(.*?)\]', content, re.DOTALL)
+    if not a_match:
+        raise ValueError(f"Could not find color_A in {yaml_path}")
+    a_values = [float(x.strip()) for x in a_match.group(1).replace('\n', '').split(',')]
+    A = np.array(a_values, dtype=np.float32).reshape(3, 6)  # 3 channels, 6 features
+    
+    # Parse color_b vector (3 values)
+    b_match = re.search(r'color_b:\s*\[(.*?)\]', content, re.DOTALL)
+    if not b_match:
+        raise ValueError(f"Could not find color_b in {yaml_path}")
+    b_values = [float(x.strip()) for x in b_match.group(1).replace('\n', '').split(',')]
+    b = np.array(b_values, dtype=np.float32)
+    
+    return A, b
+
+
+def apply_color_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Apply quadratic color transform to image.
+    
+    Args:
+        img: Input image (H, W, 3) in RGB format, uint8 [0-255]
+        A: Transform matrix (3, 6) for [R², G², B², R, G, B] terms
+        b: Bias vector (3,), constant term
+    
+    Returns:
+        Transformed image (H, W, 3) in RGB format, uint8 [0-255]
+    """
+    # Flatten and normalize to [0, 1]
+    flat = img.reshape(-1, 3).astype(np.float32) / 255.0
+    
+    # Apply quadratic transform: [R², G², B², R, G, B] @ A.T + b
+    flat_aug = _get_aug(flat, add_ones=False)  # Shape: (N, 6)
+    out = flat_aug @ A.T + b  # Shape: (N, 3)
+    
+    # Clip and convert back to uint8
+    out = np.clip(out, 0.0, 1.0)
+    out_rgb = (out.reshape(img.shape) * 255.0).astype(np.uint8)
+    
+    return out_rgb
 
 
 def display_camera_images(observation: dict, policy_config=None, window_name_prefix: str = "Camera"):
@@ -227,21 +307,26 @@ def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
 
 def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco.Renderer, 
                                   calib_dir: Path, gripper_ctrl_range: tuple,
-                                  camera_name: str = "teleoperator_pov") -> dict:
+                                  camera_name: str = "teleoperator_pov",
+                                  seg_renderer: mujoco.Renderer = None,
+                                  robot_geom_ids: set = None,
+                                  gaussian_data: dict = None) -> dict:
     """
-    Build observation dictionary from MuJoCo state.
+    Build observation dictionary from MuJoCo state with optional Gaussian Splatting composite.
     
     Returns observation in format expected by policy:
     {
         "observation.state": np.ndarray,  # (14,) joint positions
-        "observation.images.cam_high": np.ndarray,  # (H, W, 3) RGB image
+        "observation.images.cam_high": np.ndarray,  # (H, W, 3) RGB image (composite if Gaussian available)
         "observation.images.cam_low": np.ndarray,
-        "observation.images.cam_left_wrist": np.ndarray,
-        "observation.images.cam_right_wrist": np.ndarray,
+        "observation.images.cam_left_wrist": np.ndarray,  # (composite if Gaussian available)
+        "observation.images.cam_right_wrist": np.ndarray,  # (composite if Gaussian available)
     }
+    
+    Args:
+        gaussian_data: Dict with 'scene_data', 'scene_depth_data', 'intrinsics_cache', 'viz_cfg' for composite rendering
     """
     # Convert MuJoCo state (radians) to lerobot format (normalized degrees)
-    # This converts qpos from MuJoCo radians to lerobot normalized degrees
     state = convert_mujoco_state_to_lerobot(data, calib_dir, gripper_ctrl_range)
     
     # Build observation dict
@@ -249,34 +334,114 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
         OBS_STATE: state,
     }
     
-    # Render all required camera images
-    # Policy expects: cam_high, cam_low, cam_left_wrist, cam_right_wrist
-    # Try to use specific cameras if they exist, otherwise use the default camera for all
+    # Camera mapping: observation key -> MuJoCo camera name
     camera_names = {
-        "observation.images.cam_high": "teleoperator_pov",  # Default to teleoperator view
+        "observation.images.cam_high": "teleoperator_pov",
         "observation.images.cam_low": "depth_cam",
         "observation.images.cam_left_wrist": "wrist_cam_left",
         "observation.images.cam_right_wrist": "wrist_cam_right",
     }
- 
+    
+    # Check if Gaussian composite rendering is available
+    use_composite = (gaussian_data is not None and 
+                     gaussian_data.get('scene_data') is not None and
+                     seg_renderer is not None and
+                     robot_geom_ids is not None)
+    
+    # Wrist cameras should use composite rendering (if available)
+    wrist_cameras = {"wrist_cam_left", "wrist_cam_right"}
     
     # Render each camera view
     for obs_key, cam_name_to_use in camera_names.items():
         try:
-            renderer.update_scene(data, camera=cam_name_to_use)
-            rgb_image = renderer.render()
+            # Decide if we should use composite rendering for this camera
+            should_composite = use_composite and cam_name_to_use in wrist_cameras
+            
+            if should_composite:
+                # Render composite (Gaussian background + MuJoCo foreground)
+                rgb_image = render_composite_view(
+                    model, data, renderer, seg_renderer, robot_geom_ids,
+                    cam_name_to_use, gaussian_data
+                )
+            else:
+                # Render MuJoCo only
+                renderer.update_scene(data, camera=cam_name_to_use)
+                rgb_image = renderer.render()
+            
             # Convert to [0, 1] range
             rgb_image = rgb_image.astype(np.float32) / 255.0
             observation[obs_key] = rgb_image
+            
         except Exception as e:
-            # If camera doesn't exist, use the default camera
-            print(f"[WARN] Camera '{cam_name_to_use}' not found, using '{camera_name}' instead")
+            # Fallback to default camera on error
+            print(f"[WARN] Camera '{cam_name_to_use}' rendering failed: {e}, using '{camera_name}' instead")
             renderer.update_scene(data, camera=camera_name)
             rgb_image = renderer.render()
             rgb_image = rgb_image.astype(np.float32) / 255.0
             observation[obs_key] = rgb_image
     
     return observation
+
+
+def render_composite_view(model: MjModel, data: MjData, 
+                         renderer: mujoco.Renderer, seg_renderer: mujoco.Renderer,
+                         robot_geom_ids: set, cam_name: str, gaussian_data: dict) -> np.ndarray:
+    """
+    Render composite view: Gaussian Splatting background + MuJoCo robot foreground.
+    Optionally applies color calibration if available.
+    
+    Returns:
+        RGB image as uint8 numpy array (H, W, 3)
+    """
+    # Render MuJoCo foreground
+    renderer.update_scene(data, camera=cam_name)
+    fg_rgb = renderer.render()
+    
+    # Get segmentation mask for robot
+    seg_renderer.update_scene(data, camera=cam_name)
+    seg_mask = seg_renderer.render()
+    seg_labels = seg_mask[:, :, 0].astype(np.int32)
+    seg_labels[seg_labels == -1] = 0
+    robot_mask = np.isin(seg_labels, list(robot_geom_ids))
+    mask_uint8 = (robot_mask.astype(np.uint8)) * 255
+    
+    # Render Gaussian background
+    try:
+        # Get camera pose and intrinsics
+        camera_pose = get_mujoco_camera_pose(model, data, cam_name)
+        w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
+        
+        # Get or compute intrinsics for this camera
+        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+        intrinsics_cache = gaussian_data['intrinsics_cache']
+        if cam_name not in intrinsics_cache:
+            viz_cfg = gaussian_data['viz_cfg']
+            k = get_camera_intrinsics_from_model(model, cam_id, viz_cfg['viz_w'], viz_cfg['viz_h'])
+            intrinsics_cache[cam_name] = k
+        else:
+            k = intrinsics_cache[cam_name]
+        
+        # Render Gaussian background
+        bg_im = render_gaussian(w2c, k, gaussian_data['scene_data'], 
+                               gaussian_data['scene_depth_data'], gaussian_data['viz_cfg'])
+        bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
+        bg_np = (bg_np * 255).astype(np.uint8)
+        
+        # Composite: background + foreground where mask is True
+        composite = bg_np.copy()
+        composite[mask_uint8 > 0] = fg_rgb[mask_uint8 > 0]
+        
+        # Apply color calibration if available
+        if 'color_calib' in gaussian_data and gaussian_data['color_calib'] is not None:
+            color_A, color_b = gaussian_data['color_calib']
+            composite = apply_color_transform(composite, color_A, color_b)
+        
+        return composite
+        
+    except Exception as e:
+        # Fallback to MuJoCo only on Gaussian rendering error
+        print(f"[WARN] Gaussian rendering failed for {cam_name}: {e}, using MuJoCo only")
+        return fg_rgb
 
 
 def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndarray,
@@ -479,6 +644,18 @@ def main():
     )
     parser.add_argument("--new", action="store_true",
                    help="Use PI05 normalization method: degrees = (raw - mid) * 360 / max_res")
+    parser.add_argument(
+        "--scene-path",
+        type=str,
+        default="pointclouds/N Goodwin Ave_w_o_Arm.npz",
+        help="Path to Gaussian Splatting scene file for composite rendering (optional)"
+    )
+    parser.add_argument(
+        "--color-calib-path",
+        type=str,
+        default="calibration_pairs_wrist/calibrated/color_mapping.yaml",
+        help="Path to color calibration YAML file (optional)"
+    )
     
     args = parser.parse_args()
     
@@ -486,6 +663,15 @@ def main():
     policy, config_dict = load_policy(args.policy_path)
     device = get_safe_torch_device(policy.config.device)
     policy = policy.to(device)
+    
+    # Print policy action parameters
+    print(f"[INFO] Policy action parameters:")
+    if hasattr(policy.config, 'horizon'):
+        print(f"  - horizon: {policy.config.horizon} (number of future steps predicted)")
+    if hasattr(policy.config, 'n_action_steps'):
+        print(f"  - n_action_steps: {policy.config.n_action_steps} (number of steps executed per prediction)")
+    if hasattr(policy.config, 'chunk_size'):
+        print(f"  - chunk_size: {policy.config.chunk_size} (ACT chunk size)")
     
     # Create pre/post processors
     # Try to load from pretrained path, fallback to creating from config if files don't exist
@@ -539,6 +725,82 @@ def main():
     RENDER_W, RENDER_H = 640, 480
     renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     
+    # Create segmentation renderer for composite rendering
+    seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
+    seg_renderer.enable_segmentation_rendering()
+    
+    # Get robot geom IDs for masking
+    robot_geom_ids = get_robot_geom_ids(model)
+    print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
+    
+    # Load Gaussian Splatting scene (optional)
+    gaussian_data = None
+    if os.path.exists(args.scene_path):
+        try:
+            # Check if diff_gaussian_rasterization is available
+            from diff_gaussian_rasterization import GaussianRasterizer
+            from diff_gaussian_rasterization import GaussianRasterizationSettings
+            
+            # Get initial camera pose and intrinsics for wrist cameras
+            # We'll use wrist_cam_right as reference for loading scene
+            composite_cam = "wrist_cam_right"
+            composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, composite_cam)
+            if composite_cam_id == -1:
+                print(f"[WARN] Camera '{composite_cam}' not found, trying wrist_cam_left")
+                composite_cam = "wrist_cam_left"
+                composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, composite_cam)
+            
+            if composite_cam_id != -1:
+                # Get intrinsics
+                k = get_camera_intrinsics_from_model(model, composite_cam_id, RENDER_W, RENDER_H)
+                
+                # Get initial w2c
+                mujoco.mj_forward(model, data)
+                init_pose = get_mujoco_camera_pose(model, data, composite_cam)
+                w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
+                
+                # Load scene
+                scene_data, scene_depth_data = load_scene_data(args.scene_path, w2c_init, k)
+                
+                # Load color calibration if available
+                color_calib = None
+                if args.color_calib_path and os.path.exists(args.color_calib_path):
+                    try:
+                        color_A, color_b = load_color_mapping(args.color_calib_path)
+                        color_calib = (color_A, color_b)
+                        print(f"[INFO] Loaded color calibration from: {args.color_calib_path}")
+                    except Exception as e:
+                        print(f"[INFO] Failed to load color calibration: {e}, Continuing without color calibration")
+                else:
+                    print("[INFO] Continuing without color calibration")
+                
+                # Package Gaussian data
+                viz_cfg = {
+                    'viz_w': RENDER_W, 'viz_h': RENDER_H,
+                    'viz_near': 0.1, 'viz_far': 10.0
+                }
+                gaussian_data = {
+                    'scene_data': scene_data,
+                    'scene_depth_data': scene_depth_data,
+                    'intrinsics_cache': {},  # Will cache intrinsics per camera
+                    'viz_cfg': viz_cfg,
+                    'color_calib': color_calib  # Add color calibration
+                }
+                print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
+                print(f"[INFO] Composite rendering enabled for wrist cameras")
+            else:
+                print(f"[WARN] No wrist cameras found, Gaussian rendering disabled")
+                
+        except ImportError:
+            print("[WARN] diff_gaussian_rasterization not installed, composite rendering disabled")
+            print("[INFO] To enable, install: pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization")
+        except Exception as e:
+            print(f"[WARN] Failed to load Gaussian Splatting: {e}")
+            print("[INFO] Continuing with MuJoCo-only rendering")
+    else:
+        print(f"[INFO] Scene file not found: {args.scene_path}")
+        print("[INFO] Using MuJoCo-only rendering (no Gaussian background)")
+    
     # Reset policy
     policy.reset()
     
@@ -580,7 +842,10 @@ def main():
             
             # Build observation from MuJoCo (convert to lerobot format)
             observation = build_observation_from_mujoco(
-                model, data, renderer, calib_dir, gripper_ctrl_range, args.camera
+                model, data, renderer, calib_dir, gripper_ctrl_range, args.camera,
+                seg_renderer=seg_renderer,
+                robot_geom_ids=robot_geom_ids,
+                gaussian_data=gaussian_data
             )
             
             # Display camera images (if not headless)
@@ -603,6 +868,15 @@ def main():
                     task=args.prompt,
                     robot_type="aloha_follower",
                 )
+            
+            # Debug: show action prediction details on first step
+            if step == 0:
+                action_shape = action.shape if isinstance(action, torch.Tensor) else np.array(action).shape
+                print(f"[INFO] First action prediction:")
+                print(f"  - Action shape: {action_shape}")
+                if hasattr(policy.config, 'n_action_steps'):
+                    print(f"  - Executing step 0 of {policy.config.n_action_steps} predicted actions")
+                    print(f"  - Policy will repredict every {policy.config.n_action_steps} steps")
             
             # Convert action to MuJoCo control
             ctrl = convert_action_to_mujoco(action, mujoco_keyframe_ctrl, gripper_ctrl_range, calib_dir, use_new_normalization=args.new)
