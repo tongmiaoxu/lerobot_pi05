@@ -40,10 +40,10 @@ lerobot-train \
   --policy.push_to_hub=false \
   --dataset.repo_id=tongmiao/aloha_pick_cube \
   --dataset.root=data/tongmiao/aloha_pick_cube \
-  --output_dir=./outputs/act_training_wrist \
+  --output_dir=./outputs/act2_training_wrist \
   --policy.image_keys_filter='["cam_right_wrist", "cam_left_wrist"]' \
   --batch_size=8 \
-  --steps=40000 \
+  --steps=80000 \
   --wandb.enable=true \
   --wandb.project=aloha_pick_cube_lerobot0.4.3_wrist \
   --dataset.image_transforms.enable=true
@@ -98,7 +98,7 @@ python visual_match/load_model.py
 ```
 ### Replay in mujoco (--new means using new normalization method in lerobot0.4.3)
 ```bash
-python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/  tongmiao/aloha_pick_cube/ --episode 0 --new
+python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new
 ```
 
 ### Policy rollout in Simulation

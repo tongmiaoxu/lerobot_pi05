@@ -78,14 +78,15 @@ import json
 # Lerobot dataset loader
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-# ============================================================================
-# Gripper calibration constants
-# ============================================================================
-# LEROBOT GRIPPER RANGE: Change these if your dataset uses different values
-# LEROBOT_OPEN_PCT: The percentage value that means "fully open" in lerobot
-# LEROBOT_CLOSED_PCT: The percentage value that means "fully closed" in lerobot
-LEROBOT_OPEN_PCT = 140.0  # Change to 110.0 if lerobot uses 110% for fully open
-LEROBOT_CLOSED_PCT = 0.0  # Typically 0% for fully closed
+# Import unified conversion module
+from mujoco_lerobot_conversion import (
+    convert_actions_to_mujoco_pi05,
+    convert_actions_to_mujoco_absolute,
+    convert_mujoco_state_to_lerobot,
+    MuJoCoLeRobotConverter,
+    LEROBOT_OPEN_PCT,
+    LEROBOT_CLOSED_PCT,
+)
 
 # -------- Dataclasses ---------------------------------------------------------
 @dataclasses.dataclass
@@ -219,270 +220,27 @@ XML_PATH = str(_project_root / "aloha" / "robolab_setup.xml")
 RENDER_W, RENDER_H = 640, 480
 
 def build_observation(model, data, recorded_observation, renderer, prompt):
+    """Build observation from MuJoCo state.
+    
+    MuJoCo qpos structure (with cube freejoint):
+    - qpos[0:7] = right arm (6 joints + left_finger)
+    - qpos[7] = right/right_finger (coupled, excluded)
+    - qpos[8:15] = left arm (6 joints + left_finger)
+    - qpos[15] = left/right_finger (coupled, excluded)
+    - qpos[16:23] = cube freejoint (3 pos + 4 quat)
+    
+    Observation state (14-dim): [left_arm(7), right_arm(7)]
+    """
     state = np.zeros((14,), np.float32)
-    state[:7] = data.qpos[8:-1]
-    state[7:] = data.qpos[:7]
+    # Left arm: qpos[8:15] (7 elements)
+    state[:7] = data.qpos[8:15]
+    # Right arm: qpos[0:7] (7 elements)
+    state[7:] = data.qpos[0:7]
     images = {}
     return {"state": state, "images": images, "prompt": prompt}
 
-# -------- PI05 normalization method -------------------------------------------
-def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray, mujoco_keyframe_ctrl: np.ndarray,
-                                    gripper_ctrl_range: tuple = (0.002, 0.041)):
-    """
-    PI05 NORMALIZATION: Convert lerobot normalized degrees to MuJoCo (Interbotix) radians.
-    
-    Uses PI05 normalization formula:
-        1. normalized_degrees = (raw - mid) * 360 / max_res (recorded data)
-        2. raw_encoder = (normalized_degrees * max_res / 360) + mid (inverse)
-        3. raw_encoder → interbotix_radians: rad = (raw - 2048) * (2π / 4096)
-    
-    Where:
-        - mid = (range_min + range_max) / 2
-        - max_res = 4095 (for ALOHA motors: 4096 - 1)
-    
-    Calibration data from .cache/calibration/aloha_follower/*.json
-    """
-    from pathlib import Path
-    
-    num_frames = len(actions_raw)
-    ctrl_sequence = np.zeros((num_frames, 14))
-    
-    # Load calibration files (relative to project root)
-    project_root = Path(__file__).parent.parent
-    calib_dir = project_root / ".cache" / "calibration" / "aloha_follower"
-    
-    # Try to load calibration, fall back to hardcoded defaults if not found
-    try:
-        with open(calib_dir / "aloha_left.json") as f:
-            left_calib = json.load(f)
-        with open(calib_dir / "aloha_right.json") as f:
-            right_calib = json.load(f)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Calibration files not found at {calib_dir}, cannot proceed with PI05 normalization")
-    
-    # PI05 constants
-    MAX_RES = 4095  # For ALOHA motors: 4096 - 1
-    
-    def normalized_degrees_to_raw(normalized_degrees: float, range_min: int, range_max: int) -> float:
-        """Convert PI05 normalized degrees to raw encoder value."""
-        mid = (range_min + range_max) / 2
-        raw = (normalized_degrees * MAX_RES / 360) + mid
-        return raw
-    
-    def raw_encoder_to_radians(raw: float) -> float:
-        """Convert raw encoder to Interbotix/MuJoCo radians."""
-        return (raw - 2048) * (2 * np.pi) / 4096
-    
-    gripper_min, gripper_max = gripper_ctrl_range
-    gripper_range = gripper_max - gripper_min
-    
-    # Calculate slope and intercept from control range and lerobot percentage range
-    RIGHT_GRIPPER_SLOPE = (LEROBOT_CLOSED_PCT - LEROBOT_OPEN_PCT) / gripper_range
-    RIGHT_GRIPPER_INTERCEPT = LEROBOT_OPEN_PCT - RIGHT_GRIPPER_SLOPE * gripper_min
-    
-    # Left arm gripper calibration (using same as right for now)
-    LEFT_GRIPPER_SLOPE = RIGHT_GRIPPER_SLOPE
-    LEFT_GRIPPER_INTERCEPT = RIGHT_GRIPPER_INTERCEPT
-    
-    def gripper_lerobot_to_interbotix(lerobot_percent: float, arm_side: str = "right") -> float:
-        """
-        Convert gripper from lerobot percentage to Interbotix radians.
-        """
-        if arm_side == "right":
-            return (lerobot_percent - RIGHT_GRIPPER_INTERCEPT) / RIGHT_GRIPPER_SLOPE
-        else:  # left
-            return (lerobot_percent - LEFT_GRIPPER_INTERCEPT) / LEFT_GRIPPER_SLOPE
-    
-    # Mapping: recorded index → (mujoco ctrl index, calibration dict, joint name, arm_side)
-    # Recorded format: [left_arm(9), right_arm(9)] = 18 total
-    #   Left:  [0]=waist, [1]=shoulder, [2]=shoulder_shadow, [3]=elbow, [4]=elbow_shadow,
-    #          [5]=forearm_roll, [6]=wrist_angle, [7]=wrist_rotate, [8]=gripper
-    #   Right: [9]=waist, [10]=shoulder, [11]=shoulder_shadow, [12]=elbow, [13]=elbow_shadow,
-    #          [14]=forearm_roll, [15]=wrist_angle, [16]=wrist_rotate, [17]=gripper
-    #
-    # MuJoCo ctrl format: [right_arm(7), left_arm(7)] = 14 total
-    #   [0-6]: right waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, gripper
-    #   [7-13]: left waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, gripper
-    
-    # Mapping: (recorded_idx, ctrl_idx, calib, joint_name, arm_side)
-    # Skip shadow joints (indices 2, 4, 11, 13)
-    joint_mapping = [
-        # Right arm: recorded[9-17] → ctrl[0-6]
-        (9,  0, right_calib, "waist", "right"),
-        (10, 1, right_calib, "shoulder", "right"),
-        # skip 11 (shoulder_shadow)
-        (12, 2, right_calib, "elbow", "right"),
-        # skip 13 (elbow_shadow)
-        (14, 3, right_calib, "forearm_roll", "right"),
-        (15, 4, right_calib, "wrist_angle", "right"),
-        (16, 5, right_calib, "wrist_rotate", "right"),
-        (17, 6, right_calib, "gripper", "right"),
-        # Left arm: recorded[0-8] → ctrl[7-13]
-        (0,  7, left_calib, "waist", "left"),
-        (1,  8, left_calib, "shoulder", "left"),
-        # skip 2 (shoulder_shadow)
-        (3,  9, left_calib, "elbow", "left"),
-        # skip 4 (elbow_shadow)
-        (5, 10, left_calib, "forearm_roll", "left"),
-        (6, 11, left_calib, "wrist_angle", "left"),
-        (7, 12, left_calib, "wrist_rotate", "left"),
-        (8, 13, left_calib, "gripper", "left"),
-    ]
-    
-    # print("[INFO] Converting using PI05 normalization method:")
-    # print("       normalized_degrees = (raw - mid) * 360 / max_res")
-    # print("       where mid = (range_min + range_max) / 2, max_res = 4095")
-    
-    for frame_idx in range(num_frames):
-        for rec_idx, ctrl_idx, calib, joint_name, arm_side in joint_mapping:
-            lerobot_val = actions_raw[frame_idx, rec_idx]
-            
-            if joint_name == "gripper":
-                # Gripper: percentage → Interbotix radians (with arm-specific calibration)
-                mujoco_rad = gripper_lerobot_to_interbotix(lerobot_val, arm_side)
-            else:
-                # Regular joint: PI05 normalized degrees → raw → radians
-                range_min = calib[joint_name]["range_min"]
-                range_max = calib[joint_name]["range_max"]
-                raw = normalized_degrees_to_raw(lerobot_val, range_min, range_max)
-                mujoco_rad = raw_encoder_to_radians(raw)
-            
-            ctrl_sequence[frame_idx, ctrl_idx] = mujoco_rad
-        
-    
-    return ctrl_sequence
-
-# -------- Absolute action conversion (from compare_recorded_vs_mujoco.py) ----
-def convert_actions_to_mujoco_absolute(actions_raw: np.ndarray, mujoco_keyframe_ctrl: np.ndarray, 
-                                        gripper_ctrl_range: tuple = (0.002, 0.041)):
-    """
-    ABSOLUTE: Convert lerobot calibrated degrees to MuJoCo (Interbotix) radians.
-    
-    Uses the SAME conversion as convert_poses.py:lerobot_to_interbotix():
-        1. calibrated_degrees → raw_encoder: raw = deg/180*(resolution/2) - homing_offset (* -1 if drive_mode)
-        2. raw_encoder → interbotix_radians: rad = (raw - 2048) * (2π / 4096)
-    
-    Calibration data from aloha/.cache/calibration/aloha_default/*.json
-    
-    Args:
-        gripper_ctrl_range: (min, max) control range for gripper from XML (default: 0.002, 0.041)
-    """
-    from pathlib import Path
-    
-    num_frames = len(actions_raw)
-    ctrl_sequence = np.zeros((num_frames, 14))
-    
-    # Load calibration files (relative to project root)
-    project_root = Path(__file__).parent.parent
-    calib_dir = project_root / "aloha" / ".cache" / "calibration" / "aloha_default"
-    
-    # Try to load calibration, fall back to hardcoded defaults if not found
-    try:
-        with open(calib_dir / "right_follower.json") as f:
-            right_calib = json.load(f)
-        with open(calib_dir / "left_follower.json") as f:
-            left_calib = json.load(f)
-        print(f"[INFO] Loaded calibration from: {calib_dir}")
-    except FileNotFoundError:
-        print(f"[WARN] Calibration files not found at {calib_dir}, using defaults")
-        # Default calibration (from convert_poses.py)
-        right_calib = {
-            "homing_offset": [-1024, 0, 0, -2048, -2048, -1024, -1024, -1024, -1024],
-            "drive_mode": [0, 0, 0, 0, 0, 0, 0, 0, 0],
-            "motor_names": ["waist", "shoulder", "shoulder_shadow", "elbow", "elbow_shadow", 
-                           "forearm_roll", "wrist_angle", "wrist_rotate", "gripper"]
-        }
-        left_calib = right_calib.copy()
-    
-    def calibrated_degrees_to_raw(degrees: float, homing_offset: int, drive_mode: int, resolution: int = 4096) -> float:
-        """Convert lerobot calibrated degrees to raw encoder value."""
-        value = degrees / 180 * (resolution // 2)
-        value -= homing_offset
-        if drive_mode:
-            value *= -1
-        return value
-    
-    def raw_encoder_to_radians(raw: float) -> float:
-        """Convert raw encoder to Interbotix/MuJoCo radians."""
-        return (raw - 2048) * (2 * np.pi) / 4096
-    
-    gripper_min, gripper_max = gripper_ctrl_range
-    gripper_range = gripper_max - gripper_min
-    
-    # Calculate slope and intercept from control range and lerobot percentage range
-    RIGHT_GRIPPER_SLOPE = (LEROBOT_CLOSED_PCT - LEROBOT_OPEN_PCT) / gripper_range
-    RIGHT_GRIPPER_INTERCEPT = LEROBOT_OPEN_PCT - RIGHT_GRIPPER_SLOPE * gripper_min
-    
-    # Left arm gripper calibration (using same as right for now)
-    LEFT_GRIPPER_SLOPE = RIGHT_GRIPPER_SLOPE
-    LEFT_GRIPPER_INTERCEPT = RIGHT_GRIPPER_INTERCEPT
-    
-    def gripper_lerobot_to_interbotix(lerobot_percent: float, arm_side: str = "right") -> float:
-        """
-        Convert gripper from lerobot percentage to Interbotix radians.
-        """
-        if arm_side == "right":
-            return (lerobot_percent - RIGHT_GRIPPER_INTERCEPT) / RIGHT_GRIPPER_SLOPE
-        else:  # left
-            return (lerobot_percent - LEFT_GRIPPER_INTERCEPT) / LEFT_GRIPPER_SLOPE
-    
-    # Mapping: recorded index → (mujoco ctrl index, calibration dict, joint index in calib)
-    # Recorded format: [left_arm(9), right_arm(9)] = 18 total
-    #   Left:  [0]=waist, [1]=shoulder, [2]=shoulder_shadow, [3]=elbow, [4]=elbow_shadow,
-    #          [5]=forearm_roll, [6]=wrist_angle, [7]=wrist_rotate, [8]=gripper
-    #   Right: [9]=waist, [10]=shoulder, [11]=shoulder_shadow, [12]=elbow, [13]=elbow_shadow,
-    #          [14]=forearm_roll, [15]=wrist_angle, [16]=wrist_rotate, [17]=gripper
-    #
-    # MuJoCo ctrl format: [right_arm(7), left_arm(7)] = 14 total
-    #   [0-6]: right waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, gripper
-    #   [7-13]: left waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, gripper
-    
-    # Mapping: (recorded_idx, ctrl_idx, calib, calib_joint_idx, arm_side)
-    # Skip shadow joints (indices 2, 4, 11, 13)
-    joint_mapping = [
-        # Right arm: recorded[9-17] → ctrl[0-6]
-        (9,  0, right_calib, 0, "right"),   # waist
-        (10, 1, right_calib, 1, "right"),   # shoulder
-        # skip 11 (shoulder_shadow)
-        (12, 2, right_calib, 3, "right"),   # elbow
-        # skip 13 (elbow_shadow)
-        (14, 3, right_calib, 5, "right"),   # forearm_roll
-        (15, 4, right_calib, 6, "right"),   # wrist_angle
-        (16, 5, right_calib, 7, "right"),   # wrist_rotate
-        (17, 6, right_calib, 8, "right"),   # gripper
-        # Left arm: recorded[0-8] → ctrl[7-13]
-        (0,  7, left_calib, 0, "left"),    # waist
-        (1,  8, left_calib, 1, "left"),    # shoulder
-        # skip 2 (shoulder_shadow)
-        (3,  9, left_calib, 3, "left"),    # elbow
-        # skip 4 (elbow_shadow)
-        (5, 10, left_calib, 5, "left"),    # forearm_roll
-        (6, 11, left_calib, 6, "left"),    # wrist_angle
-        (7, 12, left_calib, 7, "left"),    # wrist_rotate
-        (8, 13, left_calib, 8, "left"),    # gripper
-    ]
-    
-    print("[INFO] Converting using calibration-based absolute conversion:")
-    
-    for frame_idx in range(num_frames):
-        for rec_idx, ctrl_idx, calib, calib_idx, arm_side in joint_mapping:
-            joint_name = calib["motor_names"][calib_idx]
-            lerobot_val = actions_raw[frame_idx, rec_idx]
-            
-            if joint_name == "gripper":
-                # Gripper: percentage → Interbotix radians (with arm-specific calibration)
-                mujoco_rad = gripper_lerobot_to_interbotix(lerobot_val, arm_side)
-            else:
-                # Regular joint: calibrated degrees → raw → radians
-                homing_offset = calib["homing_offset"][calib_idx]
-                drive_mode = calib["drive_mode"][calib_idx]
-                raw = calibrated_degrees_to_raw(lerobot_val, homing_offset, drive_mode)
-                mujoco_rad = raw_encoder_to_radians(raw)
-            
-            ctrl_sequence[frame_idx, ctrl_idx] = mujoco_rad
-        
-     
-    return ctrl_sequence
+# Conversion functions are now imported from mujoco_lerobot_conversion module
+# See: convert_actions_to_mujoco_pi05, convert_actions_to_mujoco_absolute
 
 # -------- Main ----------------------------------------------------------------
 def main():

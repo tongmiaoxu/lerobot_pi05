@@ -67,6 +67,11 @@ from compare_recorded_vs_mujoco import (
     get_camera_intrinsics_from_model,
     T_splat2mj,
 )
+from mujoco_lerobot_conversion import (
+    MuJoCoLeRobotConverter,
+    convert_actions_to_mujoco_pi05,
+    convert_actions_to_mujoco_absolute,
+)
 
 # ============================================================================
 # Color calibration functions
@@ -157,15 +162,8 @@ def display_camera_images(observation: dict, policy_config=None, window_name_pre
     
     for img_key in image_keys:
         img = observation[img_key]
-        
-        # Convert from [0, 1] float32 to [0, 255] uint8 for display
-        if img.dtype == np.float32 and img.max() <= 1.0:
-            img_display = (img * 255).astype(np.uint8)
-        else:
-            img_display = img.astype(np.uint8)
-        
         # Convert RGB to BGR for OpenCV
-        img_bgr = cv2.cvtColor(img_display, cv2.COLOR_RGB2BGR)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         
         # Extract a nice window name from the key
         # e.g., "observation.images.cam_high" -> "cam_high"
@@ -310,7 +308,8 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
                                   camera_name: str = "teleoperator_pov",
                                   seg_renderer: mujoco.Renderer = None,
                                   robot_geom_ids: set = None,
-                                  gaussian_data: dict = None) -> dict:
+                                  gaussian_data: dict = None,
+                                  use_new_normalization: bool = False) -> dict:
     """
     Build observation dictionary from MuJoCo state with optional Gaussian Splatting composite.
     
@@ -325,9 +324,11 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
     
     Args:
         gaussian_data: Dict with 'scene_data', 'scene_depth_data', 'intrinsics_cache', 'viz_cfg' for composite rendering
+        use_new_normalization: If True, use PI05 normalization for state conversion
     """
     # Convert MuJoCo state (radians) to lerobot format (normalized degrees)
-    state = convert_mujoco_state_to_lerobot(data, calib_dir, gripper_ctrl_range)
+    converter = MuJoCoLeRobotConverter(gripper_ctrl_range, use_new_normalization)
+    state = converter.state_to_lerobot(data.qpos)
     
     # Build observation dict
     observation = {
@@ -369,7 +370,6 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
                 rgb_image = renderer.render()
             
             # Convert to [0, 1] range
-            rgb_image = rgb_image.astype(np.float32) / 255.0
             observation[obs_key] = rgb_image
             
         except Exception as e:
@@ -377,7 +377,6 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
             print(f"[WARN] Camera '{cam_name_to_use}' rendering failed: {e}, using '{camera_name}' instead")
             renderer.update_scene(data, camera=camera_name)
             rgb_image = renderer.render()
-            rgb_image = rgb_image.astype(np.float32) / 255.0
             observation[obs_key] = rgb_image
     
     return observation
@@ -449,15 +448,8 @@ def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndar
     """
     Convert policy action (18 dims) to MuJoCo control (14 dims).
     
-    Uses convert_actions_to_mujoco_absolute from run_prerecorded_traj_mujoco.py
-    to match the conversion used during training with old data format.
+    Uses unified conversion module for consistent conversion.
     """
-    # Import the conversion function from run_prerecorded_traj_mujoco
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    from run_prerecorded_traj_mujoco import convert_actions_to_mujoco_pi05,convert_actions_to_mujoco_absolute
-    
     # Convert to numpy and reshape for the conversion function
     action_np = action.cpu().numpy()
     if action_np.ndim > 1:
@@ -466,7 +458,7 @@ def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndar
     # Reshape to (1, 18) for the conversion function (expects batch dimension)
     actions_raw = action_np.reshape(1, -1)
     
-    # Use the same conversion function as run_prerecorded_traj_mujoco.py
+    # Use the unified conversion module
     if use_new_normalization:
         ctrl_sequence = convert_actions_to_mujoco_pi05(
             actions_raw, 
@@ -481,121 +473,6 @@ def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndar
         )
     # Return first frame (remove batch dimension)
     return ctrl_sequence[0]
-
-
-def convert_mujoco_state_to_lerobot(data: MjData, calib_dir: Path, gripper_ctrl_range: tuple) -> np.ndarray:
-    """
-    Convert MuJoCo state (qpos in radians) to lerobot normalized format (degrees).
-    
-    This is the inverse of the action conversion - converts MuJoCo observations
-    back to lerobot format that the policy expects.
-    
-    Returns 18-dim state: [left_arm(9), right_arm(9)]
-    """
-    # Load calibration files
-    try:
-        with open(calib_dir / "right_follower.json") as f:
-            right_calib = json.load(f)
-        with open(calib_dir / "left_follower.json") as f:
-            left_calib = json.load(f)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Calibration files not found: {calib_dir}")
-    
-    def radians_to_raw_encoder(mujoco_rad: float, resolution: int = 4096) -> float:
-        """Convert MuJoCo radians to raw encoder value."""
-        return (mujoco_rad * 4096 / (2 * np.pi)) + 2048
-    
-    def raw_to_calibrated_degrees(raw: float, homing_offset: int, drive_mode: int, resolution: int = 4096) -> float:
-        """Convert raw encoder value to lerobot calibrated degrees."""
-        if drive_mode:
-            raw *= -1
-        raw += homing_offset
-        degrees = raw * 180 / (resolution // 2)
-        return degrees
-    
-    gripper_min, gripper_max = gripper_ctrl_range
-    gripper_range = gripper_max - gripper_min
-    
-    # Calculate slope and intercept for gripper conversion (inverse of action conversion)
-    LEROBOT_OPEN_PCT = 140.0
-    LEROBOT_CLOSED_PCT = 0.0
-    RIGHT_GRIPPER_SLOPE = (LEROBOT_CLOSED_PCT - LEROBOT_OPEN_PCT) / gripper_range
-    RIGHT_GRIPPER_INTERCEPT = LEROBOT_OPEN_PCT - RIGHT_GRIPPER_SLOPE * gripper_min
-    
-    def gripper_interbotix_to_lerobot(mujoco_rad: float, calib: dict, arm_side: str = "right") -> float:
-        """Convert gripper from Interbotix radians to lerobot percentage."""
-        if "motor_names" in calib:
-            gripper_idx = calib["motor_names"].index("gripper")
-            drive_mode = calib["drive_mode"][gripper_idx]
-        else:
-            gripper_calib = calib.get("gripper", {})
-            drive_mode = gripper_calib.get("drive_mode", 0)
-        
-        # Inverse of gripper_lerobot_to_interbotix
-        if arm_side == "right":
-            lerobot_pct = RIGHT_GRIPPER_SLOPE * mujoco_rad + RIGHT_GRIPPER_INTERCEPT
-        else:
-            lerobot_pct = RIGHT_GRIPPER_SLOPE * mujoco_rad + RIGHT_GRIPPER_INTERCEPT
-        
-        return np.clip(lerobot_pct, 0.0, 140.0)
-    
-    # MuJoCo qpos structure: [right_arm(8), left_arm(8)]
-    # qpos[0:7] = right arm (waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, left_finger)
-    # qpos[7] = right/right_finger (excluded, coupled via equality constraint)
-    # qpos[8:14] = left arm (waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate, left_finger)
-    # qpos[15] = left/right_finger (excluded, coupled via equality constraint)
-    # Convert to lerobot format: [left_arm(9), right_arm(9)] with shadow joints
-    state = np.zeros((18,), dtype=np.float32)
-    
-    # Mapping: (mujoco_qpos_idx, lerobot_state_idx, calib, calib_joint_idx, arm_side)
-    # Left arm: qpos[8:14] → state[0:7] (with shadow joints, excluding right_finger at qpos[15])
-    left_mapping = [
-        (8, 0, left_calib, 0, "left"),   # waist
-        (9, 1, left_calib, 1, "left"),   # shoulder
-        (9, 2, left_calib, 1, "left"),   # shoulder_shadow (duplicate)
-        (10, 3, left_calib, 3, "left"),   # elbow
-        (10, 4, left_calib, 3, "left"),   # elbow_shadow (duplicate)
-        (11, 5, left_calib, 5, "left"),   # forearm_roll
-        (12, 6, left_calib, 6, "left"),   # wrist_angle
-        (13, 7, left_calib, 7, "left"),   # wrist_rotate
-    ]
-    
-    # Right arm: qpos[0:6] → state[9:16] (with shadow joints, excluding right_finger at qpos[7])
-    right_mapping = [
-        (0, 9, right_calib, 0, "right"),   # waist
-        (1, 10, right_calib, 1, "right"),  # shoulder
-        (1, 11, right_calib, 1, "right"),  # shoulder_shadow (duplicate)
-        (2, 12, right_calib, 3, "right"),  # elbow
-        (2, 13, right_calib, 3, "right"),  # elbow_shadow (duplicate)
-        (3, 14, right_calib, 5, "right"),  # forearm_roll
-        (4, 15, right_calib, 6, "right"),  # wrist_angle
-        (5, 16, right_calib, 7, "right"),  # wrist_rotate
-    ]
-    
-    # Convert joints (skip grippers for now)
-    for mujoco_idx, lerobot_idx, calib, calib_idx, arm_side in left_mapping + right_mapping:
-        if len(data.qpos) > mujoco_idx:
-            mujoco_rad = data.qpos[mujoco_idx]
-            joint_name = calib["motor_names"][calib_idx]
-            
-            # Convert radians → raw → calibrated degrees
-            raw = radians_to_raw_encoder(mujoco_rad)
-            homing_offset = calib["homing_offset"][calib_idx]
-            drive_mode = calib["drive_mode"][calib_idx]
-            degrees = raw_to_calibrated_degrees(raw, homing_offset, drive_mode)
-            state[lerobot_idx] = degrees
-    
-    # Convert grippers: qpos[14] = left/left_finger, qpos[6] = right/left_finger
- 
-    # Left gripper (left/left_finger at qpos[14])
-    left_gripper_rad = data.qpos[14]
-    state[8] = gripper_interbotix_to_lerobot(left_gripper_rad, left_calib, "left")
-    
-    # Right gripper (right/left_finger at qpos[6])
-    right_gripper_rad = data.qpos[6]
-    state[17] = gripper_interbotix_to_lerobot(right_gripper_rad, right_calib, "right")
-
-    return state
 
 
 def main():
@@ -716,11 +593,7 @@ def main():
     print(f"[INFO] Gripper control range: [{gripper_ctrl_range[0]}, {gripper_ctrl_range[1]}]")
     
     # Load calibration directory for action conversion
-    calib_dir = project_root / "aloha" / ".cache" / "calibration" / "aloha_default"
-    if not calib_dir.exists():
-        print(f"[WARN] Calibration directory not found: {calib_dir}")
-        print("[WARN] Will use default calibration values")
-    
+    calib_dir = project_root / ".cache" / "calibration" / "aloha_follower"
     # Create renderer
     RENDER_W, RENDER_H = 640, 480
     renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
@@ -736,67 +609,54 @@ def main():
     # Load Gaussian Splatting scene (optional)
     gaussian_data = None
     if os.path.exists(args.scene_path):
-        try:
-            # Check if diff_gaussian_rasterization is available
-            from diff_gaussian_rasterization import GaussianRasterizer
-            from diff_gaussian_rasterization import GaussianRasterizationSettings
-            
-            # Get initial camera pose and intrinsics for wrist cameras
-            # We'll use wrist_cam_right as reference for loading scene
-            composite_cam = "wrist_cam_right"
+        composite_cam = "wrist_cam_right"
+        composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, composite_cam)
+        if composite_cam_id == -1:
+            print(f"[WARN] Camera '{composite_cam}' not found, trying wrist_cam_left")
+            composite_cam = "wrist_cam_left"
             composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, composite_cam)
-            if composite_cam_id == -1:
-                print(f"[WARN] Camera '{composite_cam}' not found, trying wrist_cam_left")
-                composite_cam = "wrist_cam_left"
-                composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, composite_cam)
+        
+        if composite_cam_id != -1:
+            # Get intrinsics
+            k = get_camera_intrinsics_from_model(model, composite_cam_id, RENDER_W, RENDER_H)
             
-            if composite_cam_id != -1:
-                # Get intrinsics
-                k = get_camera_intrinsics_from_model(model, composite_cam_id, RENDER_W, RENDER_H)
-                
-                # Get initial w2c
-                mujoco.mj_forward(model, data)
-                init_pose = get_mujoco_camera_pose(model, data, composite_cam)
-                w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
-                
-                # Load scene
-                scene_data, scene_depth_data = load_scene_data(args.scene_path, w2c_init, k)
-                
-                # Load color calibration if available
-                color_calib = None
-                if args.color_calib_path and os.path.exists(args.color_calib_path):
-                    try:
-                        color_A, color_b = load_color_mapping(args.color_calib_path)
-                        color_calib = (color_A, color_b)
-                        print(f"[INFO] Loaded color calibration from: {args.color_calib_path}")
-                    except Exception as e:
-                        print(f"[INFO] Failed to load color calibration: {e}, Continuing without color calibration")
-                else:
-                    print("[INFO] Continuing without color calibration")
-                
-                # Package Gaussian data
-                viz_cfg = {
-                    'viz_w': RENDER_W, 'viz_h': RENDER_H,
-                    'viz_near': 0.1, 'viz_far': 10.0
-                }
-                gaussian_data = {
-                    'scene_data': scene_data,
-                    'scene_depth_data': scene_depth_data,
-                    'intrinsics_cache': {},  # Will cache intrinsics per camera
-                    'viz_cfg': viz_cfg,
-                    'color_calib': color_calib  # Add color calibration
-                }
-                print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
-                print(f"[INFO] Composite rendering enabled for wrist cameras")
+            # Get initial w2c
+            mujoco.mj_forward(model, data)
+            init_pose = get_mujoco_camera_pose(model, data, composite_cam)
+            w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
+            
+            # Load scene
+            scene_data, scene_depth_data = load_scene_data(args.scene_path, w2c_init, k)
+            
+            # Load color calibration if available
+            color_calib = None
+            if args.color_calib_path and os.path.exists(args.color_calib_path):
+                try:
+                    color_A, color_b = load_color_mapping(args.color_calib_path)
+                    color_calib = (color_A, color_b)
+                    print(f"[INFO] Loaded color calibration from: {args.color_calib_path}")
+                except Exception as e:
+                    print(f"[INFO] Failed to load color calibration: {e}, Continuing without color calibration")
             else:
-                print(f"[WARN] No wrist cameras found, Gaussian rendering disabled")
-                
-        except ImportError:
-            print("[WARN] diff_gaussian_rasterization not installed, composite rendering disabled")
-            print("[INFO] To enable, install: pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization")
-        except Exception as e:
-            print(f"[WARN] Failed to load Gaussian Splatting: {e}")
-            print("[INFO] Continuing with MuJoCo-only rendering")
+                print("[INFO] Continuing without color calibration")
+            
+            # Package Gaussian data
+            viz_cfg = {
+                'viz_w': RENDER_W, 'viz_h': RENDER_H,
+                'viz_near': 0.1, 'viz_far': 10.0
+            }
+            gaussian_data = {
+                'scene_data': scene_data,
+                'scene_depth_data': scene_depth_data,
+                'intrinsics_cache': {},  # Will cache intrinsics per camera
+                'viz_cfg': viz_cfg,
+                'color_calib': color_calib  # Add color calibration
+            }
+            print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
+            print(f"[INFO] Composite rendering enabled for wrist cameras")
+        else:
+            print(f"[WARN] No wrist cameras found, Gaussian rendering disabled")
+            
     else:
         print(f"[INFO] Scene file not found: {args.scene_path}")
         print("[INFO] Using MuJoCo-only rendering (no Gaussian background)")
@@ -845,7 +705,8 @@ def main():
                 model, data, renderer, calib_dir, gripper_ctrl_range, args.camera,
                 seg_renderer=seg_renderer,
                 robot_geom_ids=robot_geom_ids,
-                gaussian_data=gaussian_data
+                gaussian_data=gaussian_data,
+                use_new_normalization=args.new
             )
             
             # Display camera images (if not headless)
@@ -886,17 +747,6 @@ def main():
                 action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
                 if action_np.ndim > 1:
                     action_np = action_np[0]
-                # print(f"\n[DEBUG Step {step}]")
-                # print(f"Policy action shape: {action_np.shape}")
-                # print(f"  Left arm (0:9):  {action_np[:9]}")
-                # print(f"  Right arm (9:18): {action_np[9:18]}")
-                # print(f"MuJoCo ctrl shape: {ctrl.shape}")
-                # print(f"  Right arm ctrl (0:7):  {ctrl[:7]}")
-                # print(f"  Left arm ctrl (7:14):  {ctrl[7:14]} {'[DISABLED]' if args.disable_left_arm else ''}")
-                # print(f"MuJoCo qpos (current state):")
-                # print(f"  Left arm qpos (0:7):  {data.qpos[0:7]}")
-                # print(f"  Right arm qpos (7:14): {data.qpos[7:14]}")
-                # print(f"  Grippers qpos (14:16): {data.qpos[14:16] if len(data.qpos) >= 16 else 'N/A'}")
             
             # Apply control
             data.ctrl[:] = ctrl
