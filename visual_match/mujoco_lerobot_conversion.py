@@ -475,14 +475,13 @@ class MuJoCoLeRobotConverter:
 # Convenience functions (for backward compatibility)
 # ============================================================================
 
-def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray, mujoco_keyframe_ctrl: np.ndarray,
+def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray,
                                     gripper_ctrl_range: Tuple[float, float] = (0.002, 0.041)) -> np.ndarray:
     """
     PI05 NORMALIZATION: Convert lerobot normalized degrees to MuJoCo radians.
     
     Args:
         actions_raw: Array of shape (num_frames, 18) in lerobot format
-        mujoco_keyframe_ctrl: Keyframe control (unused, kept for API compatibility)
         gripper_ctrl_range: (min, max) control range for gripper
     
     Returns:
@@ -492,14 +491,13 @@ def convert_actions_to_mujoco_pi05(actions_raw: np.ndarray, mujoco_keyframe_ctrl
     return converter.actions_to_mujoco(actions_raw)
 
 
-def convert_actions_to_mujoco_absolute(actions_raw: np.ndarray, mujoco_keyframe_ctrl: np.ndarray,
+def convert_actions_to_mujoco_absolute(actions_raw: np.ndarray,
                                         gripper_ctrl_range: Tuple[float, float] = (0.002, 0.041)) -> np.ndarray:
     """
     ABSOLUTE: Convert lerobot calibrated degrees to MuJoCo radians.
     
     Args:
         actions_raw: Array of shape (num_frames, 18) in lerobot format
-        mujoco_keyframe_ctrl: Keyframe control (unused, kept for API compatibility)
         gripper_ctrl_range: (min, max) control range for gripper
     
     Returns:
@@ -587,10 +585,10 @@ def convert_actions_to_mujoco(actions_raw: np.ndarray, mujoco_keyframe_ctrl: np.
     if use_absolute:
         if use_new_normalization:
             print("[INFO] Using PI05 normalization method (motor encoder → MuJoCo with PI05 calibration)")
-            return convert_actions_to_mujoco_pi05(actions_raw, mujoco_keyframe_ctrl, gripper_ctrl_range)
+            return convert_actions_to_mujoco_pi05(actions_raw, gripper_ctrl_range)
         else:
             print("[INFO] Using ABSOLUTE joint replay (motor encoder → MuJoCo with legacy calibration)")
-            return convert_actions_to_mujoco_absolute(actions_raw, mujoco_keyframe_ctrl, gripper_ctrl_range)
+            return convert_actions_to_mujoco_absolute(actions_raw, gripper_ctrl_range)
     else:
         print("[INFO] Using DELTA-based joint replay (from MuJoCo keyframe)")
         return convert_actions_to_mujoco_delta(actions_raw, mujoco_keyframe_ctrl)

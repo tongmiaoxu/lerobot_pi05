@@ -304,7 +304,7 @@ def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
 
 
 def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco.Renderer, 
-                                  calib_dir: Path, gripper_ctrl_range: tuple,
+                                  gripper_ctrl_range: tuple,
                                   camera_name: str = "teleoperator_pov",
                                   seg_renderer: mujoco.Renderer = None,
                                   robot_geom_ids: set = None,
@@ -369,7 +369,6 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
                 renderer.update_scene(data, camera=cam_name_to_use)
                 rgb_image = renderer.render()
             
-            # Convert to [0, 1] range
             observation[obs_key] = rgb_image
             
         except Exception as e:
@@ -443,8 +442,8 @@ def render_composite_view(model: MjModel, data: MjData,
         return fg_rgb
 
 
-def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndarray,
-                             gripper_ctrl_range: tuple, calib_dir: Path, use_new_normalization: bool = False) -> np.ndarray:
+def convert_action_to_mujoco(action: torch.Tensor,
+                             gripper_ctrl_range: tuple, use_new_normalization: bool = False) -> np.ndarray:
     """
     Convert policy action (18 dims) to MuJoCo control (14 dims).
     
@@ -462,13 +461,11 @@ def convert_action_to_mujoco(action: torch.Tensor, mujoco_keyframe_ctrl: np.ndar
     if use_new_normalization:
         ctrl_sequence = convert_actions_to_mujoco_pi05(
             actions_raw, 
-            mujoco_keyframe_ctrl, 
             gripper_ctrl_range
         )
     else:
         ctrl_sequence = convert_actions_to_mujoco_absolute(
             actions_raw, 
-            mujoco_keyframe_ctrl, 
             gripper_ctrl_range
         )
     # Return first frame (remove batch dimension)
@@ -581,9 +578,9 @@ def main():
         os.chdir(original_cwd)
     
     data = MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, 0)
-    mujoco_keyframe_ctrl = data.ctrl.copy()
-    
+    data.qpos[:16] = [-0.0125, -1.697, 1.707, -0.001, 0.299, 0.181, 0.0377, 0.0377,
+            0.0114, -1.843, 1.680, -0.003, 0.239, -0.004, 0.0382,0.0382]
+    mujoco.mj_forward(model, data)
     # Get gripper control range
     right_gripper_actuator_id = 6
     gripper_ctrl_range = (
@@ -592,8 +589,6 @@ def main():
     )
     print(f"[INFO] Gripper control range: [{gripper_ctrl_range[0]}, {gripper_ctrl_range[1]}]")
     
-    # Load calibration directory for action conversion
-    calib_dir = project_root / ".cache" / "calibration" / "aloha_follower"
     # Create renderer
     RENDER_W, RENDER_H = 640, 480
     renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
@@ -693,16 +688,17 @@ def main():
     if not args.headless and _HAS_DISPLAY:
         try:
             viewer = mujoco.viewer.launch_passive(model, data)
+            
         except Exception as e:
             viewer = None
     
     try:
         while step < args.max_steps:
             step_start = time.perf_counter()
-            
+            print("[QPOS] ", data.qpos)
             # Build observation from MuJoCo (convert to lerobot format)
             observation = build_observation_from_mujoco(
-                model, data, renderer, calib_dir, gripper_ctrl_range, args.camera,
+                model, data, renderer, gripper_ctrl_range, args.camera,
                 seg_renderer=seg_renderer,
                 robot_geom_ids=robot_geom_ids,
                 gaussian_data=gaussian_data,
@@ -716,7 +712,7 @@ def main():
             # Add prompt if policy supports it
             if hasattr(policy.config, 'language_features') and policy.config.language_features:
                 observation["observation.language"] = args.prompt
-            
+            print(f"[ACTION]: {observation['observation.state']}")
             # Predict action
             with torch.inference_mode():
                 action = predict_action(
@@ -740,7 +736,7 @@ def main():
                     print(f"  - Policy will repredict every {policy.config.n_action_steps} steps")
             
             # Convert action to MuJoCo control
-            ctrl = convert_action_to_mujoco(action, mujoco_keyframe_ctrl, gripper_ctrl_range, calib_dir, use_new_normalization=args.new)
+            ctrl = convert_action_to_mujoco(action, gripper_ctrl_range, use_new_normalization=args.new)
             
             # Debug output
             if step == 0 or step % 100 == 0:

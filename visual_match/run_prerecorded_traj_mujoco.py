@@ -288,12 +288,12 @@ def main():
     if args.use_new_normalization:
         print("[INFO] Using PI05 normalization method (--new flag)")
         ctrl_sequence = convert_actions_to_mujoco_pi05(
-            actions_raw, mujoco_keyframe_ctrl, gripper_ctrl_range
+            actions_raw, gripper_ctrl_range
         )
     else:
         print("[INFO] Using legacy absolute calibration method")
         ctrl_sequence = convert_actions_to_mujoco_absolute(
-            actions_raw, mujoco_keyframe_ctrl, gripper_ctrl_range
+            actions_raw, gripper_ctrl_range
         )
     
     print(f"[INFO] Ctrl range: [{ctrl_sequence.min():.3f}, {ctrl_sequence.max():.3f}]")
