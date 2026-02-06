@@ -3,10 +3,10 @@
 """
 Side-by-side comparison of recorded dataset video and MuJoCo simulation.
 
-Shows THREE synchronized windows:
-1. Recorded video from right wrist camera (from dataset)
-2. Rendered view from teleoperator_pov camera (from MuJoCo replay)
-3. Composite (MuJoCo foreground + Gaussian Splatting background) from wrist camera
+Shows synchronized windows in a 3-row layout:
+Row 1: Right wrist - Recorded, Composite, Alpha
+Row 2: Left wrist - Recorded, Composite, Alpha
+Row 3: MuJoCo teleoperator view
 
 Usage:
     python compare_recorded_vs_mujoco.py --dataset-path /path/to/dataset --episode 0
@@ -20,6 +20,21 @@ from pathlib import Path
 
 # Add src to path for lerobot imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+# ============================================================================
+# Camera Configuration
+# ============================================================================
+# Maps dataset camera names to MuJoCo camera names
+CAMERA_CONFIG = {
+    "right_wrist": {
+        "dataset_cam": "cam_right_wrist",      # Dataset camera key
+        "mujoco_cam": "wrist_cam_right",       # MuJoCo camera name
+    },
+    "left_wrist": {
+        "dataset_cam": "cam_left_wrist",
+        "mujoco_cam": "wrist_cam_left",
+    },
+}
 
 # Auto-detect display before importing mujoco
 def _detect_display():
@@ -518,11 +533,7 @@ def parse_args():
     p.add_argument("--dataset-root", type=str, default=None,
                    help="Root directory for local datasets (default: ~/.cache/huggingface/lerobot)")
     p.add_argument("--episode", type=int, default=0)
-    p.add_argument("--camera", type=str, default="cam_right_wrist",
-                   help="Dataset camera name (default: cam_right_wrist)")
     p.add_argument("--mujoco-camera", type=str, default="teleoperator_pov")
-    p.add_argument("--composite-camera", type=str, default="wrist_cam_right",
-                   help="MuJoCo camera for composite view (default: wrist_cam_right)")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--scene-path", type=str, default="pointclouds/N Goodwin Ave_w_o_Arm.npz",
                    help="Path to Gaussian Splatting scene file")
@@ -533,6 +544,10 @@ def parse_args():
                    help="Joint replay mode: 'absolute' uses calibrated motor positions, 'delta' uses keyframe + deltas")
     p.add_argument("--new", action="store_true",
                    help="Use PI05 normalization method: degrees = (raw - mid) * 360 / max_res")
+    p.add_argument("--alpha", type=float, default=0.5,
+                   help="Alpha value for blending (0.0 = fully real, 1.0 = fully robot). Default: 0.5")
+    p.add_argument("--color-calibrate", action="store_true",
+                   help="Apply color calibration to composite renderings for both wrist cameras")
     return p.parse_args()
 
 
@@ -544,62 +559,58 @@ def main():
     actions_raw = episode_data["action"].numpy()
     num_frames = len(actions_raw)
     
-    # Get video path using dataset's method
-    camera_key = f"observation.images.{args.camera}"
     dataset = episode_data["dataset"]
-    
-    # Get episode metadata for video path
     ep_meta = dataset.meta.episodes[args.episode]
-    chunk_idx = ep_meta["data/chunk_index"]
-    file_idx = ep_meta["data/file_index"]
-    
-    # Construct video path (v3.0 format)
-    # get_video_file_path returns a relative path, need to combine with dataset root
-    video_path_rel = dataset.meta.get_video_file_path(args.episode, camera_key)
-    video_path = dataset.root / video_path_rel
-    video_start_frame = episode_data.get('video_start_frame', 0)
-    
-    print(f"[INFO] v3.0: Episode {args.episode} starts at video frame {video_start_frame}")
-    print(f"[INFO] Video path: {video_path}")
-    
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-    
-    print(f"[INFO] Loading recorded video: {video_path}")
-    print(f"[INFO] Episode has {num_frames} frames")
-    
-    # Use dataset's video loading which handles AV1 properly
-    # Get episode metadata for video timestamps
     video_fps = dataset.fps
     print(f"[INFO] Video FPS: {video_fps}")
     
     # Calculate timestamps for all frames in the episode
-    # Episode starts at from_timestamp in the video file (relative timestamps within episode)
-    # Then we shift by from_timestamp to get absolute timestamps in the video file
-    from_timestamp = ep_meta.get(f"videos/{camera_key}/from_timestamp", 0.0)
-    # Relative timestamps within the episode (0, 1/fps, 2/fps, ...)
     relative_timestamps = [i / video_fps for i in range(num_frames)]
-    # Absolute timestamps in the video file (shifted by from_timestamp)
-    absolute_timestamps = [from_timestamp + ts for ts in relative_timestamps]
     
-    # Pre-load all video frames using dataset's decoder (handles AV1)
-    print(f"[INFO] Loading {num_frames} video frames from timestamp {from_timestamp:.3f}s...")
-    video_frames_tensor = decode_video_frames(
-        video_path, 
-        absolute_timestamps, 
-        tolerance_s=1e-4,
-        backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
-    )
-    # Convert from torch tensor (N, C, H, W) to list of numpy (H, W, C) for OpenCV
-    video_frames = []
-    for i in range(video_frames_tensor.shape[0]):
-        frame = video_frames_tensor[i].permute(1, 2, 0).cpu().numpy()  # (H, W, C)
-        frame = (frame * 255).astype(np.uint8)  # Convert from [0,1] to [0,255]
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # RGB to BGR for OpenCV
-        video_frames.append(frame_bgr)
+    # Load video frames for both wrist cameras using CAMERA_CONFIG
+    wrist_frames = {}  # Dict: "right_wrist" -> list of frames, "left_wrist" -> list of frames
     
-    print(f"[INFO] Loaded {len(video_frames)} video frames")
-    video_frame_count = len(video_frames)
+    for wrist_key, cam_cfg in CAMERA_CONFIG.items():
+        dataset_cam = cam_cfg["dataset_cam"]
+        camera_key = f"observation.images.{dataset_cam}"
+        
+        try:
+            video_path_rel = dataset.meta.get_video_file_path(args.episode, camera_key)
+            video_path = dataset.root / video_path_rel
+            
+            if not video_path.exists():
+                print(f"[WARN] Video not found for {wrist_key}: {video_path}")
+                wrist_frames[wrist_key] = []
+                continue
+            
+            print(f"[INFO] Loading {wrist_key} camera video: {video_path}")
+            from_timestamp = ep_meta.get(f"videos/{camera_key}/from_timestamp", 0.0)
+            absolute_timestamps = [from_timestamp + ts for ts in relative_timestamps]
+            
+            frames_tensor = decode_video_frames(
+                video_path, 
+                absolute_timestamps, 
+                tolerance_s=1e-4,
+                backend="pyav"
+            )
+            
+            frames_list = []
+            for i in range(frames_tensor.shape[0]):
+                frame = frames_tensor[i].permute(1, 2, 0).cpu().numpy()
+                frame = (frame * 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                frames_list.append(frame_bgr)
+            
+            wrist_frames[wrist_key] = frames_list
+            print(f"[INFO] Loaded {len(frames_list)} frames for {wrist_key}")
+            
+        except Exception as e:
+            print(f"[WARN] Failed to load {wrist_key} camera: {e}")
+            wrist_frames[wrist_key] = []
+    
+    # Calculate total frame count
+    video_frame_count = max(len(wrist_frames.get(k, [])) for k in CAMERA_CONFIG)
+    video_frame_count = max(video_frame_count, num_frames)
     
     # Load MuJoCo model
     # Change to aloha directory so relative includes resolve correctly
@@ -639,24 +650,18 @@ def main():
     scene_depth_data = None
     gaussian_available = False
     
+    # Get camera intrinsics for all cameras in CAMERA_CONFIG
+    camera_intrinsics = {}  # Maps wrist_key -> intrinsics matrix
+    for wrist_key, cam_cfg in CAMERA_CONFIG.items():
+        mujoco_cam = cam_cfg["mujoco_cam"]
+        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, mujoco_cam)
+        camera_intrinsics[wrist_key] = get_camera_intrinsics_from_model(model, cam_id, RENDER_W, RENDER_H)
+    
     if os.path.exists(args.scene_path):
         try:
-            composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.composite_camera)
-            if composite_cam_id == -1:
-                print(f"[WARN] Composite camera '{args.composite_camera}' not found, using teleoperator_pov")
-                args.composite_camera = "teleoperator_pov"
-                composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.composite_camera)
-            
-            # Get intrinsics with proper fallback to fovy=45°
-            k = get_camera_intrinsics_from_model(model, composite_cam_id, RENDER_W, RENDER_H)
-            
-            # Update MuJoCo's fovy to match (for renderer alignment)
-            fy = k[1, 1]
-            model.cam_fovy[composite_cam_id] = np.degrees(2 * np.arctan(RENDER_H / (2 * fy)))
-            
-            # Get initial w2c
+            # Get initial w2c using right wrist camera for scene loading
             mujoco.mj_forward(model, data)
-            init_pose = get_mujoco_camera_pose(model, data, args.composite_camera)
+            init_pose = get_mujoco_camera_pose(model, data, CAMERA_CONFIG["right_wrist"]["mujoco_cam"])
             w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
             
             # Check if diff_gaussian_rasterization is available before loading scene
@@ -673,7 +678,7 @@ def main():
                 gaussian_available = False
                 raise
             
-            scene_data, scene_depth_data = load_scene_data(args.scene_path, w2c_init, k)
+            scene_data, scene_depth_data = load_scene_data(args.scene_path, w2c_init, camera_intrinsics["right_wrist"])
             gaussian_available = True
             print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
         except ImportError:
@@ -716,23 +721,46 @@ def main():
                                                use_new_normalization=args.new,
                                                gripper_ctrl_range=gripper_ctrl_range)
     
-    # Create windows
-    window_recorded = f"Recorded: {args.camera}"
+    # Create windows - organized by wrist camera
+    # Right wrist windows
+    window_right_recorded = f"Right Wrist - Recorded"
+    window_right_composite = f"Right Wrist - Composite"
+    window_right_alpha = f"Right Wrist - Alpha"
+    # Left wrist windows
+    window_left_recorded = f"Left Wrist - Recorded"
+    window_left_composite = f"Left Wrist - Composite"
+    window_left_alpha = f"Left Wrist - Alpha"
+    # MuJoCo teleoperator view
     window_mujoco = f"MuJoCo: {args.mujoco_camera}"
-    window_composite = f"Composite: {args.composite_camera}"
     
-    cv2.namedWindow(window_recorded, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(window_mujoco, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(window_composite, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_recorded, 640, 480)
-    cv2.resizeWindow(window_mujoco, 640, 480)
-    cv2.resizeWindow(window_composite, 640, 480)
+    # Create all windows with smaller size to fit 3 rows on screen
+    WINDOW_W, WINDOW_H = 400, 300  # Smaller windows for 3-row layout
+    for win in [window_right_recorded, window_right_composite, window_right_alpha,
+                window_left_recorded, window_left_composite, window_left_alpha,
+                window_mujoco]:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
     
-    cv2.moveWindow(window_recorded, 50, 100)
-    cv2.moveWindow(window_mujoco, 700, 100)
-    cv2.moveWindow(window_composite, 1350, 100)
+    # Arrange windows in 3-row layout (fits on 1920x1080 screen)
+    # Horizontal spacing: 410px (400 + 10 gap)
+    # Vertical spacing: 340px (300 + 40 for title bar)
+    X_START, Y_START = 50, 30
+    X_STEP, Y_STEP = 410, 340
     
-    print("[INFO] Starting synchronized playback (press 'q' to quit, SPACE to pause)")
+    # Row 1: Right wrist (Recorded, Composite, Alpha)
+    cv2.moveWindow(window_right_recorded, X_START, Y_START)
+    cv2.moveWindow(window_right_composite, X_START + X_STEP, Y_START)
+    cv2.moveWindow(window_right_alpha, X_START + 2*X_STEP, Y_START)
+    # Row 2: Left wrist (Recorded, Composite, Alpha)
+    cv2.moveWindow(window_left_recorded, X_START, Y_START + Y_STEP)
+    cv2.moveWindow(window_left_composite, X_START + X_STEP, Y_START + Y_STEP)
+    cv2.moveWindow(window_left_alpha, X_START + 2*X_STEP, Y_START + Y_STEP)
+    # Row 3: MuJoCo (centered)
+    cv2.moveWindow(window_mujoco, X_START + X_STEP, Y_START + 2*Y_STEP)
+    
+    print("[INFO] Starting synchronized playback (press 'q' to quit, SPACE to pause, +/- to adjust alpha)")
+    print(f"[INFO] Alpha blending: {args.alpha:.2f} (robot foreground transparency)")
+    alpha = args.alpha
     
     frame_delay = int(1000 / args.fps)
     paused = False
@@ -740,12 +768,6 @@ def main():
     
     while frame_idx < min(num_frames, video_frame_count):
         if not paused:
-            # Get pre-loaded video frame
-            if frame_idx >= len(video_frames):
-                print(f"[WARN] Frame index {frame_idx} out of range")
-                break
-            recorded_frame = video_frames[frame_idx]
-            
             # Apply ctrl to MuJoCo
             data.ctrl[:] = ctrl_sequence[frame_idx]
             TIMESTEP = 1.0 / args.fps
@@ -758,81 +780,112 @@ def main():
             mujoco_rgb = renderer.render()
             mujoco_frame = cv2.cvtColor(mujoco_rgb, cv2.COLOR_RGB2BGR)
             
-            # Render composite from wrist camera
-            renderer.update_scene(data, camera=args.composite_camera)
-            fg_rgb = renderer.render()
-            fg_bgr = cv2.cvtColor(fg_rgb, cv2.COLOR_RGB2BGR)
+            # =====================================================================
+            # Render both wrist cameras using CAMERA_CONFIG loop
+            # =====================================================================
+            wrist_renders = {}  # Stores rendered frames for each wrist
             
-            # Get segmentation mask
-            seg_renderer.update_scene(data, camera=args.composite_camera)
-            seg_mask = seg_renderer.render()
-            seg_labels = seg_mask[:, :, 0].astype(np.int32)
-            seg_labels[seg_labels == -1] = 0
-            robot_mask = np.isin(seg_labels, list(robot_geom_ids))
-            mask_uint8 = (robot_mask.astype(np.uint8)) * 255
-            
-            # Composite with Gaussian background
-            if gaussian_available and scene_data is not None:
-                try:
-                    camera_pose = get_mujoco_camera_pose(model, data, args.composite_camera)
-                    w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
-                    bg_im = render_gaussian(w2c, k, scene_data, scene_depth_data, viz_cfg)
-                    bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
-                    bg_np = (bg_np * 255).astype(np.uint8)
-                    bg_bgr = cv2.cvtColor(bg_np, cv2.COLOR_RGB2BGR)
-                    
-                    # Composite: background + foreground where mask is True
-                    composite_frame = bg_bgr.copy()
-                    composite_frame[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
-                    
-                    # Apply color calibration if available
-                    if color_calib is not None:
-                        color_A, color_b = color_calib
-                        composite_frame = apply_color_transform(composite_frame, color_A, color_b)
-                except Exception as e:
-                    # Log error on first frame only to avoid spam
-                    if frame_idx == 0:
-                        print(f"[WARN] Gaussian rendering failed: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        print("[INFO] Falling back to MuJoCo only for composite view")
-                    # Fallback to MuJoCo only
+            for wrist_key, cam_cfg in CAMERA_CONFIG.items():
+                mujoco_cam = cam_cfg["mujoco_cam"]
+                frames_list = wrist_frames.get(wrist_key, [])
+                
+                # Get recorded frame
+                if frame_idx < len(frames_list):
+                    recorded_frame = frames_list[frame_idx].copy()
+                else:
+                    recorded_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                
+                # Render MuJoCo foreground
+                renderer.update_scene(data, camera=mujoco_cam)
+                fg_rgb = renderer.render()
+                fg_bgr = cv2.cvtColor(fg_rgb, cv2.COLOR_RGB2BGR)
+                
+                # Get segmentation mask
+                seg_renderer.update_scene(data, camera=mujoco_cam)
+                seg_mask = seg_renderer.render()
+                seg_labels = seg_mask[:, :, 0].astype(np.int32)
+                seg_labels[seg_labels == -1] = 0
+                robot_mask = np.isin(seg_labels, list(robot_geom_ids))
+                mask_uint8 = (robot_mask.astype(np.uint8)) * 255
+                
+                # Composite with Gaussian background
+                if gaussian_available and scene_data is not None:
+                    try:
+                        camera_pose = get_mujoco_camera_pose(model, data, mujoco_cam)
+                        w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
+                        bg_im = render_gaussian(w2c, camera_intrinsics[wrist_key], scene_data, scene_depth_data, viz_cfg)
+                        bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
+                        bg_np = (bg_np * 255).astype(np.uint8)
+                        bg_bgr = cv2.cvtColor(bg_np, cv2.COLOR_RGB2BGR)
+                        
+                        composite_frame = bg_bgr.copy()
+                        composite_frame[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
+                        
+                        # Apply color calibration if enabled
+                        if args.color_calibrate and color_calib is not None:
+                            color_A, color_b = color_calib
+                            composite_frame = apply_color_transform(composite_frame, color_A, color_b)
+                    except Exception as e:
+                        if frame_idx == 0:
+                            print(f"[WARN] {wrist_key} Gaussian rendering failed: {e}")
+                        composite_frame = fg_bgr.copy()
+                else:
                     composite_frame = fg_bgr.copy()
-            else:
-                # No Gaussian available, just show MuJoCo
-                composite_frame = fg_bgr.copy()
+                
+                # Alpha blending
+                alpha_mask = (mask_uint8 / 255.0).astype(np.float32)
+                alpha_mask_3ch = np.stack([alpha_mask] * 3, axis=-1)
+                foreground = fg_bgr.astype(np.float32)
+                background = recorded_frame.astype(np.float32)
+                blended = (alpha * foreground + (1 - alpha) * background) * alpha_mask_3ch + \
+                          background * (1 - alpha_mask_3ch)
+                alpha_frame = blended.astype(np.uint8)
+                
+                # Store results
+                wrist_renders[wrist_key] = {
+                    "recorded": recorded_frame,
+                    "composite": composite_frame,
+                    "alpha": alpha_frame,
+                }
             
+            # =====================================================================
+            # Add overlay text to all frames
+            # =====================================================================
             # Get gripper values for display
-            # Recorded gripper: index 17 = right gripper percentage
             recorded_gripper_pct = actions_raw[frame_idx, 17]
-            # MuJoCo gripper: ctrl[6] = right gripper in meters
             mujoco_gripper_m = data.ctrl[6]
-            # Convert MuJoCo gripper to percentage using range from XML and lerobot constants
-            # min = open (LEROBOT_OPEN_PCT), max = closed (LEROBOT_CLOSED_PCT)
-            # Inverse: percent = OPEN - ((mujoco_m - min) / (max - min)) * (OPEN - CLOSED)
             gripper_min, gripper_max = gripper_ctrl_range
             mujoco_gripper_pct = LEROBOT_OPEN_PCT - ((mujoco_gripper_m - gripper_min) / (gripper_max - gripper_min)) * (LEROBOT_OPEN_PCT - LEROBOT_CLOSED_PCT)
             
-            # Add frame info overlay
-            cv2.putText(recorded_frame, f"Frame: {frame_idx}/{num_frames}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(recorded_frame, f"R Gripper: {recorded_gripper_pct:.1f}%", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            # Add overlays to wrist frames
+            for wrist_key in CAMERA_CONFIG:
+                for frame_type in ["recorded", "composite", "alpha"]:
+                    frame = wrist_renders[wrist_key][frame_type]
+                    cv2.putText(frame, f"Frame: {frame_idx}/{num_frames}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    if frame_type == "alpha":
+                        cv2.putText(frame, f"Alpha: {alpha:.2f}", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             
+            # MuJoCo overlay
             cv2.putText(mujoco_frame, f"Frame: {frame_idx}/{num_frames}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(mujoco_frame, f"R Gripper: {mujoco_gripper_m*1000:.1f}mm", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            cv2.putText(composite_frame, f"Frame: {frame_idx}/{num_frames}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(composite_frame, f"R Gripper: {mujoco_gripper_m*1000:.1f}mm ({mujoco_gripper_pct:.1f}%)", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            
-            # Display
-            cv2.imshow(window_recorded, recorded_frame)
+            # =====================================================================
+            # Display all windows
+            # =====================================================================
+            # Row 1: Right wrist
+            cv2.imshow(window_right_recorded, wrist_renders["right_wrist"]["recorded"])
+            cv2.imshow(window_right_composite, wrist_renders["right_wrist"]["composite"])
+            cv2.imshow(window_right_alpha, wrist_renders["right_wrist"]["alpha"])
+            # Row 2: Left wrist
+            cv2.imshow(window_left_recorded, wrist_renders["left_wrist"]["recorded"])
+            cv2.imshow(window_left_composite, wrist_renders["left_wrist"]["composite"])
+            cv2.imshow(window_left_alpha, wrist_renders["left_wrist"]["alpha"])
+            # Row 3: MuJoCo
             cv2.imshow(window_mujoco, mujoco_frame)
-            cv2.imshow(window_composite, composite_frame)
             
             frame_idx += 1
         
@@ -847,6 +900,12 @@ def main():
         elif key == ord('n') and paused:
             paused = False
             continue
+        elif key == ord('+') or key == ord('='):  # + or = key
+            alpha = min(1.0, alpha + 0.05)
+            print(f"[INFO] Alpha: {alpha:.2f}")
+        elif key == ord('-') or key == ord('_'):  # - or _ key
+            alpha = max(0.0, alpha - 0.05)
+            print(f"[INFO] Alpha: {alpha:.2f}")
     
     # Cleanup
     cv2.destroyAllWindows()
