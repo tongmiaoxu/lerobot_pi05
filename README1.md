@@ -128,8 +128,11 @@ python visual_match/deploy_act_policy_mujoco.py \
 Color calibration is applied automatically if calibration_pairs_wrist/calibrated/color_mapping.yaml exists.
 
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new 
- 
+python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new --color-calibrate --alpha 0.6 --save-images
+```
+
+```bash
+python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new --alpha 0.6
 ```
 
 

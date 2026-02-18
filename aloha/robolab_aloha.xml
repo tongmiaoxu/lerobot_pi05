@@ -31,31 +31,31 @@
       <joint axis="0 1 0" actuatorfrcrange="-35 35"/>
       <site group="4"/>
       <default class="waist">
-        <joint axis="0 0 1" range="-3.14158 3.14158" damping="5.76"/>
-        <position ctrlrange="-3.14158 3.14158" kp="43"/>
+        <joint axis="0 0 1" range="-3.14158 3.14158" damping="14.27"/>
+        <position ctrlrange="-3.14158 3.14158" kp="41.51"/>
       </default>
       <default class="shoulder">
-        <joint range="-1.85005 1.25664" armature="0.395" frictionloss="2.0" damping="20.0" actuatorfrcrange="-144 144"/>
-        <position ctrlrange="-1.85005 1.25664" kp="265"/>
+        <joint range="-1.85005 1.25664" armature="0.395" frictionloss="2.0" damping="25.69" actuatorfrcrange="-144 144"/>
+        <position ctrlrange="-1.85005 1.25664" kp="264.82"/>
       </default>
       <default class="elbow">
-        <joint range="-1.76278 1.6057" armature="0.383" frictionloss="1.15" damping="18.49" actuatorfrcrange="-59 59"/>
-        <position ctrlrange="-1.76278 1.6057" kp="227"/>
+        <joint range="-1.76278 1.6057" armature="0.383" frictionloss="1.15" damping="42.56" actuatorfrcrange="-59 59"/>
+        <position ctrlrange="-1.76278 1.6057" kp="235.25"/>
       </default>
       <default class="forearm_roll">
-        <joint axis="1 0 0" range="-3.14158 3.14158" armature="0.14" damping="6.78" actuatorfrcrange="-22 22"/>
-        <position ctrlrange="-3.14158 3.14158" kp="78"/>
+        <joint axis="1 0 0" range="-3.14158 3.14158" armature="0.14" damping="14.45" actuatorfrcrange="-22 22"/>
+        <position ctrlrange="-3.14158 3.14158" kp="76.10"/>
       </default>
       <default class="wrist_angle">
-        <joint range="-1.8675 2.23402" armature="0.008" damping="6.28"/>
-        <position ctrlrange="-1.8675 2.23402" kp="37"/>
+        <joint range="-1.8675 2.23402" armature="0.008" damping="3.61"/>
+        <position ctrlrange="-1.8675 2.23402" kp="36.82"/>
       </default>
       <default class="wrist_rotate">
-        <joint axis="1 0 0" range="-3.14158 3.14158" damping="1.2"/>
-        <position ctrlrange="-3.14158 3.14158" kp="10.4"/>
+        <joint axis="1 0 0" range="-3.14158 3.14158" damping="1.58"/>
+        <position ctrlrange="-3.14158 3.14158" kp="10.74"/>
       </default>
       <default class="finger">
-        <joint type="slide" armature="0.243" damping="40"/>
+        <joint type="slide" armature="0.243" damping="86.49"/>
         <!--
           The joint and control ranges are in meters, representing the linear displacement of the
           finger on the rail. Note that the real robot takes in a float value representing the
@@ -78,7 +78,7 @@
           where the gripper is actuated to its fully closed and fully open positions. Therefore the
           control range represents limits enforced by _software_ on the real robot.
         -->
-        <position ctrlrange="0.002 0.041" kp="2000" kv="124"/>
+        <position ctrlrange="0.002 0.041" kp="1812.27" kv="124"/>
         <default class="left_finger">
           <joint range="0 0.041" axis="0 0 -1"/>
         </default>
@@ -243,7 +243,7 @@
                     <geom class="collision" pos="0 -0.03525 -0.0227" quat="0 0 0.7071 -0.7071" type="mesh" mesh="camera_mount"/>
                     <geom class="visual" pos="0.0325 -0.080 -0.006" quat="0.00000000e+00 1.31228456e-17 1.73648178e-01 9.84807753e-01" type="mesh" mesh="d435_binary"/>
                     <geom class="collision" pos="0.0325 -0.080 -0.006" quat="0.00000000e+00 1.31228456e-17 1.73648178e-01 9.84807753e-01" type="mesh" mesh="d435_binary"/>
-                    <camera name="wrist_cam_left" pos="0.0 -0.080 -0.006" mode="fixed" euler="2.80525955359 0 0"
+                    <camera name="wrist_cam_left" pos="0.0 -0.080 -0.006" mode="fixed" euler="2.73 0 0"
                             focal="3.694e-3 2.703e-3" resolution="640 480" sensorsize="3896e-6 2140e-6"/>
                    <body name="left/left_finger_link" pos="0.0191 -0.0141637 0.0581727" quat="1 -1 -1 1">
                       <inertial pos="0.0143478 -0.0284791 0.0122897" quat="0.535486 0.458766 -0.450407 0.547651"

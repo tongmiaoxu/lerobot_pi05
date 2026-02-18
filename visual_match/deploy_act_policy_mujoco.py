@@ -695,7 +695,7 @@ def main():
     try:
         while step < args.max_steps:
             step_start = time.perf_counter()
-            print("[QPOS] ", data.qpos)
+            # print("[QPOS] ", data.qpos)
             # Build observation from MuJoCo (convert to lerobot format)
             observation = build_observation_from_mujoco(
                 model, data, renderer, gripper_ctrl_range, args.camera,
@@ -712,7 +712,7 @@ def main():
             # Add prompt if policy supports it
             if hasattr(policy.config, 'language_features') and policy.config.language_features:
                 observation["observation.language"] = args.prompt
-            print(f"[ACTION]: {observation['observation.state']}")
+            # print(f"[ACTION]: {observation['observation.state']}")
             # Predict action
             with torch.inference_mode():
                 action = predict_action(
