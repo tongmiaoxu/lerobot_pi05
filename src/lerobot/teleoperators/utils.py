@@ -89,6 +89,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .aloha_leader import BiAlohaLeader
 
         return BiAlohaLeader(config)
+    elif config.type == "gello_leader":
+        from .gello_leader import GelloLeader
+
+        return GelloLeader(config)
     else:
         try:
             return cast(Teleoperator, make_device_from_device_class(config))

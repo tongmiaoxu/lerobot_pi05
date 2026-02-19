@@ -109,6 +109,7 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.robots.aloha_follower import AlohaFollower, AlohaFollowerConfig  # noqa: F401
+from lerobot.robots.xarm_follower import XarmFollower, XarmFollowerConfig  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -126,6 +127,7 @@ from lerobot.teleoperators.aloha_leader import (  # noqa: F401
     BiAlohaLeader,
     BiAlohaLeaderConfig,
 )
+from lerobot.teleoperators.gello_leader import GelloLeader, GelloLeaderConfig  # noqa: F401
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (

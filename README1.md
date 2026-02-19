@@ -32,6 +32,91 @@ or some other parameters:
     --display_data=true
 ```
 
+---
+
+## Data Collection (xArm + GELLO)
+src/lerobot/scripts/lerobot_record.py    ← Main entry point (lerobot-record command)
+├── src/lerobot/robots/xarm_follower/     ← Robot implementation
+│   ├── xarm_follower.py                   (XarmFollower class, uses xArm SDK)
+│   └── config_xarm_follower.py            (Robot config: IP, DOF, gripper, cameras)
+├── src/lerobot/teleoperators/gello_leader/ ← Teleoperator implementation
+│   ├── gello_leader.py                    (GelloLeader class, Dynamixel XL330)
+│   └── config_gello_leader.py             (Teleop config: port, DOF, offsets)
+├── src/lerobot/datasets/lerobot_dataset.py  ← Dataset creation & saving
+├── src/lerobot/utils/control_utils.py       ← Keyboard listener
+└── .cache/calibration/                      ← Calibration files
+
+### Prerequisites
+```bash
+pip install xarm-python-sdk
+```
+
+### Command (xArm + GELLO data collection)
+```bash
+# Basic data collection with xArm7 + GELLO (no cameras):
+lerobot-record \
+    --robot.type=xarm_follower \
+    --robot.ip=192.168.1.228 \
+    --robot.dof=7 \
+    --teleop.type=gello_leader \
+    --teleop.port=/dev/ttyUSB0 \
+    --teleop.dof=7 \
+    --dataset.repo_id=tongmiao/xarm_pick_cube \
+    --dataset.single_task="Pick up the cube" \
+    --dataset.num_episodes=20 \
+    --dataset.fps=30 \
+    --dataset.root=data
+```
+```bash
+# With a RealSense camera:
+lerobot-record \
+    --robot.type=xarm_follower \
+    --robot.ip=192.168.1.228 \
+    --robot.cameras='{"cam_wrist": {"type": "realsense", "serial_number_or_name": "YOUR_SERIAL", "fps": 30, "width": 640, "height": 480}}' \
+    --teleop.type=gello_leader \
+    --teleop.port=/dev/ttyUSB0 \
+    --dataset.repo_id=tongmiao/xarm_pick_cube \
+    --dataset.single_task="Pick up the cube" \
+    --dataset.num_episodes=20 \
+    --dataset.fps=30 \
+    --dataset.root=data
+```
+Other useful parameters:
+```bash
+    --resume=true \
+    --dataset.push_to_hub=false \
+    --display_data=true
+```
+
+### Teleoperation only (xArm + GELLO, no data recording)
+```bash
+lerobot-teleoperate --robot.type=xarm_follower --teleop.type=gello_leader --robot.ip=192.168.1.228 --teleop.port=/dev/ttyUSB0 --fps=100
+```
+
+### GELLO Calibration (get offsets)
+Same approach as gello_software's calibration.
+
+**Option A — Use gello_software's offsets directly** (recommended if your GELLO already works with gello_software):
+```bash
+python scripts/gello_get_offset.py --port /dev/ttyUSB0 --use-gello-software-offsets
+```
+
+**Option B — Compute offsets from scratch**:
+
+1. Place GELLO so it matches the xArm's known start pose.
+   Default: `[0, 0, 0, 90, 0, 90, 0]` degrees — joints 4 and 6 at 90°, rest at 0°.
+   Leave the GELLO gripper fully open.
+2. Run:
+```bash
+python scripts/gello_get_offset.py --port /dev/ttyUSB0
+```
+3. Verify the `corrected` values match `expected`. If they don't, check GELLO alignment.
+
+Both options save offsets to `.cache/calibration/gello_leader/gello_offsets.json`.
+They are loaded automatically by `lerobot-record` and `lerobot-teleoperate`.
+
+---
+
 ### Policy Training
 ```bash
 lerobot-train \
@@ -137,3 +222,12 @@ python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/tongmiao/a
 
 
 
+```bash
+newgrp dialout
+conda activate gello_lerobot
+```
+or
+```bash
+sudo usermod -aG dialout $USER
+reboot
+```bash

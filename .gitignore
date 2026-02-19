@@ -58,7 +58,6 @@ __pycache__/
 *$py.class
 *.so
 *.sage.py
-.cache/
 .ruff_cache/
 .mypy_cache/
 .pyre/
