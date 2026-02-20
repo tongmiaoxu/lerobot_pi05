@@ -68,11 +68,12 @@ lerobot-record \
     --dataset.root=data
 ```
 ```bash
-# With a RealSense camera:
+# With 2 RealSense cameras (stationary + wrist):
+# To find serial numbers, run: lerobot-find-cameras realsense
 lerobot-record \
     --robot.type=xarm_follower \
     --robot.ip=192.168.1.228 \
-    --robot.cameras='{"cam_wrist": {"type": "realsense", "serial_number_or_name": "YOUR_SERIAL", "fps": 30, "width": 640, "height": 480}}' \
+    --robot.cameras='{"cam_high": {"type": "intelrealsense", "serial_number_or_name": "246322303954", "fps": 30, "width": 640, "height": 480}, "cam_wrist": {"type": "intelrealsense", "serial_number_or_name": "213622251153", "fps": 30, "width": 640, "height": 480}}' \
     --teleop.type=gello_leader \
     --teleop.port=/dev/ttyUSB0 \
     --dataset.repo_id=tongmiao/xarm_pick_cube \

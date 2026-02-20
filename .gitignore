@@ -171,7 +171,6 @@ outputs/
 *.pot
 
 # Dev folders
-.cache/*
 *.stl
 *.urdf
 *.xml

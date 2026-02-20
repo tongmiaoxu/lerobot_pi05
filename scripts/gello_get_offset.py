@@ -37,14 +37,15 @@ GRIPPER_OPEN_TO_CLOSED_RAD = -0.8529
 # Offsets from gello_software's PORT_CONFIG_MAP for /dev/ttyUSB0 (xArm GELLO).
 # Use --use-gello-software-offsets to apply these directly.
 GELLO_SOFTWARE_OFFSETS = [
-    3 * np.pi / 2,
-    3 * np.pi / 2,
-    1 * np.pi / 2,
-    1 * np.pi / 2,
-    3 * np.pi / 2,
-    2.3 * np.pi / 2,
-    3 * np.pi / 2,
-]
+    # 3 * np.pi / 2,
+    # 3 * np.pi / 2,
+    # 1 * np.pi / 2,
+    # 1 * np.pi / 2,
+    # 3 * np.pi / 2,
+    # 2.3 * np.pi / 2,
+    # 3 * np.pi / 2,
+
+    4*np.pi/2, 3*np.pi/2, 0*np.pi/2, 1*np.pi/2, 3*np.pi/2, 2.3*np.pi/2, 3*np.pi/2]
 GELLO_SOFTWARE_SIGNS = [1, 1, 1, 1, 1, 1, 1]
 GELLO_SOFTWARE_GRIPPER_OPEN_CLOSE_DEG = (114.145703125, 72.345703125)
 
