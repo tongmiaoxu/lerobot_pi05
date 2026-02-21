@@ -15,7 +15,7 @@ class GelloLeaderConfig(TeleoperatorConfig):
     It mirrors the xArm's kinematic structure so joint angles map directly.
 
     Calibration uses the same approach as gello_software:
-      1. Run `python scripts/gello_get_offset.py` with GELLO in a known pose
+      1. Run `python tools/gello_get_offset.py` with GELLO in a known pose
       2. The script computes joint_offsets and gripper_range_rad
       3. Values are saved to .cache/calibration/gello_leader/gello_offsets.json
 
@@ -52,7 +52,7 @@ class GelloLeaderConfig(TeleoperatorConfig):
     joint_signs: list[int] = field(default_factory=lambda: [1, 1, 1, 1, 1, 1, 1])
 
     # Per-joint offset in RADIANS.
-    # Computed by scripts/gello_get_offset.py.
+    # Computed by tools/gello_get_offset.py.
     # Corrected angle = sign * (raw_radians - offset).
     joint_offsets: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

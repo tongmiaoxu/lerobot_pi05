@@ -7,7 +7,7 @@ are read as raw encoder values and converted to xArm joint commands.
 
 Calibration follows the gello_software approach:
   corrected_angle = joint_sign * (raw_radians - offset)
-  offset is computed by scripts/gello_get_offset.py
+  offset is computed by tools/gello_get_offset.py
 
 Includes exponential smoothing (alpha=0.99) to reduce Dynamixel noise,
 matching gello_software/gello/robots/dynamixel.py.
@@ -138,7 +138,7 @@ class GelloLeader(Teleoperator):
         if all(o == 0.0 for o in self._offsets):
             logger.warning(
                 "GELLO joint offsets are all zero. If you haven't calibrated yet, run:\n"
-                "  python scripts/gello_get_offset.py "
+                "  python tools/gello_get_offset.py "
                 f"--port {self.config.port} --dof {self.config.dof}"
             )
 

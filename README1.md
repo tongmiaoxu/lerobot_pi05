@@ -99,7 +99,7 @@ Same approach as gello_software's calibration.
 
 **Option A — Use gello_software's offsets directly** (recommended if your GELLO already works with gello_software):
 ```bash
-python scripts/gello_get_offset.py --port /dev/ttyUSB0 --use-gello-software-offsets
+python tools/gello_get_offset.py --port /dev/ttyUSB0 --use-gello-software-offsets
 ```
 
 **Option B — Compute offsets from scratch**:
@@ -109,14 +109,25 @@ python scripts/gello_get_offset.py --port /dev/ttyUSB0 --use-gello-software-offs
    Leave the GELLO gripper fully open.
 2. Run:
 ```bash
-python scripts/gello_get_offset.py --port /dev/ttyUSB0
+python tools/gello_get_offset.py --port /dev/ttyUSB0
 ```
 3. Verify the `corrected` values match `expected`. If they don't, check GELLO alignment.
 
 Both options save offsets to `.cache/calibration/gello_leader/gello_offsets.json`.
 They are loaded automatically by `lerobot-record` and `lerobot-teleoperate`.
 
----
+### Point Cloud of xArm (ground truth from MuJoCo model → PCD)
+Generate a ground-truth point cloud of the xArm7 robot mesh in world frame.
+Uses the MuJoCo model (`xarm7/scene.xml`) + STL meshes, sets joint angles, runs FK,
+samples points on each link's surface, and saves as PCD.
+Requires: `pip install open3d mujoco`
+
+```bash
+
+# More dense sampling + visualize:
+python tools/get_xarm_pointcloud.py --points-per-mesh 100000
+```
+
 
 ### Policy Training
 ```bash
