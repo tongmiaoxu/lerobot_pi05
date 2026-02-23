@@ -5,8 +5,8 @@ Adapted from eval_pipeline_advait_new.py (ALOHA version):
   - MuJoCo model: xarm7/scene.xml (instead of aloha/robolab_setup.xml)
   - Robot geom detection: xArm body names
   - Observation state: 8-DOF (7 joints + gripper) instead of 14-DOF
-  - Camera intrinsics: RealSense D455 serial 246322303954 (real hardware)
-  - Camera pose: computed from calibration (rgbd_to_base_frame.py)
+  - Camera intrinsics/extrinsics: loaded from configs/ JSON files
+  - Camera pose: computed from calibration (camera_config.py)
 """
 
 import sys
@@ -32,68 +32,33 @@ import open3d as o3d
 import mujoco
 from mujoco import MjData, MjModel
 
+from camera_config import load_camera_config, set_mujoco_camera_from_config
+
 # ===== ICP alignment transform (Gaussian Splatting <-> MuJoCo) =====
 ICP_TRANSFORM_PATH = "pointclouds/icp_transform.npy"
 T_splat2mj = np.load(ICP_TRANSFORM_PATH)
 
+# ===== Load camera calibration from config =====
+_stationary_cfg = load_camera_config("stationary_cam")
 
-# ===== CALIBRATION: Camera 246322303954 -> robot base frame =====
-# From visual_match/rgbd_to_base_frame.py
+CAM_POS_MJ = _stationary_cfg["cam_pos_mj"]
+CAM_XMAT_MJ = _stationary_cfg["cam_xmat_mj"]
+REALSENSE_INTRINSICS_640x480 = _stationary_cfg["intrinsics"]
 
-# Camera-to-board (board pose in camera frame, from estimatePoseCharucoBoard)
-_rvec_cam2board = np.array([[-0.62826474], [0.31336757], [0.69660772]])
-_tvec_cam2board = np.array([[-0.18496315], [-0.00416288], [0.69116146]])
-
-_R_board2cam = cv2.Rodrigues(_rvec_cam2board)[0]
-_t_board2cam = _tvec_cam2board.ravel()
-
-R_cam2board = _R_board2cam.T
-t_cam2board = -R_cam2board @ _t_board2cam
-
-# Board-to-robot-base
-_R_base2world = np.array([
-    [0.0318678, 0.99946283, -0.00764881],
-    [0.99945614, -0.03180082, 0.00872485],
-    [0.00847693, -0.00792269, -0.99993268],
-])
-_t_base2world = np.array([0.10073883, -0.64318448, -0.06923716])
-
-R_world2base = _R_base2world.T
-t_world2base = -R_world2base @ _t_base2world
-
-# Full camera -> robot base transform
-R_cam2base = R_world2base @ R_cam2board
-t_cam_in_base = R_world2base @ t_cam2board + t_world2base
-
-# Camera pose in MuJoCo world frame
-# xarm7/scene.xml places link_base at (0, 0, 0.12)
-_MJ_BASE_OFFSET = np.array([0.0, 0.0, 0.12])
-CAM_POS_MJ = t_cam_in_base + _MJ_BASE_OFFSET
-
-# Camera orientation in MuJoCo world (convert OpenCV camera convention to MuJoCo)
-# OpenCV: +Z forward, +Y down. MuJoCo: -Z forward, +Y up. Flip Y and Z.
-_OPENCV_TO_MJ_FLIP = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-CAM_XMAT_MJ = R_cam2base @ _OPENCV_TO_MJ_FLIP  # MuJoCo cam_xmat: camera-to-world rotation
-
-# RealSense D455 (serial 246322303954) intrinsics at 640x480
-REALSENSE_INTRINSICS_640x480 = np.array([
-    [386.755, 0.0,     324.176],
-    [0.0,     386.309, 241.659],
-    [0.0,     0.0,     1.0],
-])
+# Expose intermediate transforms for backwards compatibility
+R_cam2board = _stationary_cfg["R_cam2board"]
+t_cam2board = _stationary_cfg["t_cam2board"]
+R_world2base = _stationary_cfg["R_world2base"]
+t_world2base = _stationary_cfg["t_world2base"]
+R_cam2base = _stationary_cfg["R_cam2base"]
+t_cam_in_base = _stationary_cfg["t_cam_in_base"]
 
 
 def set_camera_from_calibration(data, model, cam_name):
     """
-    Override the MuJoCo camera pose with the real camera calibration
-    (computed from rgbd_to_base_frame.py data).
+    Override the MuJoCo camera pose with the real camera calibration.
     """
-    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
-    if cam_id < 0:
-        raise ValueError(f"Camera '{cam_name}' not found in model")
-    data.cam_xpos[cam_id] = CAM_POS_MJ
-    data.cam_xmat[cam_id] = CAM_XMAT_MJ.flatten()
-    return cam_id
+    return set_mujoco_camera_from_config(data, model, cam_name, _stationary_cfg)
 
 
 

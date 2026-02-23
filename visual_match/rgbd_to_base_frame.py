@@ -1,6 +1,6 @@
 """
-Simple script: capture RGBD from camera 246322303954, build point cloud in camera frame,
-then transform to robot base frame using provided calibration.
+Simple script: capture RGBD from a RealSense camera, build point cloud in camera frame,
+then transform to robot base frame using calibration loaded from configs/.
 """
 
 import sys
@@ -15,33 +15,21 @@ root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(root))
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.pcd_utils import depth2fgpcd
+from camera_config import load_camera_config
 
-# === Calibration (camera 246322303954) ===
-# Camera to board (from estimatePoseCharucoBoard: board pose in camera frame)
-rvec_cam2board = np.array([[-0.62826474], [0.31336757], [0.69660772]])
-tvec_cam2board = np.array([[-0.18496315], [-0.00416288], [0.69116146]])
+# === Load calibration from config ===
+_cam_cfg = load_camera_config("stationary_cam")
 
-R_board2cam = cv2.Rodrigues(rvec_cam2board)[0]
-t_board2cam = tvec_cam2board.ravel()
-
-# Camera to board (world = board frame in calibration)
-R_cam2board = R_board2cam.T
-t_cam2board = -R_cam2board @ t_board2cam
-
-# Board to robot base (inverse of base2world)
-R_base2world = np.array([
-    [0.0318678, 0.99946283, -0.00764881],
-    [0.99945614, -0.03180082, 0.00872485],
-    [0.00847693, -0.00792269, -0.99993268],
-])
-t_base2world = np.array([0.10073883, -0.64318448, -0.06923716])
-
-R_world2base = R_base2world.T
-t_world2base = -R_world2base @ t_base2world
+R_cam2board = _cam_cfg["R_cam2board"]
+t_cam2board = _cam_cfg["t_cam2board"]
+R_world2base = _cam_cfg["R_world2base"]
+t_world2base = _cam_cfg["t_world2base"]
 
 
-def capture_rgbd(serial_number: str = "246322303954", resolution=(1280, 720)):
+def capture_rgbd(serial_number: str = None, resolution=(1280, 720)):
     """Capture one RGBD frame from the given camera."""
+    if serial_number is None:
+        serial_number = _cam_cfg["serial_number"]
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_device(serial_number)
@@ -101,8 +89,9 @@ def rgbd_to_pointcloud_base(color, depth, intr, depth_scale, depth_range=(0.2, 2
 
 
 def main():
-    print("Capturing from camera 246322303954...")
-    color, depth, intr, depth_scale = capture_rgbd("246322303954")
+    serial = _cam_cfg["serial_number"]
+    print(f"Capturing from camera {serial}...")
+    color, depth, intr, depth_scale = capture_rgbd(serial)
     print("Got frame.")
 
     pcd = rgbd_to_pointcloud_base(color, depth, intr, depth_scale)

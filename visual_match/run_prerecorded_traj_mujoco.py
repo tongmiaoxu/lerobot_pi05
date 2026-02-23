@@ -1,52 +1,34 @@
 #!/usr/bin/env python3
 """
-Replay LeRobot v3.0 dataset in MuJoCo ALOHA simulation using ABSOLUTE joint positions.
+Replay xArm LeRobot v3.0 dataset in MuJoCo using recorded observation.state.
 
 ================================================================================
-DATA FORMAT: LeRobot v3.0 (.parquet data files)
+DATA FORMAT: xArm LeRobot v3.0 (.parquet)
 ================================================================================
-- Recorded values are ABSOLUTE joint positions in DEGREES (motor encoder values)
-- v3.0: 18 dimensions per frame: [left_arm(8), left_gripper(1), right_arm(8), right_gripper(1)]
-- Includes "shadow joints" (shoulder_shadow, elbow_shadow) - mechanically coupled
-  joints that mirror the primary joint for additional torque
-================================================================================
-| Issue                      | Solution                                        |
-|----------------------------|-------------------------------------------------|
-| Different dimensions       | Skip shadow joint indices (2, 4, 11, 13)        |
-| (18 vs 14)                 | → MuJoCo doesn't model parallel linkage         |
-|                            |                                                 |
-| Different arm order        | Map left/right to MuJoCo's [right, left] order  |
-| recorded: [left, right]    | → MuJoCo ctrl: [right_arm(7), left_arm(7)]      |
-|                            |                                                 |
-| Motor encoder calibration  | Uses calibration files from aloha/.cache/       |
-|                            | → calibrated_degrees → raw_encoder → radians   |
-|                            |                                                 |
-| Absolute positions         | Direct conversion using calibration offsets     |
-|                            | → No delta-based approach, true motor positions|
-|                            |                                                 |
-| Gripper percentage         | Linear mapping from lerobot % to MuJoCo meters |
-|                            | Range read from XML, lerobot range configurable |
-================================================================================
+observation.state (8-dim):
+  [joint1.pos, joint2.pos, …, joint7.pos, gripper.pos]
+  - Joint angles are in DEGREES (from xArm servo encoders)
+  - Gripper is in mm: 800 = fully open, 0 = fully closed
 
-Recorded data layout (18-dim):
-  Left arm:  [0:waist, 1:shoulder, 2:shoulder_shadow, 3:elbow, 4:elbow_shadow,
-              5:forearm_roll, 6:wrist_angle, 7:wrist_rotate, 8:gripper]
-  Right arm: [9:waist, 10:shoulder, 11:shoulder_shadow, 12:elbow, 13:elbow_shadow,
-              14:forearm_roll, 15:wrist_angle, 16:wrist_rotate, 17:gripper]
+MuJoCo xarm7 model (8 actuators):
+  act1–act7 : joint position targets in RADIANS
+  gripper   : tendon ctrl in [0, 255]  (0 = closed, 255 = open)
+
+Conversion:
+  mj_joint  = deg2rad(obs_joint)
+  mj_grip   = (gripper_mm / GRIPPER_OPEN_MM) * GRIPPER_MJ_MAX
+================================================================================
 """
 
-# -------- Standard imports & sys.path tweaks ---------------------------------
-import sys, os, dataclasses, argparse
+import sys
+import os
+import argparse
+import dataclasses
 from pathlib import Path
-import time
 from typing import Optional
+import time
 
-# Add src to path for lerobot imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-# Auto-detect if we have a display before importing mujoco
 def _detect_display():
-    """Check if a display is available (X11 on Linux, or macOS/Windows)."""
     if os.environ.get("DISPLAY"):
         return True
     if os.environ.get("WAYLAND_DISPLAY"):
@@ -64,276 +46,217 @@ if not _HAS_DISPLAY:
     os.environ["MUJOCO_GL"] = "egl"
 
 import numpy as np
-import torch
-
 import mujoco
 from mujoco import MjModel, MjData
 
 if _HAS_DISPLAY:
     import mujoco.viewer
 
-import plotly.graph_objects as go
-import json
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+GRIPPER_OPEN_MM = 800.0
+GRIPPER_CLOSE_MM = 0.0
 
-# Lerobot dataset loader
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+XML_PATH = str(_PROJECT_ROOT / "xarm7" / "scene.xml")
+RENDER_W, RENDER_H = 640, 480
 
-# Import unified conversion module
-from mujoco_lerobot_conversion import (
-    convert_actions_to_mujoco_pi05,
-    convert_actions_to_mujoco_absolute,
-    convert_mujoco_state_to_lerobot,
-    MuJoCoLeRobotConverter,
-    LEROBOT_OPEN_PCT,
-    LEROBOT_CLOSED_PCT,
-)
 
-# -------- Dataclasses ---------------------------------------------------------
 @dataclasses.dataclass
 class Args:
-    default_prompt: Optional[str] = "pick cube"
-    dataset_path: str = "/home/tongmiao/Documents/pick_cuber"
-    dataset_root: Optional[str] = None
-    action_key: str = "action"
+    parquet: str = "data/data/chunk-000/file-000.parquet"
     episode: int = 0
     fps: float = 30.0
-    use_new_normalization: bool = False
+    use_actions: bool = False
+    plot: bool = False
+    cma: bool = False
+    cma_params: str = "cma_result.pkl"
+
 
 def parse_cli() -> Args:
     p = argparse.ArgumentParser(
-        description="Replay LeRobot v3.0 dataset in MuJoCo (no policy needed)."
+        description="Replay xArm LeRobot dataset in MuJoCo."
     )
-    p.add_argument("--default-prompt", type=str, default="pick cube")
-    p.add_argument("--dataset-path", type=str, default="/home/tongmiao/Documents/pick_cuber",
-                   help="Path to dataset directory (local) or repo_id (Hub)")
-    p.add_argument("--dataset-root", type=str, default=None,
-                   help="Root directory for local datasets (default: ~/.cache/huggingface/lerobot)")
-    p.add_argument("--action-key", type=str, default="action")
+    p.add_argument(
+        "--parquet", type=str,
+        default="data/data/chunk-000/file-000.parquet",
+        help="Path to .parquet data file",
+    )
     p.add_argument("--episode", type=int, default=0)
-    p.add_argument("--fps", type=float, default=30.0, help="Replay frame rate (default: 30.0)")
-    p.add_argument("--new", action="store_true",
-                   help="Use PI05 normalization method: degrees = (raw - mid) * 360 / max_res")
-
-    ns = p.parse_args()
-
-    return Args(
-        default_prompt=ns.default_prompt,
-        dataset_path=ns.dataset_path,
-        dataset_root=ns.dataset_root,
-        action_key=ns.action_key,
-        episode=ns.episode,
-        fps=ns.fps,
-        use_new_normalization=ns.new,
+    p.add_argument("--fps", type=float, default=30.0)
+    p.add_argument(
+        "--use-actions", action="store_true",
+        help="Replay using action columns instead of observation.state",
     )
+    p.add_argument("--plot", action="store_true", help="Save joint plot HTML")
+    p.add_argument(
+        "--cma-params", type=str, default="cma_result.pkl",
+        help="Path to cma_result.pkl from CMA-ES optimisation. "
+             "Applies optimised stiffness/damping to the model.",
+    )
+    p.add_argument(
+        "--cma", action="store_true",
+        help="Apply CMA-ES optimised parameters to the model.",
+    )
+    return Args(**vars(p.parse_args()))
 
-# -------- Dataset loader for v3.0 using LeRobotDataset ----------------------
-def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None = None):
-    """
-    Load a single episode from a LeRobot v3.0 dataset using LeRobotDataset.
-    
-    Args:
-        dataset_path: Path to local dataset directory or repo_id for Hub dataset
-        episode_idx: Episode index to load
-        dataset_root: Root directory for local datasets (optional, used when dataset_path is repo_id)
-    """
-    print(f"[INFO] Loading episode {episode_idx} from dataset: {dataset_path}")
-    
-    # Check if dataset_path is a local directory or repo_id
-    dataset_path_obj = Path(dataset_path)
-    if dataset_path_obj.exists() and dataset_path_obj.is_dir():
-        # Local dataset - check if it has the v3.0 structure (meta/info.json)
-        meta_info = dataset_path_obj / "meta" / "info.json"
-        if meta_info.exists():
-            # Dataset is at the path directly - use it as root
-            # LeRobotDataset expects root/repo_id/, but for local datasets we can pass
-            # the dataset directory as root and use the directory name as repo_id
-            # However, LeRobotDatasetMetadata uses root directly, so we need to pass
-            # the dataset directory as root
-            repo_id = dataset_path_obj.name
-            # For local datasets, LeRobotDataset will use root directly for metadata
-            # So we pass the dataset directory as root
-            dataset = LeRobotDataset(
-                repo_id=repo_id,
-                root=dataset_path_obj,  # Pass dataset directory as root
-                episodes=[episode_idx],
-                video_backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
-            )
-        else:
-            # Path might be a parent directory - try using directory name as repo_id
-            repo_id = dataset_path_obj.name
-            root = dataset_path_obj.parent
-            dataset = LeRobotDataset(
-                repo_id=repo_id,
-                root=root,
-                episodes=[episode_idx],
-                video_backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
-            )
-    else:
-        # Assume it's a repo_id - load from Hub or local cache
-        dataset = LeRobotDataset(
-            repo_id=dataset_path,
-            root=dataset_root,
-            episodes=[episode_idx],
-            video_backend="pyav"  # Use pyav instead of torchcodec to avoid FFmpeg library issues
+
+# ---------------------------------------------------------------------------
+# Dataset loader — reads parquet directly (no video dependencies)
+# ---------------------------------------------------------------------------
+def load_episode(parquet_path: str, episode_idx: int):
+    import pandas as pd
+
+    df = pd.read_parquet(parquet_path)
+    ep = df[df["episode_index"] == episode_idx].sort_values("frame_index")
+    if len(ep) == 0:
+        available = sorted(df["episode_index"].unique())
+        raise ValueError(
+            f"Episode {episode_idx} not found. Available: {available}"
         )
-    
-    # Get episode metadata
-    if episode_idx >= dataset.num_episodes:
-        raise ValueError(f"Episode {episode_idx} not found. Dataset has {dataset.num_episodes} episodes")
-    
-    # Get episode frame range
-    ep_meta = dataset.meta.episodes[episode_idx]
-    start_idx = ep_meta["dataset_from_index"]
-    end_idx = ep_meta["dataset_to_index"]
-    # end_idx is inclusive, so the valid range is [start_idx, end_idx]
-    # But we need to make sure we don't go beyond the dataset size
-    dataset_size = len(dataset)
-    end_idx = min(end_idx, dataset_size - 1)
-    num_frames = end_idx - start_idx + 1
-    
-    print(f"[INFO] Episode {episode_idx} has {num_frames} frames (indices {start_idx} to {end_idx})")
-    
-    # Load all frames from this episode
-    actions = []
-    observations = []
-    
-    for frame_idx in range(start_idx, end_idx + 1):
-        sample = dataset[frame_idx]
-        actions.append(sample["action"].numpy())
-        observations.append(sample["observation.state"].numpy())
-    
-    # Convert to tensors
-    actions_tensor = torch.from_numpy(np.array(actions))
-    observations_tensor = torch.from_numpy(np.array(observations))
-    
-    return {
-        'action': actions_tensor,
-        'observation.state': observations_tensor,
-        'episode_index': episode_idx,
-        'num_frames': num_frames,
-    }
 
-# -------- Observation builder -------------------------------------------------
-# XML path - resolve relative to project root
-_project_root = Path(__file__).parent.parent
-XML_PATH = str(_project_root / "aloha" / "robolab_setup.xml")
-RENDER_W, RENDER_H = 640, 480
+    obs = np.stack(ep["observation.state"].values).astype(np.float32)
+    act = np.stack(ep["action"].values).astype(np.float32)
+    timestamps = ep["timestamp"].values.astype(np.float32)
 
-def build_observation(model, data, recorded_observation, renderer, prompt):
-    """Build observation from MuJoCo state.
-    
-    MuJoCo qpos structure (with cube freejoint):
-    - qpos[0:7] = right arm (6 joints + left_finger)
-    - qpos[7] = right/right_finger (coupled, excluded)
-    - qpos[8:15] = left arm (6 joints + left_finger)
-    - qpos[15] = left/right_finger (coupled, excluded)
-    - qpos[16:23] = cube freejoint (3 pos + 4 quat)
-    
-    Observation state (14-dim): [left_arm(7), right_arm(7)]
+    print(f"[INFO] Episode {episode_idx}: {len(ep)} frames, "
+          f"obs shape {obs.shape}, act shape {act.shape}")
+    return obs, act, timestamps
+
+
+# ---------------------------------------------------------------------------
+# Conversion: LeRobot obs/action (degrees + mm) → MuJoCo ctrl (rad + [0,255])
+# ---------------------------------------------------------------------------
+def lerobot_to_mujoco_ctrl(state: np.ndarray, gripper_mj_range: tuple[float, float]) -> np.ndarray:
     """
-    state = np.zeros((14,), np.float32)
-    # Left arm: qpos[8:15] (7 elements)
-    state[:7] = data.qpos[8:15]
-    # Right arm: qpos[0:7] (7 elements)
-    state[7:] = data.qpos[0:7]
-    images = {}
-    return {"state": state, "images": images, "prompt": prompt}
+    state: (8,) — [joint1..7 in degrees, gripper in mm]
+    returns: (8,) — [act1..7 in radians, gripper in MuJoCo ctrl units]
+    """
+    ctrl = np.zeros(8, dtype=np.float64)
+    ctrl[:7] = np.deg2rad(state[:7])
 
-# Conversion functions are now imported from mujoco_lerobot_conversion module
-# See: convert_actions_to_mujoco_pi05, convert_actions_to_mujoco_absolute
+    gripper_mm = state[7]
+    grip_frac = np.clip(gripper_mm / GRIPPER_OPEN_MM, 0.0, 1.0)
+    mj_hi, mj_lo = gripper_mj_range
+    ctrl[7] = mj_lo + grip_frac * (mj_hi - mj_lo)
 
-# -------- Main ----------------------------------------------------------------
+    return ctrl
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     args = parse_cli()
 
-    print(f"[INFO] Loading dataset from: {args.dataset_path}")
-    print(f"[INFO] Replaying episode {args.episode}")
-    
-    episode_data = load_episode(args.dataset_path, args.episode, dataset_root=args.dataset_root)
-    
-    # Extract raw actions (18-dim, degrees)
-    actions_raw = episode_data[args.action_key].numpy()  # (num_frames, 18)
-    observations = episode_data["observation.state"].numpy()
-    num_frames = len(actions_raw)
-    
-    print(f"[INFO] Action shape: {actions_raw.shape}")
-    print(f"[INFO] First frame action: {actions_raw[0]}")
-    
-    # ============================================================
-    # Load MuJoCo model first to get gripper control range
-    # ============================================================
-    # Change to aloha directory so relative includes resolve correctly
-    aloha_dir = _project_root / "aloha"
+    parquet_path = args.parquet
+    if not Path(parquet_path).is_absolute():
+        parquet_path = str(_PROJECT_ROOT / parquet_path)
+
+    obs_all, act_all, timestamps = load_episode(parquet_path, args.episode)
+    num_frames = len(obs_all)
+
+    source = act_all if args.use_actions else obs_all
+    source_label = "action" if args.use_actions else "observation.state"
+    print(f"[INFO] Replaying {source_label} ({num_frames} frames @ {args.fps} Hz)")
+
+    # Load MuJoCo model
+    xarm_dir = _PROJECT_ROOT / "xarm7"
     original_cwd = os.getcwd()
     try:
-        os.chdir(str(aloha_dir))
-        model = MjModel.from_xml_path("robolab_setup.xml")
+        os.chdir(str(xarm_dir))
+        model = MjModel.from_xml_path("scene.xml")
     finally:
         os.chdir(original_cwd)
-    data = MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, 0)
-    mujoco_keyframe_ctrl = data.ctrl.copy()
-    
-    # Read gripper control range from model (right gripper is actuator 6)
-    right_gripper_actuator_id = 6
-    gripper_ctrl_range = (
-        model.actuator_ctrlrange[right_gripper_actuator_id, 0],
-        model.actuator_ctrlrange[right_gripper_actuator_id, 1]
-    )
-    print(f"[INFO] Gripper control range from XML: [{gripper_ctrl_range[0]}, {gripper_ctrl_range[1]}]")
-    
-    # ============================================================
-    # Choose conversion method based on --new flag
-    # ============================================================
-    if args.use_new_normalization:
-        print("[INFO] Using PI05 normalization method (--new flag)")
-        ctrl_sequence = convert_actions_to_mujoco_pi05(
-            actions_raw, gripper_ctrl_range
-        )
-    else:
-        print("[INFO] Using legacy absolute calibration method")
-        ctrl_sequence = convert_actions_to_mujoco_absolute(
-            actions_raw, gripper_ctrl_range
-        )
-    
-    print(f"[INFO] Ctrl range: [{ctrl_sequence.min():.3f}, {ctrl_sequence.max():.3f}]")
-    renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
 
-    times = []
-    grip_ch6 = []
-    grip_ch13 = []
-    gri_ch6_action = []
-    gri_ch13_action = []
+    data = MjData(model)
+
+    # Reset to home keyframe
+    try:
+        home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+        mujoco.mj_resetDataKeyframe(model, data, home_id)
+    except Exception:
+        mujoco.mj_resetData(model, data)
+
+    # Read gripper actuator ctrl range from XML
+    gripper_act_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
+    gripper_mj_range = (
+        model.actuator_ctrlrange[gripper_act_id, 0],
+        model.actuator_ctrlrange[gripper_act_id, 1],
+    )
+    print(f"[INFO] MuJoCo gripper ctrl range: {gripper_mj_range}")
+    print(f"[INFO] MuJoCo model has {model.nu} actuators, {model.nq} qpos, {model.nv} qvel")
+
+    # Apply CMA-ES optimised parameters if provided
+    if args.cma:
+        import pickle
+        cma_path = args.cma_params
+        if not Path(cma_path).is_absolute():
+            cma_path = str(_PROJECT_ROOT / cma_path)
+        with open(cma_path, "rb") as f:
+            cma_result = pickle.load(f)
+        xbest = cma_result["xbest"]
+        kp = xbest[:7]
+        act_damp = xbest[7:14]
+        jnt_damp = xbest[14:]
+        model.actuator_gainprm[:7, 0] = kp
+        model.actuator_biasprm[:7, 1] = -kp
+        model.actuator_biasprm[:7, 2] = -act_damp
+        model.dof_damping[:7] = jnt_damp
+        print(f"[INFO] Applied CMA-ES params from {args.cma_params}")
+        print(f"  kp (stiffness):       {kp.tolist()}")
+        print(f"  act_damp (biasprm[2]): {act_damp.tolist()}")
+        print(f"  jnt_damp (dof_damping): {jnt_damp.tolist()}")
+
+    # Pre-compute ctrl sequence
+    ctrl_seq = np.array(
+        [lerobot_to_mujoco_ctrl(source[i], gripper_mj_range) for i in range(num_frames)]
+    )
+
+    print(f"[INFO] Ctrl range per actuator:")
+    for i in range(8):
+        print(f"  act[{i}]: [{ctrl_seq[:, i].min():.4f}, {ctrl_seq[:, i].max():.4f}]")
+
+    # Tracking arrays for optional plot
+    joint_recorded = []
+    joint_mujoco = []
 
     def run_simulation(viewer=None):
-        TIMESTEP = 1.0 / args.fps  # Match video frame rate
-        print(f"[INFO] Using TIMESTEP={TIMESTEP:.4f}s (FPS={args.fps})")
-        
+        dt = 1.0 / args.fps
+        print(f"[INFO] TIMESTEP={dt:.4f}s (FPS={args.fps})")
+        wall_start = time.perf_counter()
+
         for frame_idx in range(num_frames):
-            recorded_observation = observations[frame_idx]
-            prompt = args.default_prompt or ""
-            obs = build_observation(model, data, recorded_observation, renderer, prompt)
-            
-            # Apply ctrl directly (like working script)
-            data.ctrl[:] = ctrl_sequence[frame_idx]
-            
-            # Step simulation forward by TIMESTEP
-            sim_time_target = data.time + TIMESTEP
-            while data.time < sim_time_target:
+            data.ctrl[:] = ctrl_seq[frame_idx]
+
+            sim_target = data.time + dt
+            # print(f"sim_target at frame {frame_idx}: {sim_target}")
+            while data.time < sim_target:
                 mujoco.mj_step(model, data)
-            
-            # Sync viewer once per frame (not per physics step) for better performance
+                # print(f"data.time: {data.time}")
+
             if viewer is not None:
                 viewer.sync()
-            
-            times.append(data.time)
-            grip_ch6.append(recorded_observation[6])
-            grip_ch13.append(recorded_observation[13])
-            gri_ch6_action.append(obs['state'][6])
-            gri_ch13_action.append(obs['state'][13])
-            
+
+            # Real-time pacing: wait until wall clock catches up to sim time
+            wall_elapsed = time.perf_counter() - wall_start
+            sim_elapsed = (frame_idx + 1) * dt
+            sleep_s = sim_elapsed - wall_elapsed
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+            if args.plot:
+                joint_recorded.append(source[frame_idx].copy())
+                mj_state = np.zeros(8)
+                mj_state[:7] = np.rad2deg(data.qpos[:7])
+                mj_state[7] = data.qpos[7]  # gripper qpos (driver joint)
+                joint_mujoco.append(mj_state)
+
             if frame_idx % 100 == 0:
-                print(f"[INFO] Frame {frame_idx}/{num_frames}, ctrl[1]={data.ctrl[1]:.3f}")
+                print(f"  frame {frame_idx}/{num_frames}  "
+                      f"sim_time={data.time:.2f}s  "
+                      f"ctrl[0]={data.ctrl[0]:.4f}")
 
     if _HAS_DISPLAY:
         with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -342,16 +265,41 @@ def main():
         print("[INFO] Running in headless mode (no viewer)")
         run_simulation(None)
 
-    idx = list(range(len(grip_ch6)))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=idx, y=grip_ch6, mode='lines', name='grip_ch6'))
-    fig.add_trace(go.Scatter(x=idx, y=grip_ch13, mode='lines', name='grip_ch13'))
-    fig.add_trace(go.Scatter(x=idx, y=gri_ch6_action, mode='lines', name='gri_ch6_action'))
-    fig.add_trace(go.Scatter(x=idx, y=gri_ch13_action, mode='lines', name='gri_ch13_action'))
-    fig.update_layout(title='Gripper Actions Over Time', xaxis_title='Index', yaxis_title='Value')
-    fig.write_html("gripper_actions_v16.html")
-    print("Saved plot → gripper_actions_v16.html")
-    print("[DONE] playback finished")
+    print("[DONE] Playback finished.")
+
+    # Optional: save joint comparison plot
+    if args.plot and joint_recorded:
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+
+            rec = np.array(joint_recorded)
+            mj = np.array(joint_mujoco)
+            names = [f"joint{i+1}" for i in range(7)] + ["gripper"]
+
+            fig = make_subplots(rows=4, cols=2, subplot_titles=names)
+            for i, name in enumerate(names):
+                r, c = divmod(i, 2)
+                fig.add_trace(
+                    go.Scatter(y=rec[:, i], name=f"{name}_recorded", mode="lines"),
+                    row=r + 1, col=c + 1,
+                )
+                fig.add_trace(
+                    go.Scatter(y=mj[:, i], name=f"{name}_mujoco", mode="lines",
+                               line=dict(dash="dash")),
+                    row=r + 1, col=c + 1,
+                )
+
+            fig.update_layout(
+                title=f"xArm Replay — Episode {args.episode} ({source_label})",
+                height=900,
+            )
+            out_html = f"xarm_replay_ep{args.episode}.html"
+            fig.write_html(out_html)
+            print(f"[INFO] Saved joint plot → {out_html}")
+        except ImportError:
+            print("[WARN] plotly not installed, skipping plot")
+
 
 if __name__ == "__main__":
     main()
