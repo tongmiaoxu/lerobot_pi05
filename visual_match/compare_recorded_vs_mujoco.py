@@ -128,7 +128,7 @@ def lerobot_state_to_mujoco_ctrl(state: np.ndarray, gripper_mj_range: tuple) -> 
     ctrl = np.zeros(8, dtype=np.float64)
     ctrl[:7] = np.deg2rad(state[:7])
     grip_frac = np.clip(state[7] / GRIPPER_OPEN_MM, 0.0, 1.0)
-    mj_lo, mj_hi = gripper_mj_range
+    mj_hi, mj_lo= gripper_mj_range
     ctrl[7] = mj_lo + grip_frac * (mj_hi - mj_lo)
     return ctrl
 
@@ -592,13 +592,16 @@ def main():
     robot_geom_ids = get_robot_geom_ids(model)
     print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
 
-    # Set camera poses from calibration (after mj_step populates data)
+    # Apply camera calibration.
+    # Wrist cam: patches model (local pose) — only needs to be done once.
+    # Stationary cam: patches data (world pose) — must be re-applied after every mj_step.
     mujoco.mj_forward(model, data)
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
         mj_cam = cam_cfg["mujoco_cam"]
         cc = cam_cfg["config"]
         cam_id = set_mujoco_camera_from_config(data, model, mj_cam, cc)
-        print(f"[INFO] Camera '{mj_cam}' (id={cam_id}) pose set from config")
+        cam_type = cc.get("type", "stationary")
+        print(f"[INFO] Camera '{mj_cam}' (id={cam_id}) calibration applied (type={cam_type})")
 
     # Camera intrinsics from config
     camera_intrinsics = {}
@@ -746,9 +749,12 @@ def main():
             while data.time < sim_target:
                 mujoco.mj_step(model, data)
 
-            # Re-apply calibrated camera poses (mj_step may reset)
+            # Re-apply stationary camera world-pose (mj_step resets data.cam_xpos).
+            # Wrist camera pose is computed by kinematics from the model-local
+            # offset set once at startup — no per-frame override needed.
             for cam_key, cam_cfg in CAMERA_CONFIG.items():
-                set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+                if cam_cfg["config"].get("type", "stationary") == "stationary":
+                    set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
             # FK comparison (site positions are already valid from mj_step)
             if ee_site is not None:
@@ -817,9 +823,14 @@ def main():
                 if gaussian_available and scene_data is not None:
                     try:
                         cc = cam_cfg["config"]
-                        camera_pose = np.eye(4)
-                        camera_pose[:3, :3] = cc["cam_xmat_mj"]
-                        camera_pose[:3, 3] = cc["cam_pos_mj"]
+                        if cc.get("type", "stationary") == "stationary":
+                            # Fixed camera — use calibration pose directly
+                            camera_pose = np.eye(4)
+                            camera_pose[:3, :3] = cc["cam_xmat_mj"]
+                            camera_pose[:3, 3] = cc["cam_pos_mj"]
+                        else:
+                            # Wrist camera — read kinematic world pose from MuJoCo
+                            camera_pose = get_mujoco_camera_pose(model, data, mujoco_cam)
                         w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
                         bg_im = render_gaussian(w2c, camera_intrinsics[cam_key],
                                                 scene_data, scene_depth_data, viz_cfg)

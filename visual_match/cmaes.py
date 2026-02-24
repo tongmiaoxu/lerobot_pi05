@@ -115,7 +115,7 @@ def lerobot_obs_to_mujoco(obs_all, gripper_mj_range):
     ctrl[:, :7] = np.deg2rad(obs_all[:, :7])
 
     grip_frac = np.clip(obs_all[:, 7] / GRIPPER_OPEN_MM, 0.0, 1.0)
-    mj_lo, mj_hi = gripper_mj_range
+    mj_hi, mj_lo = gripper_mj_range
     ctrl[:, 7] = mj_lo + grip_frac * (mj_hi - mj_lo)
     return ctrl
 
