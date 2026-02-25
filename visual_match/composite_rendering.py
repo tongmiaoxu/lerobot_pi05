@@ -36,7 +36,10 @@ from camera_config import load_camera_config, set_mujoco_camera_from_config
 
 # ===== ICP alignment transform (Gaussian Splatting <-> MuJoCo) =====
 ICP_TRANSFORM_PATH = "pointclouds/icp_transform.npy"
-T_splat2mj = np.load(ICP_TRANSFORM_PATH)
+if os.path.exists(ICP_TRANSFORM_PATH):
+    T_splat2mj = np.load(ICP_TRANSFORM_PATH)
+else:
+    raise ValueError("ICP transform not found")
 
 # ===== Load camera calibration from config =====
 _stationary_cfg = load_camera_config("stationary_cam")
@@ -122,9 +125,35 @@ def get_robot_geom_ids(model):
             robot_geom_ids.add(geom_id)
     # Also include the cube as foreground
     cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube")
+    sticker_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "sticker")
     if cube_id != -1:
         robot_geom_ids.add(cube_id)
+    if sticker_id != -1:
+        robot_geom_ids.add(sticker_id)
     return robot_geom_ids
+
+
+def get_mujoco_camera_pose(model, data, cam_name):
+    """Get camera pose (4x4 c2w matrix) from MuJoCo model and data."""
+    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+    if cam_id == -1:
+        raise ValueError(f"Camera '{cam_name}' not found")
+    camera_xpos = data.cam_xpos[cam_id]
+    camera_xmat = data.cam_xmat[cam_id].reshape(3, 3)
+    camera_pose = np.eye(4)
+    camera_pose[:3, :3] = camera_xmat
+    camera_pose[:3, 3] = camera_xpos
+    return camera_pose
+
+
+def mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj):
+    """Convert MuJoCo camera pose (c2w) to Gaussian Splatting w2c matrix."""
+    T_mj2splat = np.linalg.inv(T_splat2mj)
+    P_gs_cam = T_mj2splat @ camera_pose
+    transform_matrix = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
+    w2c = P_gs_cam @ transform_matrix
+    w2c = np.linalg.inv(w2c)
+    return w2c
 
 
 # xArm: single stationary camera
