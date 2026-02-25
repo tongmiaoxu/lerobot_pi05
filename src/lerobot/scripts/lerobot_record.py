@@ -81,7 +81,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
+from lerobot.datasets.utils import INFO_PATH, build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -129,7 +129,7 @@ from lerobot.teleoperators.aloha_leader import (  # noqa: F401
 )
 from lerobot.teleoperators.gello_leader import GelloLeader, GelloLeaderConfig  # noqa: F401
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -443,7 +443,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     listener = None
 
     try:
+        # Compute dataset root (same logic as LeRobotDatasetMetadata.create)
+        dataset_root = (
+            Path(cfg.dataset.root) if cfg.dataset.root is not None else HF_LEROBOT_HOME / cfg.dataset.repo_id
+        )
+        dataset_exists = dataset_root.exists() and (dataset_root / INFO_PATH).is_file()
+
         if cfg.resume:
+            if not dataset_exists:
+                raise FileNotFoundError(
+                    f"Cannot resume: no existing dataset found at {dataset_root}. "
+                    "Remove --resume to create a new dataset."
+                )
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -458,7 +469,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
-            # Create empty dataset or load existing saved episodes
+            # Create empty dataset
+            if dataset_exists:
+                raise FileExistsError(
+                    f"Dataset already exists at {dataset_root}. "
+                    "Use --resume=true to continue recording."
+                )
             sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,

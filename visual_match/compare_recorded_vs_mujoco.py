@@ -65,19 +65,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import cv2
+
 import mujoco
 from mujoco import MjModel, MjData
-
-_HAS_OPENCV_GUI = False
 try:
-    if not hasattr(cv2, 'namedWindow'):
-        raise AttributeError("cv2 module is not properly loaded")
-    test_window = "___opencv_gui_test___"
-    cv2.namedWindow(test_window, cv2.WINDOW_NORMAL)
-    cv2.destroyWindow(test_window)
-    _HAS_OPENCV_GUI = True
-except (AttributeError, cv2.error):
-    _HAS_OPENCV_GUI = False
+    import mujoco.viewer
+    _HAS_MJ_VIEWER = True
+except ImportError:
+    _HAS_MJ_VIEWER = False
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
@@ -290,11 +285,15 @@ T_splat2mj = np.load(ICP_TRANSFORM_PATH) if os.path.exists(ICP_TRANSFORM_PATH) e
 # ============================================================================
 
 def get_robot_geom_ids(model):
-    """Returns geom IDs belonging to the xArm robot (all mesh geoms)."""
+    """Returns geom IDs belonging to the xArm robot (all mesh geoms) and the cube."""
     robot_geom_ids = set()
     for geom_id in range(model.ngeom):
         if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH:
             robot_geom_ids.add(geom_id)
+    # Also include the cube as foreground
+    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube")
+    if cube_id != -1:
+        robot_geom_ids.add(cube_id)
     return robot_geom_ids
 
 
@@ -651,28 +650,32 @@ def main():
         for i in range(num_frames)
     ])
 
-    # Create windows — 2 rows: stationary + wrist
+    # Create windows — 2 rows: stationary + wrist, 4 columns: recorded, mujoco, composite, alpha
     win_stat_rec = "Stationary - Recorded"
+    win_stat_mj = "Stationary - MuJoCo"
     win_stat_comp = "Stationary - Composite"
     win_stat_alpha = "Stationary - Alpha"
     win_wrist_rec = "Wrist - Recorded"
+    win_wrist_mj = "Wrist - MuJoCo"
     win_wrist_comp = "Wrist - Composite"
     win_wrist_alpha = "Wrist - Alpha"
 
     WINDOW_W, WINDOW_H = 400, 300
-    for win in [win_stat_rec, win_stat_comp, win_stat_alpha,
-                win_wrist_rec, win_wrist_comp, win_wrist_alpha]:
+    for win in [win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha,
+                win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha]:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
 
     X_START, Y_START = 50, 30
     X_STEP, Y_STEP = 410, 340
     cv2.moveWindow(win_stat_rec, X_START, Y_START)
-    cv2.moveWindow(win_stat_comp, X_START + X_STEP, Y_START)
-    cv2.moveWindow(win_stat_alpha, X_START + 2 * X_STEP, Y_START)
+    cv2.moveWindow(win_stat_mj, X_START + X_STEP, Y_START)
+    cv2.moveWindow(win_stat_comp, X_START + 2 * X_STEP, Y_START)
+    cv2.moveWindow(win_stat_alpha, X_START + 3 * X_STEP, Y_START)
     cv2.moveWindow(win_wrist_rec, X_START, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_comp, X_START + X_STEP, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_alpha, X_START + 2 * X_STEP, Y_START + Y_STEP)
+    cv2.moveWindow(win_wrist_mj, X_START + X_STEP, Y_START + Y_STEP)
+    cv2.moveWindow(win_wrist_comp, X_START + 2 * X_STEP, Y_START + Y_STEP)
+    cv2.moveWindow(win_wrist_alpha, X_START + 3 * X_STEP, Y_START + Y_STEP)
 
     print("[INFO] Starting playback (q=quit, SPACE=pause, +/-=alpha)")
     alpha = args.alpha
@@ -741,13 +744,26 @@ def main():
     paused = False
     frame_idx = 0
 
-    while frame_idx < min(num_frames, video_frame_count):
-        if not paused:
-            # Apply ctrl
-            data.ctrl[:] = ctrl_sequence[frame_idx]
-            sim_target = data.time + 1.0 / args.fps
-            while data.time < sim_target:
-                mujoco.mj_step(model, data)
+    # --- MuJoCo 3D Viewer Setup ---
+    viewer = None
+    if _HAS_MJ_VIEWER:
+        viewer_ctx = mujoco.viewer.launch_passive(model, data)
+        viewer = viewer_ctx.__enter__()
+        print("[INFO] MuJoCo 3D viewer launched (synchronized)")
+    else:
+        print("[WARN] mujoco.viewer not available; 3D viewer disabled.")
+
+    try:
+        while frame_idx < min(num_frames, video_frame_count):
+            if not paused:
+                # Apply ctrl
+                data.ctrl[:] = ctrl_sequence[frame_idx]
+                sim_target = data.time + 1.0 / args.fps
+                while data.time < sim_target:
+                    mujoco.mj_step(model, data)
+                # --- Sync MuJoCo 3D Viewer ---
+                if viewer is not None:
+                    viewer.sync()
 
             # Re-apply stationary camera world-pose (mj_step resets data.cam_xpos).
             # Wrist camera pose is computed by kinematics from the model-local
@@ -797,8 +813,8 @@ def main():
             # Render both cameras
             cam_renders = {}
             window_map = {
-                "stationary": (win_stat_rec, win_stat_comp, win_stat_alpha),
-                "wrist": (win_wrist_rec, win_wrist_comp, win_wrist_alpha),
+                "stationary": (win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha),
+                "wrist": (win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha),
             }
 
             for cam_key, cam_cfg in CAMERA_CONFIG.items():
@@ -858,28 +874,30 @@ def main():
 
                 cam_renders[cam_key] = {
                     "recorded": recorded_frame,
+                    "mujoco": fg_bgr.copy(),
                     "composite": composite_frame,
                     "alpha": alpha_frame,
                 }
 
             # Save calibration frames
-            SAVE_FRAMES = [0, 5, 10, 15, 20]
-            if args.save_images and frame_idx in SAVE_FRAMES:
-                gs_dir = Path("calibration_pairs/gs_renders")
-                real_dir = Path("calibration_pairs/real_captures")
-                gs_dir.mkdir(parents=True, exist_ok=True)
-                real_dir.mkdir(parents=True, exist_ok=True)
-                gs_path = gs_dir / f"frame_{frame_idx:04d}.png"
-                real_path = real_dir / f"frame_{frame_idx:04d}.png"
-                cv2.imwrite(str(gs_path), cam_renders["stationary"]["composite"])
-                cv2.imwrite(str(real_path), cam_renders["stationary"]["recorded"])
-                print(f"[INFO] Saved frame {frame_idx}: {gs_path}, {real_path}")
+            # (disabled: do not save any images or create directories)
+            # SAVE_FRAMES = [0, 5, 10, 15, 20]
+            # if args.save_images and frame_idx in SAVE_FRAMES:
+            #     gs_dir = Path("calibration_pairs/gs_renders")
+            #     real_dir = Path("calibration_pairs/real_captures")
+            #     gs_dir.mkdir(parents=True, exist_ok=True)
+            #     real_dir.mkdir(parents=True, exist_ok=True)
+            #     gs_path = gs_dir / f"frame_{frame_idx:04d}.png"
+            #     real_path = real_dir / f"frame_{frame_idx:04d}.png"
+            #     cv2.imwrite(str(gs_path), cam_renders["stationary"]["composite"])
+            #     cv2.imwrite(str(real_path), cam_renders["stationary"]["recorded"])
+            #     print(f"[INFO] Saved frame {frame_idx}: {gs_path}, {real_path}")
 
             # Overlays
             gripper_mm = observations_raw[frame_idx, 7]
             mujoco_grip_ctrl = data.ctrl[7]
             for cam_key in CAMERA_CONFIG:
-                for ft in ["recorded", "composite", "alpha"]:
+                for ft in ["recorded", "mujoco", "composite", "alpha"]:
                     frame = cam_renders[cam_key][ft]
                     cv2.putText(frame, f"Frame: {frame_idx}/{num_frames}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -888,32 +906,36 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
             # Display
-            for cam_key, (w_rec, w_comp, w_alpha) in window_map.items():
+            for cam_key, (w_rec, w_mj, w_comp, w_alpha) in window_map.items():
                 cv2.imshow(w_rec, cam_renders[cam_key]["recorded"])
+                cv2.imshow(w_mj, cam_renders[cam_key]["mujoco"])
                 cv2.imshow(w_comp, cam_renders[cam_key]["composite"])
                 cv2.imshow(w_alpha, cam_renders[cam_key]["alpha"])
 
-            frame_idx += 1
 
-        key = cv2.waitKey(frame_delay) & 0xFF
-        if key == ord('q'):
-            print("[INFO] Quit requested")
-            break
-        elif key == ord(' '):
-            paused = not paused
-            print(f"[INFO] {'Paused' if paused else 'Resumed'}")
-        elif key == ord('n') and paused:
-            paused = False
-            continue
-        elif key == ord('+') or key == ord('='):
-            alpha = min(1.0, alpha + 0.05)
-            print(f"[INFO] Alpha: {alpha:.2f}")
-        elif key == ord('-') or key == ord('_'):
-            alpha = max(0.0, alpha - 0.05)
-            print(f"[INFO] Alpha: {alpha:.2f}")
+                frame_idx += 1
 
-    cv2.destroyAllWindows()
-    print("[INFO] Playback finished")
+            key = cv2.waitKey(frame_delay) & 0xFF
+            if key == ord('q'):
+                print("[INFO] Quit requested")
+                break
+            elif key == ord(' '):
+                paused = not paused
+                print(f"[INFO] {'Paused' if paused else 'Resumed'}")
+            elif key == ord('n') and paused:
+                paused = False
+                continue
+            elif key == ord('+') or key == ord('='):
+                alpha = min(1.0, alpha + 0.05)
+                print(f"[INFO] Alpha: {alpha:.2f}")
+            elif key == ord('-') or key == ord('_'):
+                alpha = max(0.0, alpha - 0.05)
+                print(f"[INFO] Alpha: {alpha:.2f}")
+    finally:
+        if viewer is not None:
+            viewer_ctx.__exit__(None, None, None)
+        cv2.destroyAllWindows()
+        print("[INFO] Playback finished")
 
     if realtime_plot_enabled and fig_fk is not None:
         try:
@@ -936,16 +958,16 @@ def main():
         print(f"       Rotation:    mean={np.degrees(np.mean(rot_errors[:, 3])):.2f}°, "
               f"max={np.degrees(np.max(rot_errors[:, 3])):.2f}°")
 
-        save_path = f"fk_comparison_ep{args.episode}.png"
-        if realtime_plot_enabled and fig_fk is not None:
-            try:
-                fig_fk.savefig(save_path, dpi=150, bbox_inches='tight')
-                print(f"[INFO] Saved FK plot to: {save_path}")
-                plt.show()
-            except Exception:
-                pass
-        else:
-            plot_fk_comparison(trans_errors, rot_errors, args.fps, save_path=save_path)
+        # save_path = f"fk_comparison_ep{args.episode}.png"
+        # if realtime_plot_enabled and fig_fk is not None:
+        #     try:
+        #         fig_fk.savefig(save_path, dpi=150, bbox_inches='tight')
+        #         print(f"[INFO] Saved FK plot to: {save_path}")
+        #         plt.show()
+        #     except Exception:
+        #         pass
+        # else:
+        #     plot_fk_comparison(trans_errors, rot_errors, args.fps, save_path=save_path)
 
 
 if __name__ == "__main__":

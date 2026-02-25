@@ -52,21 +52,7 @@ pip install xarm-python-sdk
 ```
 
 ### Command (xArm + GELLO data collection)
-```bash
-# Basic data collection with xArm7 + GELLO (no cameras):
-lerobot-record \
-    --robot.type=xarm_follower \
-    --robot.ip=192.168.1.228 \
-    --robot.dof=7 \
-    --teleop.type=gello_leader \
-    --teleop.port=/dev/ttyUSB0 \
-    --teleop.dof=7 \
-    --dataset.repo_id=tongmiao/xarm_pick_cube \
-    --dataset.single_task="Pick up the cube" \
-    --dataset.num_episodes=20 \
-    --dataset.fps=30 \
-    --dataset.root=data
-```
+
 ```bash
 # With 2 RealSense cameras (stationary + wrist):
 # To find serial numbers, run: lerobot-find-cameras realsense
@@ -80,7 +66,8 @@ lerobot-record \
     --dataset.single_task="Pick up the cube" \
     --dataset.num_episodes=20 \
     --dataset.fps=30 \
-    --dataset.root=data
+    --dataset.root=data \
+    --resume=true
 ```
 Other useful parameters:
 ```bash
@@ -115,15 +102,19 @@ python visual_match/composite_rendering.py
 
 ### replay in mujoco (--cma : use cma result in cma_result.pkl )
 ```bash
-python visual_match/run_prerecorded_traj_mujoco.py
+python visual_match/run_prerecorded_traj_mujoco.py --cma
 ```
 
 ### compare replay
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py
+python visual_match/compare_recorded_vs_mujoco.py --cma
 ```
 
-### Policy Training
+### load model in mujoco
+```bash
+python visual_match/load_model_xarm.py
+```
+### Policy Training for aloha
 ```bash
 lerobot-train \
   --policy.type=act \
@@ -139,6 +130,39 @@ lerobot-train \
   --wandb.project=aloha_pick_cube_lerobot0.4.3_wrist \
   --dataset.image_transforms.enable=true
 
+```
+
+### Policy Training for xarm
+```bash
+lerobot-train \
+  --policy.type=act \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=tongmiao/xarm_pick_cube \
+  --dataset.root=data \
+  --output_dir=./outputs/act_xarm_training \
+  --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
+  --batch_size=8 \
+  --steps=80000 \
+  --wandb.enable=true \
+  --wandb.project=xarm_pick_cube_lerobot0.4.3 \
+  --dataset.image_transforms.enable=true
+```
+```bash
+lerobot-train \
+  --policy.type=diffusion \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=tongmiao/xarm_pick_cube \
+  --dataset.root=data \
+  --output_dir=./outputs/diffusion_xarm_training \
+  --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
+  --wandb.enable=true \
+  --wandb.project=xarm_pick_cube_lerobot0.4.3  \
+  --dataset.image_transforms.enable=true \
+  --policy.horizon=64 \
+  --policy.n_action_steps=50 \
+  --batch_size=64
 ```
 ```bash
 lerobot-train \
@@ -156,7 +180,7 @@ lerobot-train \
   --policy.n_action_steps=50 \
   --batch_size=64
 ```
-### Policy Deployment
+### Policy Deployment for aloha
 ```bash
 lerobot-record \
   --robot.type=aloha_follower \
@@ -171,9 +195,45 @@ lerobot-record \
   --resume=true
 
 ```
+```bash
+lerobot-train \
+  --policy.type=pi05 \
+  --policy.device=cuda \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.push_to_hub=false \
+  --policy.compile_model=true \
+  --policy.gradient_checkpointing=true \
+  --policy.dtype=bfloat16 \
+  --dataset.repo_id=tongmiao/xarm_pick_cube \
+  --dataset.root=data \
+  --output_dir=./outputs/pi05_xarm_training \
+  --batch_size=32 \
+  --steps=3000 \
+  --wandb.enable=true \
+  --wandb.project=xarm_pick_cube_pi05
+```
 
+### Policy Deployment for xarm
+```bash
+lerobot-record \
+  --robot.type=xarm_follower \
+  --robot.ip=192.168.1.228 \
+  --robot.cameras='{"cam_high": {"type": "intelrealsense", "serial_number_or_name": "246322303954", "fps": 30, "width": 640, "height": 480}, "cam_wrist": {"type": "intelrealsense", "serial_number_or_name": "213622251153", "fps": 30, "width": 640, "height": 480}}' \
+  --teleop.type=gello_leader \
+  --teleop.port=/dev/ttyUSB0 \
+  --policy.path=outputs/act_xarm_training/checkpoints/last/pretrained_model \
+  --dataset.repo_id=tongmiao/eval_xarm_pick_cube \
+  --dataset.single_task="Pick up the cube" \
+  --dataset.num_episodes=10 \
+  --dataset.fps=30 \
+  --dataset.root=data_eval \
+  --dataset.push_to_hub=false
 
-
+```
+### Policy rollout in Simulation for xarm
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+```
 
 ### Teleoperation (no data recording)
 To config which arm to use: edit `config_aloha_follower.py` (line 48-49) and `config_aloha_leader.py` (line 68-69)

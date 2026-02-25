@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Deploy ACT policy in MuJoCo ALOHA simulation.
+Deploy ACT policy in MuJoCo xArm simulation.
 
-This script loads an ACT policy checkpoint and runs it in MuJoCo simulation.
-The policy uses the old data conversion (not PI05 normalization), matching
-the training data format.
+This script loads an ACT policy checkpoint and runs it in MuJoCo xArm simulation.
+Uses 2 cameras: wrist and stationary, both with composite rendering (Gaussian Splatting
+background + MuJoCo robot foreground). Refer to compare_recorded_vs_mujoco for the
+xArm observation.state format (8-dim): [joint1..7 in degrees, gripper in mm (0=closed, 800=open)]
+
+composite rendering pipeline.
 
 Usage:
     python visual_match/deploy_act_policy_mujoco.py \
@@ -23,6 +26,7 @@ import json
 
 # Add src to path for lerobot imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent))
 
 # Auto-detect display
 def _detect_display():
@@ -48,30 +52,43 @@ from mujoco import MjModel, MjData
 if _HAS_DISPLAY:
     import mujoco.viewer
 
-from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+from lerobot.policies.factory import get_policy_class
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.utils.control_utils import predict_action, prepare_observation_for_inference
+from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
-from lerobot.utils.constants import OBS_STATE, OBS_IMAGES
+from lerobot.utils.constants import OBS_STATE
+from lerobot.policies.factory import make_pre_post_processors
 
 # ============================================================================
-# Import Gaussian Splatting helpers from compare_recorded_vs_mujoco.py
+# Import from compare_recorded_vs_mujoco
 # ============================================================================
-sys.path.insert(0, str(Path(__file__).parent))
+from camera_config import load_camera_config, set_mujoco_camera_from_config
 from compare_recorded_vs_mujoco import (
     get_robot_geom_ids,
     load_scene_data,
     render_gaussian,
     get_mujoco_camera_pose,
     mj_pose_to_gaussian_w2c,
-    get_camera_intrinsics_from_model,
-    T_splat2mj,
+    lerobot_state_to_mujoco_ctrl,
+    GRIPPER_OPEN_MM,
 )
-from mujoco_lerobot_conversion import (
-    MuJoCoLeRobotConverter,
-    convert_actions_to_mujoco_pi05,
-    convert_actions_to_mujoco_absolute,
-)
+from compare_recorded_vs_mujoco import T_splat2mj
+
+# Camera configuration (same as compare_recorded_vs_mujoco)
+_stationary_cfg = load_camera_config("stationary_cam")
+_wrist_cfg = load_camera_config("wrist_cam")
+CAMERA_CONFIG = {
+    "stationary": {
+        "dataset_cam": "cam_high",
+        "mujoco_cam": "stationary_cam",
+        "config": _stationary_cfg,
+    },
+    "wrist": {
+        "dataset_cam": "cam_wrist",
+        "mujoco_cam": "wrist_cam",
+        "config": _wrist_cfg,
+    },
+}
 
 # ============================================================================
 # Color calibration functions
@@ -86,401 +103,201 @@ def _get_aug(x: np.ndarray, add_ones: bool = False) -> np.ndarray:
 
 
 def load_color_mapping(yaml_path: str):
-    """
-    Load color transform from color_mapping.yaml file.
-    
-    Returns:
-        A: Transform matrix (3, 6) for [R², G², B², R, G, B] terms
-        b: Bias vector (3,), constant term
-    """
+    """Load color transform from color_mapping.yaml file."""
     with open(yaml_path, 'r') as f:
         content = f.read()
-    
-    # Parse color_A matrix (flattened 18 values)
     a_match = re.search(r'color_A:\s*\[(.*?)\]', content, re.DOTALL)
     if not a_match:
         raise ValueError(f"Could not find color_A in {yaml_path}")
     a_values = [float(x.strip()) for x in a_match.group(1).replace('\n', '').split(',')]
-    A = np.array(a_values, dtype=np.float32).reshape(3, 6)  # 3 channels, 6 features
-    
-    # Parse color_b vector (3 values)
+    A = np.array(a_values, dtype=np.float32).reshape(3, 6)
     b_match = re.search(r'color_b:\s*\[(.*?)\]', content, re.DOTALL)
     if not b_match:
         raise ValueError(f"Could not find color_b in {yaml_path}")
     b_values = [float(x.strip()) for x in b_match.group(1).replace('\n', '').split(',')]
     b = np.array(b_values, dtype=np.float32)
-    
     return A, b
 
 
 def apply_color_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """
-    Apply quadratic color transform to image.
-    
-    Args:
-        img: Input image (H, W, 3) in RGB format, uint8 [0-255]
-        A: Transform matrix (3, 6) for [R², G², B², R, G, B] terms
-        b: Bias vector (3,), constant term
-    
-    Returns:
-        Transformed image (H, W, 3) in RGB format, uint8 [0-255]
-    """
-    # Flatten and normalize to [0, 1]
+    """Apply quadratic color transform to image (RGB uint8)."""
     flat = img.reshape(-1, 3).astype(np.float32) / 255.0
-    
-    # Apply quadratic transform: [R², G², B², R, G, B] @ A.T + b
-    flat_aug = _get_aug(flat, add_ones=False)  # Shape: (N, 6)
-    out = flat_aug @ A.T + b  # Shape: (N, 3)
-    
-    # Clip and convert back to uint8
+    flat_aug = _get_aug(flat, add_ones=False)
+    out = flat_aug @ A.T + b
     out = np.clip(out, 0.0, 1.0)
     out_rgb = (out.reshape(img.shape) * 255.0).astype(np.uint8)
-    
     return out_rgb
 
 
+# ============================================================================
+# xArm state conversion (qpos -> lerobot state)
+# ============================================================================
+
+def mujoco_qpos_to_lerobot_state(qpos: np.ndarray, gripper_mj_range: tuple) -> np.ndarray:
+    """
+    Convert MuJoCo qpos (8-dim: 7 joints rad + gripper) to xArm LeRobot state.
+    State format: [joint1..7 in degrees, gripper in mm (0=closed, 800=open)]
+    """
+    state = np.zeros(8, dtype=np.float32)
+    state[:7] = np.rad2deg(qpos[:7])
+    mj_lo, mj_hi = gripper_mj_range
+    grip_frac = np.clip((qpos[7] - mj_lo) / (mj_hi - mj_lo), 0.0, 1.0)
+    state[7] = grip_frac * GRIPPER_OPEN_MM
+    return state
+
+
 def display_camera_images(observation: dict, policy_config=None, window_name_prefix: str = "Camera"):
-    """
-    Display camera images from observation dict in OpenCV windows.
-    Only displays images that are actually used by the policy.
-    
-    Args:
-        observation: Observation dict containing image keys
-        policy_config: Policy configuration to determine which images are used
-        window_name_prefix: Prefix for window names
-    """
-    # Find all image keys in observation
+    """Display camera images from observation dict in OpenCV windows."""
     all_image_keys = [k for k in observation.keys() if "image" in k.lower()]
-    
-    # Filter to only images actually used by the policy
     if policy_config is not None and hasattr(policy_config, 'image_features') and policy_config.image_features:
-        # Only display images that the policy actually uses
         image_keys = [k for k in all_image_keys if k in policy_config.image_features]
     else:
-        # No filtering, show all images
         image_keys = all_image_keys
-    
+
     for img_key in image_keys:
         img = observation[img_key]
-        # Convert RGB to BGR for OpenCV
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        
-        # Extract a nice window name from the key
-        # e.g., "observation.images.cam_high" -> "cam_high"
-        if "." in img_key:
-            window_name = img_key.split(".")[-1]
-        else:
-            window_name = img_key
-        
+        window_name = img_key.split(".")[-1] if "." in img_key else img_key
         window_full_name = f"{window_name_prefix}: {window_name}"
-        
-        # Display image
         cv2.imshow(window_full_name, img_bgr)
-    
-    # Wait 1ms to allow windows to update (non-blocking)
     cv2.waitKey(1)
 
 
 def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
     """Load ACT policy from checkpoint path."""
     print(f"[INFO] Loading policy from: {policy_path}")
-    
-    # Resolve path
+
     policy_path_obj = Path(policy_path)
     if not policy_path_obj.is_absolute():
-        # Try relative to current working directory first
         if not policy_path_obj.exists():
-            # Try relative to project root
             project_root = Path(__file__).parent.parent
             policy_path_obj = project_root / policy_path
         if not policy_path_obj.exists():
             raise FileNotFoundError(f"Policy path not found: {policy_path}")
-    
+
     policy_path = str(policy_path_obj.resolve())
-    
-    # Load policy config
+
     config_path = Path(policy_path) / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    
+
     with open(config_path, 'r') as f:
         config_dict = json.load(f)
-    
-    # If config is missing 'type' field, we need to manually construct the config
-    # and load the policy weights separately
-    if "type" not in config_dict:
-        print("[INFO] Config missing 'type' field, manually constructing ACTConfig")
-        from lerobot.policies.act.configuration_act import ACTConfig
-        from lerobot.configs.types import PolicyFeature, FeatureType, NormalizationMode
-        
-        # Convert old format (input_shapes, input_normalization_modes) to new format (input_features)
-        config_dict_new = config_dict.copy()
-        
-        # Remove old format fields that aren't valid for ACTConfig
-        old_fields = ["input_shapes", "input_normalization_modes", "output_shapes", "output_normalization_modes", "type"]
-        for field in old_fields:
-            config_dict_new.pop(field, None)
-        
-        # Convert input_shapes + input_normalization_modes to input_features
-        if "input_shapes" in config_dict or "input_normalization_modes" in config_dict:
-            input_shapes = config_dict.get("input_shapes", {})
-            input_norm_modes = config_dict.get("input_normalization_modes", {})
-            
-            input_features = {}
-            for key, shape in input_shapes.items():
-                # Determine feature type based on key
-                if "image" in key.lower() or "images" in key.lower():
-                    feature_type = FeatureType.VISUAL
-                elif "state" in key.lower():
-                    feature_type = FeatureType.STATE
-                elif "environment_state" in key.lower():
-                    feature_type = FeatureType.ENV
-                else:
-                    feature_type = FeatureType.STATE  # Default
-                
-                input_features[key] = PolicyFeature(
-                    type=feature_type,
-                    shape=tuple(shape)
-                )
-            
-            config_dict_new["input_features"] = input_features
-        
-        # Convert output_shapes + output_normalization_modes to output_features
-        if "output_shapes" in config_dict or "output_normalization_modes" in config_dict:
-            output_shapes = config_dict.get("output_shapes", {})
-            output_norm_modes = config_dict.get("output_normalization_modes", {})
-            
-            output_features = {}
-            for key, shape in output_shapes.items():
-                output_features[key] = PolicyFeature(
-                    type=FeatureType.ACTION,
-                    shape=tuple(shape)
-                )
-            
-            config_dict_new["output_features"] = output_features
-        
-        # Construct ACTConfig from converted dict
-        config = ACTConfig(**config_dict_new)
-        config.pretrained_path = Path(policy_path)
-        
-        # Get policy class
-        policy_class = get_policy_class("act")
-        
-        # Create policy instance with config
-        policy = policy_class(config)
-        
-        # Load model weights using the same method as from_pretrained
-        from lerobot.utils.utils import get_safe_torch_device
-        from lerobot.policies.pretrained import SAFETENSORS_SINGLE_FILE
-        
-        model_file = Path(policy_path) / SAFETENSORS_SINGLE_FILE
-        if not model_file.exists():
-            raise FileNotFoundError(f"Model file not found: {model_file}")
-        
-        device_obj = get_safe_torch_device(config.device)
-        
-        # Load to CPU first (safest approach, works with all safetensors versions)
-        # Then move to target device afterwards
-        policy = policy_class._load_as_safetensor(policy, str(model_file), "cpu", strict=False)
-        policy = policy.to(device_obj)
-        
-        print(f"[INFO] Policy loaded: act (manual loading)")
-    else:
-        policy_type = config_dict.get("type", "act")
-        if policy_type != "act":
-            print(f"[WARN] Policy type is {policy_type}, expected 'act'")
-        
-        # Get policy class
-        policy_class = get_policy_class(policy_type)
-        
-        # Load policy using from_pretrained (standard path)
-        policy = policy_class.from_pretrained(policy_path)
-        print(f"[INFO] Policy loaded: {policy_type}")
-    
+
+    policy_type = config_dict.get("type", "act")
+    policy_class = get_policy_class(policy_type)
+    policy = policy_class.from_pretrained(policy_path)
+    if policy_type != "act":
+        print(f"[WARN] Policy type is {policy_type}, expected 'act'")
+
     policy.eval()
-    print(f"[INFO] Policy config: device={policy.config.device}, use_amp={policy.config.use_amp}")
-    
+    print(f"[INFO] Policy loaded: {policy_type}")
     return policy, config_dict
 
 
-def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco.Renderer, 
-                                  gripper_ctrl_range: tuple,
-                                  camera_name: str = "teleoperator_pov",
-                                  seg_renderer: mujoco.Renderer = None,
-                                  robot_geom_ids: set = None,
-                                  gaussian_data: dict = None,
-                                  use_new_normalization: bool = False) -> dict:
+def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco.Renderer,
+                                  gripper_mj_range: tuple,
+                                  seg_renderer: mujoco.Renderer,
+                                  robot_geom_ids: set,
+                                  gaussian_data: dict | None) -> dict:
     """
-    Build observation dictionary from MuJoCo state with optional Gaussian Splatting composite.
-    
-    Returns observation in format expected by policy:
-    {
-        "observation.state": np.ndarray,  # (14,) joint positions
-        "observation.images.cam_high": np.ndarray,  # (H, W, 3) RGB image (composite if Gaussian available)
-        "observation.images.cam_low": np.ndarray,
-        "observation.images.cam_left_wrist": np.ndarray,  # (composite if Gaussian available)
-        "observation.images.cam_right_wrist": np.ndarray,  # (composite if Gaussian available)
-    }
-    
-    Args:
-        gaussian_data: Dict with 'scene_data', 'scene_depth_data', 'intrinsics_cache', 'viz_cfg' for composite rendering
-        use_new_normalization: If True, use PI05 normalization for state conversion
+    Build observation dict for xArm policy from MuJoCo state.
+    Uses 2 cameras: cam_high (stationary) and cam_wrist, both with composite rendering.
     """
-    # Convert MuJoCo state (radians) to lerobot format (normalized degrees)
-    converter = MuJoCoLeRobotConverter(gripper_ctrl_range, use_new_normalization)
-    state = converter.state_to_lerobot(data.qpos)
-    
-    # Build observation dict
-    observation = {
-        OBS_STATE: state,
-    }
-    
-    # Camera mapping: observation key -> MuJoCo camera name
-    camera_names = {
-        "observation.images.cam_high": "teleoperator_pov",
-        "observation.images.cam_low": "depth_cam",
-        "observation.images.cam_left_wrist": "wrist_cam_left",
-        "observation.images.cam_right_wrist": "wrist_cam_right",
-    }
-    
-    # Check if Gaussian composite rendering is available
-    use_composite = (gaussian_data is not None and 
+    state = mujoco_qpos_to_lerobot_state(data.qpos, gripper_mj_range)
+    observation = {OBS_STATE: state}
+
+    use_composite = (gaussian_data is not None and
                      gaussian_data.get('scene_data') is not None and
                      seg_renderer is not None and
                      robot_geom_ids is not None)
-    
-    # Wrist cameras should use composite rendering (if available)
-    wrist_cameras = {"wrist_cam_left", "wrist_cam_right"}
-    
-    # Render each camera view
-    for obs_key, cam_name_to_use in camera_names.items():
-        try:
-            # Decide if we should use composite rendering for this camera
-            should_composite = use_composite and cam_name_to_use in wrist_cameras
-            
-            if should_composite:
-                # Render composite (Gaussian background + MuJoCo foreground)
-                rgb_image = render_composite_view(
-                    model, data, renderer, seg_renderer, robot_geom_ids,
-                    cam_name_to_use, gaussian_data
-                )
-            else:
-                # Render MuJoCo only
-                renderer.update_scene(data, camera=cam_name_to_use)
-                rgb_image = renderer.render()
-            
-            observation[obs_key] = rgb_image
-            
-        except Exception as e:
-            # Fallback to default camera on error
-            print(f"[WARN] Camera '{cam_name_to_use}' rendering failed: {e}, using '{camera_name}' instead")
-            renderer.update_scene(data, camera=camera_name)
+
+    camera_intrinsics = gaussian_data.get('camera_intrinsics', {}) if gaussian_data else {}
+
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        mujoco_cam = cam_cfg["mujoco_cam"]
+        obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
+
+        if use_composite:
+            rgb_image = render_composite_view(
+                model, data, renderer, seg_renderer, robot_geom_ids,
+                mujoco_cam, gaussian_data, camera_intrinsics.get(cam_key)
+            )
+        else:
+            renderer.update_scene(data, camera=mujoco_cam)
             rgb_image = renderer.render()
-            observation[obs_key] = rgb_image
-    
+
+        observation[obs_key] = rgb_image
+
     return observation
 
 
-def render_composite_view(model: MjModel, data: MjData, 
-                         renderer: mujoco.Renderer, seg_renderer: mujoco.Renderer,
-                         robot_geom_ids: set, cam_name: str, gaussian_data: dict) -> np.ndarray:
+def render_composite_view(model: MjModel, data: MjData,
+                          renderer: mujoco.Renderer, seg_renderer: mujoco.Renderer,
+                          robot_geom_ids: set, cam_name: str, gaussian_data: dict,
+                          intrinsics: np.ndarray | None) -> np.ndarray:
     """
     Render composite view: Gaussian Splatting background + MuJoCo robot foreground.
-    Optionally applies color calibration if available.
-    
-    Returns:
-        RGB image as uint8 numpy array (H, W, 3)
     """
-    # Render MuJoCo foreground
     renderer.update_scene(data, camera=cam_name)
     fg_rgb = renderer.render()
-    
-    # Get segmentation mask for robot
+
     seg_renderer.update_scene(data, camera=cam_name)
     seg_mask = seg_renderer.render()
     seg_labels = seg_mask[:, :, 0].astype(np.int32)
     seg_labels[seg_labels == -1] = 0
     robot_mask = np.isin(seg_labels, list(robot_geom_ids))
     mask_uint8 = (robot_mask.astype(np.uint8)) * 255
-    
-    # Render Gaussian background
-    try:
-        # Get camera pose and intrinsics
-        camera_pose = get_mujoco_camera_pose(model, data, cam_name)
-        w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
-        
-        # Get or compute intrinsics for this camera
-        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
-        intrinsics_cache = gaussian_data['intrinsics_cache']
-        if cam_name not in intrinsics_cache:
+
+    if intrinsics is not None and gaussian_data.get('scene_data') is not None:
+        try:
+            cc = None
+            for cam_cfg in CAMERA_CONFIG.values():
+                if cam_cfg["mujoco_cam"] == cam_name:
+                    cc = cam_cfg["config"]
+                    break
+            if cc is not None and cc.get("type", "stationary") == "stationary":
+                camera_pose = np.eye(4)
+                camera_pose[:3, :3] = cc["cam_xmat_mj"]
+                camera_pose[:3, 3] = cc["cam_pos_mj"]
+            else:
+                camera_pose = get_mujoco_camera_pose(model, data, cam_name)
+            w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
             viz_cfg = gaussian_data['viz_cfg']
-            k = get_camera_intrinsics_from_model(model, cam_id, viz_cfg['viz_w'], viz_cfg['viz_h'])
-            intrinsics_cache[cam_name] = k
-        else:
-            k = intrinsics_cache[cam_name]
-        
-        # Render Gaussian background
-        bg_im = render_gaussian(w2c, k, gaussian_data['scene_data'], 
-                               gaussian_data['scene_depth_data'], gaussian_data['viz_cfg'])
-        bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
-        bg_np = (bg_np * 255).astype(np.uint8)
-        
-        # Composite: background + foreground where mask is True
-        composite = bg_np.copy()
-        composite[mask_uint8 > 0] = fg_rgb[mask_uint8 > 0]
-        
-        # Apply color calibration if available
-        if 'color_calib' in gaussian_data and gaussian_data['color_calib'] is not None:
-            color_A, color_b = gaussian_data['color_calib']
-            composite = apply_color_transform(composite, color_A, color_b)
-        
-        return composite
-        
-    except Exception as e:
-        # Fallback to MuJoCo only on Gaussian rendering error
-        print(f"[WARN] Gaussian rendering failed for {cam_name}: {e}, using MuJoCo only")
-        return fg_rgb
+            bg_im = render_gaussian(w2c, intrinsics, gaussian_data['scene_data'],
+                                    gaussian_data['scene_depth_data'], viz_cfg)
+            bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
+            bg_np = (bg_np * 255).astype(np.uint8)
+            composite = bg_np.copy()
+            composite[mask_uint8 > 0] = fg_rgb[mask_uint8 > 0]
+            if 'color_calib' in gaussian_data and gaussian_data['color_calib'] is not None:
+                color_A, color_b = gaussian_data['color_calib']
+                composite = apply_color_transform(composite, color_A, color_b)
+            return composite
+        except Exception as e:
+            print(f"[WARN] Gaussian rendering failed for {cam_name}: {e}")
+    return fg_rgb
 
 
-def convert_action_to_mujoco(action: torch.Tensor,
-                             gripper_ctrl_range: tuple, use_new_normalization: bool = False) -> np.ndarray:
+def convert_action_to_mujoco(action: torch.Tensor, gripper_mj_range: tuple) -> np.ndarray:
     """
-    Convert policy action (18 dims) to MuJoCo control (14 dims).
-    
-    Uses unified conversion module for consistent conversion.
+    Convert policy action (8-dim: 7 joints degrees + gripper mm) to MuJoCo ctrl (8-dim).
     """
-    # Convert to numpy and reshape for the conversion function
     action_np = action.cpu().numpy()
     if action_np.ndim > 1:
-        action_np = action_np[0]  # Remove batch dimension if present
-    
-    # Reshape to (1, 18) for the conversion function (expects batch dimension)
-    actions_raw = action_np.reshape(1, -1)
-    
-    # Use the unified conversion module
-    if use_new_normalization:
-        ctrl_sequence = convert_actions_to_mujoco_pi05(
-            actions_raw, 
-            gripper_ctrl_range
-        )
-    else:
-        ctrl_sequence = convert_actions_to_mujoco_absolute(
-            actions_raw, 
-            gripper_ctrl_range
-        )
-    # Return first frame (remove batch dimension)
-    return ctrl_sequence[0]
+        action_np = action_np[0]
+    return lerobot_state_to_mujoco_ctrl(action_np, gripper_mj_range)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Deploy ACT policy in MuJoCo ALOHA simulation"
+        description="Deploy ACT policy in MuJoCo xArm simulation"
     )
     parser.add_argument(
         "--policy-path",
         type=str,
-        required=True,
-        help="Path to policy checkpoint directory (e.g., outputs/train/act_pick_cuber/checkpoints/080000/pretrained_model)"
+        default="outputs/act_xarm_training/checkpoints/last/pretrained_model",
+        help="Path to policy checkpoint directory"
     )
     parser.add_argument(
         "--prompt",
@@ -501,129 +318,105 @@ def main():
         help="Maximum number of steps to run (default: 1000)"
     )
     parser.add_argument(
-        "--camera",
-        type=str,
-        default="teleoperator_pov",
-        help="MuJoCo camera name for observation (default: teleoperator_pov)"
-    )
-    parser.add_argument(
         "--headless",
         action="store_true",
         help="Run without GUI (for headless servers)"
     )
     parser.add_argument(
-        "--disable-left-arm",
-        action="store_true",
-        help="Disable left arm control (set to zero or hold position)"
-    )
-    parser.add_argument("--new", action="store_true",
-                   help="Use PI05 normalization method: degrees = (raw - mid) * 360 / max_res")
-    parser.add_argument(
         "--scene-path",
         type=str,
-        default="pointclouds/N Goodwin Ave_w_o_Arm.npz",
-        help="Path to Gaussian Splatting scene file for composite rendering (optional)"
+        default="pointclouds/xarm7.npz",
+        help="Path to Gaussian Splatting scene file for composite rendering"
     )
     parser.add_argument(
         "--color-calib-path",
         type=str,
-        default="calibration_pairs_wrist/calibrated/color_mapping.yaml",
+        default=None,
         help="Path to color calibration YAML file (optional)"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Load policy
     policy, config_dict = load_policy(args.policy_path)
     device = get_safe_torch_device(policy.config.device)
     policy = policy.to(device)
-    
-    # Print policy action parameters
+
     print(f"[INFO] Policy action parameters:")
     if hasattr(policy.config, 'horizon'):
-        print(f"  - horizon: {policy.config.horizon} (number of future steps predicted)")
+        print(f"  - horizon: {policy.config.horizon}")
     if hasattr(policy.config, 'n_action_steps'):
-        print(f"  - n_action_steps: {policy.config.n_action_steps} (number of steps executed per prediction)")
+        print(f"  - n_action_steps: {policy.config.n_action_steps}")
     if hasattr(policy.config, 'chunk_size'):
-        print(f"  - chunk_size: {policy.config.chunk_size} (ACT chunk size)")
-    
+        print(f"  - chunk_size: {policy.config.chunk_size}")
+
     # Create pre/post processors
-    # Try to load from pretrained path, fallback to creating from config if files don't exist
     processor_path = Path(args.policy_path) / "policy_preprocessor.json"
     if processor_path.exists():
-        # Processors exist, load them
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy.config,
             pretrained_path=args.policy_path,
         )
     else:
-        # Processors don't exist, create from config
-        print("[WARN] Processor files not found in checkpoint")
-        print("[INFO] Creating processors from config (normalization may not match training)")
-        print("[INFO] To fix this, run: python src/lerobot/processor/migrate_policy_normalization.py --pretrained-path " + args.policy_path)
-        # Create processors from config without loading from checkpoint
+        print("[WARN] Processor files not found, creating from config")
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy.config,
-            pretrained_path=None,  # Don't load from checkpoint, create from config
+            pretrained_path=None,
         )
-    
-    # Load MuJoCo model
+
+    # Load MuJoCo xArm model
     project_root = Path(__file__).parent.parent
-    aloha_dir = project_root / "aloha"
+    xarm_dir = project_root / "xarm7"
     original_cwd = os.getcwd()
     try:
-        os.chdir(str(aloha_dir))
-        model = MjModel.from_xml_path("robolab_setup.xml")
+        os.chdir(str(xarm_dir))
+        model = MjModel.from_xml_path("scene.xml")
     finally:
         os.chdir(original_cwd)
-    
+
     data = MjData(model)
-    data.qpos[:16] = [-0.0125, -1.697, 1.707, -0.001, 0.299, 0.181, 0.0377, 0.0377,
-            0.0114, -1.843, 1.680, -0.003, 0.239, -0.004, 0.0382,0.0382]
-    mujoco.mj_forward(model, data)
-    # Get gripper control range
-    right_gripper_actuator_id = 6
-    gripper_ctrl_range = (
-        model.actuator_ctrlrange[right_gripper_actuator_id, 0],
-        model.actuator_ctrlrange[right_gripper_actuator_id, 1]
+    try:
+        home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+        mujoco.mj_resetDataKeyframe(model, data, home_id)
+    except Exception:
+        mujoco.mj_resetData(model, data)
+
+    gripper_act_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
+    gripper_mj_range = (
+        model.actuator_ctrlrange[gripper_act_id, 0],
+        model.actuator_ctrlrange[gripper_act_id, 1],
     )
-    print(f"[INFO] Gripper control range: [{gripper_ctrl_range[0]}, {gripper_ctrl_range[1]}]")
-    
-    # Create renderer
+    print(f"[INFO] Gripper ctrl range: [{gripper_mj_range[0]}, {gripper_mj_range[1]}]")
+
     RENDER_W, RENDER_H = 640, 480
     renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
-    
-    # Create segmentation renderer for composite rendering
     seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer.enable_segmentation_rendering()
-    
-    # Get robot geom IDs for masking
+
     robot_geom_ids = get_robot_geom_ids(model)
     print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
-    
-    # Load Gaussian Splatting scene (optional)
+
+    # Apply camera calibration
+    mujoco.mj_forward(model, data)
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        mj_cam = cam_cfg["mujoco_cam"]
+        cc = cam_cfg["config"]
+        cam_id = set_mujoco_camera_from_config(data, model, mj_cam, cc)
+        print(f"[INFO] Camera '{mj_cam}' (id={cam_id}) calibration applied")
+
+    # Camera intrinsics from config (used for Gaussian rendering)
+    camera_intrinsics = {cam_key: cam_cfg["config"]["intrinsics"]
+                         for cam_key, cam_cfg in CAMERA_CONFIG.items()}
+
+    # Load Gaussian Splatting scene
     gaussian_data = None
     if os.path.exists(args.scene_path):
-        composite_cam = "wrist_cam_right"
-        composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, composite_cam)
-        if composite_cam_id == -1:
-            print(f"[WARN] Camera '{composite_cam}' not found, trying wrist_cam_left")
-            composite_cam = "wrist_cam_left"
-            composite_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, composite_cam)
-        
-        if composite_cam_id != -1:
-            # Get intrinsics
-            k = get_camera_intrinsics_from_model(model, composite_cam_id, RENDER_W, RENDER_H)
-            
-            # Get initial w2c
-            mujoco.mj_forward(model, data)
-            init_pose = get_mujoco_camera_pose(model, data, composite_cam)
+        try:
+            init_pose = get_mujoco_camera_pose(model, data, "stationary_cam")
             w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
-            
-            # Load scene
-            scene_data, scene_depth_data = load_scene_data(args.scene_path, w2c_init, k)
-            
-            # Load color calibration if available
+            scene_data, scene_depth_data = load_scene_data(
+                args.scene_path, w2c_init, camera_intrinsics["stationary"]
+            )
             color_calib = None
             if args.color_calib_path and os.path.exists(args.color_calib_path):
                 try:
@@ -631,89 +424,67 @@ def main():
                     color_calib = (color_A, color_b)
                     print(f"[INFO] Loaded color calibration from: {args.color_calib_path}")
                 except Exception as e:
-                    print(f"[INFO] Failed to load color calibration: {e}, Continuing without color calibration")
-            else:
-                print("[INFO] Continuing without color calibration")
-            
-            # Package Gaussian data
-            viz_cfg = {
-                'viz_w': RENDER_W, 'viz_h': RENDER_H,
-                'viz_near': 0.1, 'viz_far': 10.0
-            }
+                    print(f"[WARN] Failed to load color calibration: {e}")
+            viz_cfg = {'viz_w': RENDER_W, 'viz_h': RENDER_H, 'viz_near': 0.1, 'viz_far': 10.0}
             gaussian_data = {
                 'scene_data': scene_data,
                 'scene_depth_data': scene_depth_data,
-                'intrinsics_cache': {},  # Will cache intrinsics per camera
                 'viz_cfg': viz_cfg,
-                'color_calib': color_calib  # Add color calibration
+                'color_calib': color_calib,
+                'camera_intrinsics': camera_intrinsics,
             }
             print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
-            print(f"[INFO] Composite rendering enabled for wrist cameras")
-        else:
-            print(f"[WARN] No wrist cameras found, Gaussian rendering disabled")
-            
+        except Exception as e:
+            print(f"[WARN] Failed to load Gaussian scene: {e}")
+            import traceback
+            traceback.print_exc()
     else:
-        print(f"[INFO] Scene file not found: {args.scene_path}")
-        print("[INFO] Using MuJoCo-only rendering (no Gaussian background)")
-    
-    # Reset policy
+        print(f"[WARN] Scene file not found: {args.scene_path}")
+
     policy.reset()
-    
-    # Create OpenCV windows for camera display (if not headless)
-    # Only create windows for cameras actually used by the policy
+
     if not args.headless:
-        if hasattr(policy.config, 'image_features') and policy.config.image_features:
-            print(f"[INFO] Policy uses {len(policy.config.image_features)} camera(s): {list(policy.config.image_features)}")
-            for img_key in policy.config.image_features:
-                # Extract camera name from key (e.g., "observation.images.cam_high" -> "cam_high")
-                cam_name = img_key.split(".")[-1] if "." in img_key else img_key
-                cv2.namedWindow(f"Camera: {cam_name}", cv2.WINDOW_NORMAL)
-            print(f"[INFO] Created {len(policy.config.image_features)} camera display window(s)")
-        else:
-            print("[WARN] Policy config has no image_features, creating windows for all cameras")
-            cv2.namedWindow("Camera: cam_high", cv2.WINDOW_NORMAL)
-            cv2.namedWindow("Camera: cam_low", cv2.WINDOW_NORMAL)
-            cv2.namedWindow("Camera: cam_left_wrist", cv2.WINDOW_NORMAL)
-            cv2.namedWindow("Camera: cam_right_wrist", cv2.WINDOW_NORMAL)
-            print("[INFO] Camera display windows created")
-    
-    # Control loop
+        for cam_key in CAMERA_CONFIG:
+            obs_key = f"observation.images.{CAMERA_CONFIG[cam_key]['dataset_cam']}"
+            cv2.namedWindow(f"Camera: {obs_key.split('.')[-1]}", cv2.WINDOW_NORMAL)
+
     print(f"[INFO] Starting policy deployment (max {args.max_steps} steps)")
-    
+
     step_dt = 1.0 / args.fps
     step = 0
-    
-    # Viewer (optional)
+
     viewer = None
+    viewer_ctx = None
     if not args.headless and _HAS_DISPLAY:
         try:
-            viewer = mujoco.viewer.launch_passive(model, data)
-            
-        except Exception as e:
+            viewer_ctx = mujoco.viewer.launch_passive(model, data)
+            viewer = viewer_ctx.__enter__()
+        except Exception:
             viewer = None
-    
+            viewer_ctx = None
+
     try:
         while step < args.max_steps:
             step_start = time.perf_counter()
-            # print("[QPOS] ", data.qpos)
-            # Build observation from MuJoCo (convert to lerobot format)
+
+            # Re-apply stationary camera pose (mj_step may reset data.cam_xpos)
+            for cam_cfg in CAMERA_CONFIG.values():
+                if cam_cfg["config"].get("type", "stationary") == "stationary":
+                    set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+
             observation = build_observation_from_mujoco(
-                model, data, renderer, gripper_ctrl_range, args.camera,
+                model, data, renderer, gripper_mj_range,
                 seg_renderer=seg_renderer,
                 robot_geom_ids=robot_geom_ids,
                 gaussian_data=gaussian_data,
-                use_new_normalization=args.new
             )
-            
-            # Display camera images (if not headless)
+
             if not args.headless:
-                display_camera_images(observation, policy_config=policy.config, window_name_prefix="Camera")
-            
-            # Add prompt if policy supports it
+                display_camera_images(observation, policy_config=policy.config)
+
             if hasattr(policy.config, 'language_features') and policy.config.language_features:
                 observation["observation.language"] = args.prompt
-            # print(f"[ACTION]: {observation['observation.state']}")
-            # Predict action
+
             with torch.inference_mode():
                 action = predict_action(
                     observation,
@@ -723,55 +494,36 @@ def main():
                     postprocessor,
                     policy.config.use_amp,
                     task=args.prompt,
-                    robot_type="aloha_follower",
+                    robot_type="xarm_follower",
                 )
-            
-            # Debug: show action prediction details on first step
-            if step == 0:
-                action_shape = action.shape if isinstance(action, torch.Tensor) else np.array(action).shape
-                print(f"[INFO] First action prediction:")
-                print(f"  - Action shape: {action_shape}")
-                if hasattr(policy.config, 'n_action_steps'):
-                    print(f"  - Executing step 0 of {policy.config.n_action_steps} predicted actions")
-                    print(f"  - Policy will repredict every {policy.config.n_action_steps} steps")
-            
-            # Convert action to MuJoCo control
-            ctrl = convert_action_to_mujoco(action, gripper_ctrl_range, use_new_normalization=args.new)
-            
-            # Debug output
-            if step == 0 or step % 100 == 0:
-                action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
-                if action_np.ndim > 1:
-                    action_np = action_np[0]
-            
-            # Apply control
+
+            ctrl = convert_action_to_mujoco(action, gripper_mj_range)
             data.ctrl[:] = ctrl
-            
-            # Step simulation
-            mujoco.mj_step(model, data)
-            
-            # Update viewer
+
+            sim_target = data.time + step_dt
+            while data.time < sim_target:
+                mujoco.mj_step(model, data)
+
             if viewer is not None:
                 viewer.sync()
-            
-            # Sleep to maintain control frequency
+
             elapsed = time.perf_counter() - step_start
             sleep_time = max(0, step_dt - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)
-            
+
             step += 1
-            
-            # Print progress every 100 steps
             if step % 100 == 0:
                 print(f"[INFO] Step {step}/{args.max_steps}")
-    
+
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user")
     finally:
-        if viewer is not None:
-            viewer.close()
-        # Close OpenCV windows
+        if viewer_ctx is not None:
+            try:
+                viewer_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
         if not args.headless:
             cv2.destroyAllWindows()
         print("[INFO] Deployment finished")

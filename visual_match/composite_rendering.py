@@ -113,13 +113,17 @@ except ImportError:
 
 def get_robot_geom_ids(model):
     """
-    Returns geom IDs belonging to the xArm robot (all mesh geoms).
+    Returns geom IDs belonging to the xArm robot (all mesh geoms) and the cube.
     Excludes floor and primitive geoms (cylinder base, etc.).
     """
     robot_geom_ids = set()
     for geom_id in range(model.ngeom):
         if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH:
             robot_geom_ids.add(geom_id)
+    # Also include the cube as foreground
+    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube")
+    if cube_id != -1:
+        robot_geom_ids.add(cube_id)
     return robot_geom_ids
 
 
