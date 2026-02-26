@@ -203,6 +203,6 @@
   <keyframe>
     <!-- <key name="home" qpos="0 -.247 0 .909 0 1.15644 0 0 0 0 0 0 0" ctrl="0 -.247 0 .909 0 1.15644 0 0"/> -->
     <!-- 13 robot DoFs + 7 cube freejoint (pos xyz + quat wxyz) -->
-    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0  0.5415 -0.011 0.0771 1 0 0 0" ctrl="0 0 0 1.57 0 1.57 0 0"/>
+    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0  0.5286 0.0086 0.0771 1 0 0 0" ctrl="0 0 0 1.57 0 1.57 0 0"/>
   </keyframe>
 </mujoco>

@@ -11,7 +11,8 @@ import pickle
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-GRIPPER_OPEN_MM = 800.0
+from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
+
 FPS = 30.0
 TIMESTEP = 1.0 / FPS
 
@@ -105,21 +106,6 @@ def load_episodes(parquet_path):
     return episodes
 
 
-def lerobot_obs_to_mujoco(obs_all, gripper_mj_range):
-    """
-    Convert xArm observation.state to MuJoCo ctrl values.
-    obs_all : (N, 8) — [j1..j7 in degrees, gripper in mm]
-    returns : (N, 8) — [j1..j7 in radians, gripper in MuJoCo ctrl units]
-    """
-    ctrl = np.zeros_like(obs_all)
-    ctrl[:, :7] = np.deg2rad(obs_all[:, :7])
-
-    grip_frac = np.clip(obs_all[:, 7] / GRIPPER_OPEN_MM, 0.0, 1.0)
-    mj_hi, mj_lo = gripper_mj_range
-    ctrl[:, 7] = mj_lo + grip_frac * (mj_hi - mj_lo)
-    return ctrl
-
-
 def main():
     start = time.time()
 
@@ -149,7 +135,7 @@ def main():
 
     # Pre-convert all episodes: degrees/mm -> radians/mujoco-gripper
     episodes_mj = {
-        idx: lerobot_obs_to_mujoco(obs, gripper_mj_range)
+        idx: lerobot_state_to_mujoco_ctrl(obs, gripper_mj_range)
         for idx, obs in raw_episodes.items()
     }
 

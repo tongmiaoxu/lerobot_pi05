@@ -87,9 +87,9 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
 
 # ============================================================================
-# xArm conversion constants
+# xArm conversion (imported from shared utils)
 # ============================================================================
-GRIPPER_OPEN_MM = 800.0
+from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -122,19 +122,6 @@ def get_end_effector_pose(model, data, site_name: str, run_forward: bool = False
     pos = data.site_xpos[site_id].copy()
     rot_mat = data.site_xmat[site_id].reshape(3, 3).copy()
     return pos, rot_mat
-
-
-def lerobot_state_to_mujoco_ctrl(state: np.ndarray, gripper_mj_range: tuple) -> np.ndarray:
-    """
-    Convert xArm LeRobot state (8-dim: 7 joints in degrees + gripper in mm)
-    to MuJoCo ctrl (8-dim: 7 joints in radians + gripper in [0, 255]).
-    """
-    ctrl = np.zeros(8, dtype=np.float64)
-    ctrl[:7] = np.deg2rad(state[:7])
-    grip_frac = np.clip(state[7] / GRIPPER_OPEN_MM, 0.0, 1.0)
-    mj_hi, mj_lo= gripper_mj_range
-    ctrl[7] = mj_lo + grip_frac * (mj_hi - mj_lo)
-    return ctrl
 
 
 def compute_pose_difference(pos1, rot1, pos2, rot2):
@@ -802,16 +789,23 @@ def main():
         print(f"       Rotation:    mean={np.degrees(np.mean(rot_errors[:, 3])):.2f}°, "
               f"max={np.degrees(np.max(rot_errors[:, 3])):.2f}°")
 
-        # save_path = f"fk_comparison_ep{args.episode}.png"
-        # if realtime_plot_enabled and fig_fk is not None:
-        #     try:
-        #         fig_fk.savefig(save_path, dpi=150, bbox_inches='tight')
-        #         print(f"[INFO] Saved FK plot to: {save_path}")
-        #         plt.show()
-        #     except Exception:
-        #         pass
-        # else:
-        #     plot_fk_comparison(trans_errors, rot_errors, args.fps, save_path=save_path)
+        save_path = f"fk_comparison_ep{args.episode}.png"
+        if fig_fk is not None and ax_trans is not None and ax_rot is not None:
+            # Add mean/max text to the real-time figure before saving
+            mean_trans = np.mean(trans_errors[:, 3]) * 1000
+            max_trans = np.max(trans_errors[:, 3]) * 1000
+            mean_rot = np.degrees(np.mean(rot_errors[:, 3]))
+            max_rot = np.degrees(np.max(rot_errors[:, 3]))
+            ax_trans.text(0.02, 0.98, f'Mean: {mean_trans:.2f} mm\nMax: {max_trans:.2f} mm',
+                          transform=ax_trans.transAxes, va='top', fontsize=10,
+                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax_rot.text(0.02, 0.98, f'Mean: {mean_rot:.2f}°\nMax: {max_rot:.2f}°',
+                        transform=ax_rot.transAxes, va='top', fontsize=10,
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            fig_fk.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"[INFO] Saved FK plot to: {save_path}")
+        else:
+            plot_fk_comparison(trans_errors, rot_errors, args.fps, save_path=save_path)
 
 
 if __name__ == "__main__":

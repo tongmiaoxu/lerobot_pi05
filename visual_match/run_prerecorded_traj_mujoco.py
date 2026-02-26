@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Optional
 import time
 
+# Add src and visual_match to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 def _detect_display():
     if os.environ.get("DISPLAY"):
         return True
@@ -46,16 +50,52 @@ if not _HAS_DISPLAY:
     os.environ["MUJOCO_GL"] = "egl"
 
 import numpy as np
+import cv2
 import mujoco
 from mujoco import MjModel, MjData
 
 if _HAS_DISPLAY:
     import mujoco.viewer
 
+# Imports for 4-window display (Real + Composite per camera)
+from camera_config import load_camera_config, set_mujoco_camera_from_config
+from composite_rendering import (
+    get_mujoco_camera_pose,
+    get_robot_geom_ids,
+    load_scene_data,
+    mj_pose_to_gaussian_w2c,
+    render,
+    T_splat2mj,
+)
+from compare_recorded_vs_mujoco import load_episode as load_episode_for_videos
+from deploy_act_policy_mujoco import (
+    load_dataset_frames,
+    display_camera_images,
+    build_observation_from_mujoco,
+    load_color_mapping,
+)
+
+# Camera configuration (same as deploy_act_policy_mujoco)
+_stationary_cfg = load_camera_config("stationary_cam")
+_wrist_cfg = load_camera_config("wrist_cam")
+CAMERA_CONFIG = {
+    "stationary": {
+        "dataset_cam": "cam_high",
+        "mujoco_cam": "stationary_cam",
+        "config": _stationary_cfg,
+    },
+    "wrist": {
+        "dataset_cam": "cam_wrist",
+        "mujoco_cam": "wrist_cam",
+        "config": _wrist_cfg,
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-GRIPPER_OPEN_MM = 800.0
+from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
+
 GRIPPER_CLOSE_MM = 0.0
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -72,6 +112,10 @@ class Args:
     plot: bool = False
     cma: bool = False
     cma_params: str = "cma_result.pkl"
+    dataset_path: Optional[str] = None
+    scene_path: str = "pointclouds/xarm7.npz"
+    color_calib_path: Optional[str] = None
+    headless: bool = False
 
 
 def parse_cli() -> Args:
@@ -99,13 +143,29 @@ def parse_cli() -> Args:
         "--cma", action="store_true",
         help="Apply CMA-ES optimised parameters to the model.",
     )
+    p.add_argument(
+        "--dataset-path", type=str, default=None,
+        help="Path to LeRobot dataset directory for Real camera windows (optional)",
+    )
+    p.add_argument(
+        "--scene-path", type=str, default="pointclouds/xarm7.npz",
+        help="Path to Gaussian Splatting scene for composite rendering",
+    )
+    p.add_argument(
+        "--color-calib-path", type=str, default=None,
+        help="Path to color calibration YAML file (optional)",
+    )
+    p.add_argument(
+        "--headless", action="store_true",
+        help="Run without GUI (no 4-window display)",
+    )
     return Args(**vars(p.parse_args()))
 
 
 # ---------------------------------------------------------------------------
 # Dataset loader — reads parquet directly (no video dependencies)
 # ---------------------------------------------------------------------------
-def load_episode(parquet_path: str, episode_idx: int):
+def load_episode_from_parquet(parquet_path: str, episode_idx: int):
     import pandas as pd
 
     df = pd.read_parquet(parquet_path)
@@ -126,25 +186,6 @@ def load_episode(parquet_path: str, episode_idx: int):
 
 
 # ---------------------------------------------------------------------------
-# Conversion: LeRobot obs/action (degrees + mm) → MuJoCo ctrl (rad + [0,255])
-# ---------------------------------------------------------------------------
-def lerobot_to_mujoco_ctrl(state: np.ndarray, gripper_mj_range: tuple[float, float]) -> np.ndarray:
-    """
-    state: (8,) — [joint1..7 in degrees, gripper in mm]
-    returns: (8,) — [act1..7 in radians, gripper in MuJoCo ctrl units]
-    """
-    ctrl = np.zeros(8, dtype=np.float64)
-    ctrl[:7] = np.deg2rad(state[:7])
-
-    gripper_mm = state[7]
-    grip_frac = np.clip(gripper_mm / GRIPPER_OPEN_MM, 0.0, 1.0)
-    mj_hi, mj_lo = gripper_mj_range
-    ctrl[7] = mj_lo + grip_frac * (mj_hi - mj_lo)
-
-    return ctrl
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -154,7 +195,7 @@ def main():
     if not Path(parquet_path).is_absolute():
         parquet_path = str(_PROJECT_ROOT / parquet_path)
 
-    obs_all, act_all, timestamps = load_episode(parquet_path, args.episode)
+    obs_all, act_all, timestamps = load_episode_from_parquet(parquet_path, args.episode)
     num_frames = len(obs_all)
 
     source = act_all if args.use_actions else obs_all
@@ -211,12 +252,93 @@ def main():
 
     # Pre-compute ctrl sequence
     ctrl_seq = np.array(
-        [lerobot_to_mujoco_ctrl(source[i], gripper_mj_range) for i in range(num_frames)]
+        [lerobot_state_to_mujoco_ctrl(source[i], gripper_mj_range) for i in range(num_frames)]
     )
 
     print(f"[INFO] Ctrl range per actuator:")
     for i in range(8):
         print(f"  act[{i}]: [{ctrl_seq[:, i].min():.4f}, {ctrl_seq[:, i].max():.4f}]")
+
+    # -----------------------------------------------------------------------
+    # 4-window display setup (Real + Composite per camera, like deploy_act_policy_mujoco)
+    # -----------------------------------------------------------------------
+    renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
+    seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
+    seg_renderer.enable_segmentation_rendering()
+    robot_geom_ids = get_robot_geom_ids(model)
+
+    mujoco.mj_forward(model, data)
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        mj_cam = cam_cfg["mujoco_cam"]
+        cc = cam_cfg["config"]
+        set_mujoco_camera_from_config(data, model, mj_cam, cc)
+
+    camera_intrinsics = {
+        cam_key: cam_cfg["config"]["intrinsics"]
+        for cam_key, cam_cfg in CAMERA_CONFIG.items()
+    }
+
+    gaussian_data = None
+    scene_path = args.scene_path if Path(args.scene_path).is_absolute() else str(_PROJECT_ROOT / args.scene_path)
+    if os.path.exists(scene_path):
+        try:
+            init_pose = get_mujoco_camera_pose(model, data, "stationary_cam")
+            w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
+            scene_data, scene_depth_data, _ = load_scene_data(
+                scene_path, w2c_init, camera_intrinsics["stationary"]
+            )
+            color_calib = None
+            if args.color_calib_path:
+                calib_path = args.color_calib_path if Path(args.color_calib_path).is_absolute() else str(_PROJECT_ROOT / args.color_calib_path)
+                if os.path.exists(calib_path):
+                    try:
+                        color_A, color_b = load_color_mapping(calib_path)
+                        color_calib = (color_A, color_b)
+                    except Exception as e:
+                        print(f"[WARN] Failed to load color calibration: {e}")
+            viz_cfg = {"viz_w": RENDER_W, "viz_h": RENDER_H, "viz_near": 0.1, "viz_far": 10.0}
+            gaussian_data = {
+                "scene_data": scene_data,
+                "scene_depth_data": scene_depth_data,
+                "viz_cfg": viz_cfg,
+                "color_calib": color_calib,
+                "camera_intrinsics": camera_intrinsics,
+            }
+            print(f"[INFO] Loaded Gaussian Splatting scene from: {scene_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to load Gaussian scene: {e}")
+
+    obs_frames = None
+    dataset_path = args.dataset_path
+    if dataset_path is None and "data" in parquet_path:
+        dataset_path = str(Path(parquet_path).parent.parent)
+    if dataset_path and not Path(dataset_path).is_absolute():
+        dataset_path = str(_PROJECT_ROOT / dataset_path)
+    if dataset_path and os.path.isdir(dataset_path):
+        try:
+            episode_data = load_episode_for_videos(dataset_path, args.episode, dataset_root=None)
+            obs_frames = load_dataset_frames(episode_data)
+            print(f"[INFO] Loaded real dataset images for Real windows")
+        except Exception as e:
+            print(f"[WARN] Could not load dataset for Real windows: {e}")
+
+    show_windows = not args.headless and _HAS_DISPLAY
+    if show_windows:
+        WINDOW_W, WINDOW_H = 400, 300
+        X_START, Y_START = 50, 30
+        X_STEP, Y_STEP = 410, 340
+        cam_keys = list(CAMERA_CONFIG.keys())
+        for i, cam_key in enumerate(cam_keys):
+            obs_key = f"observation.images.{CAMERA_CONFIG[cam_key]['dataset_cam']}"
+            cam_short = obs_key.split(".")[-1]
+            win_real = f"Real: {cam_short}"
+            win_comp = f"Composite: {cam_short}"
+            cv2.namedWindow(win_real, cv2.WINDOW_NORMAL)
+            cv2.namedWindow(win_comp, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win_real, WINDOW_W, WINDOW_H)
+            cv2.resizeWindow(win_comp, WINDOW_W, WINDOW_H)
+            cv2.moveWindow(win_real, X_START + i * X_STEP, Y_START)
+            cv2.moveWindow(win_comp, X_START + i * X_STEP, Y_START + Y_STEP)
 
     # Tracking arrays for optional plot
     joint_recorded = []
@@ -239,6 +361,31 @@ def main():
             if viewer is not None:
                 viewer.sync()
 
+            # 4-window display: Real + Composite per camera
+            if show_windows:
+                for cam_cfg in CAMERA_CONFIG.values():
+                    if cam_cfg["config"].get("type", "stationary") == "stationary":
+                        set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+                real_obs = build_observation_from_mujoco(
+                    model, data, renderer, gripper_mj_range,
+                    seg_renderer=seg_renderer,
+                    robot_geom_ids=robot_geom_ids,
+                    gaussian_data=gaussian_data,
+                    obs_frames=obs_frames,
+                    frame_idx=frame_idx,
+                )
+                composite_obs = build_observation_from_mujoco(
+                    model, data, renderer, gripper_mj_range,
+                    seg_renderer=seg_renderer,
+                    robot_geom_ids=robot_geom_ids,
+                    gaussian_data=gaussian_data,
+                    obs_frames=None,
+                    frame_idx=frame_idx,
+                )
+                display_camera_images(real_obs, policy_config=None, window_name_prefix="Real")
+                display_camera_images(composite_obs, policy_config=None, window_name_prefix="Composite")
+                cv2.waitKey(1)
+
             # Real-time pacing: wait until wall clock catches up to sim time
             wall_elapsed = time.perf_counter() - wall_start
             sim_elapsed = (frame_idx + 1) * dt
@@ -258,13 +405,18 @@ def main():
                       f"sim_time={data.time:.2f}s  "
                       f"ctrl[0]={data.ctrl[0]:.4f}")
 
-    if _HAS_DISPLAY:
+    if _HAS_DISPLAY and not args.headless:
         with mujoco.viewer.launch_passive(model, data) as viewer:
             run_simulation(viewer)
     else:
-        print("[INFO] Running in headless mode (no viewer)")
+        if args.headless:
+            print("[INFO] Running in headless mode (no viewer, no 4-window display)")
+        else:
+            print("[INFO] No display detected, running without viewer")
         run_simulation(None)
 
+    if show_windows:
+        cv2.destroyAllWindows()
     print("[DONE] Playback finished.")
 
     # Optional: save joint comparison plot

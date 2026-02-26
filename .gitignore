@@ -178,3 +178,5 @@ outputs/
 data_eval/
 !xarm7/xarm7.xml
 !xarm7/scene.xml
+
+data_eval_old/

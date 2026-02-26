@@ -74,7 +74,12 @@ from composite_rendering import (
     render,
     T_splat2mj,
 )
-from compare_recorded_vs_mujoco import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl, load_episode
+from compare_recorded_vs_mujoco import load_episode
+from lerobot_mujoco_utils import (
+    GRIPPER_OPEN_MM,
+    lerobot_state_to_mujoco_ctrl,
+    mujoco_qpos_to_lerobot_state,
+)
 from lerobot.datasets.video_utils import decode_video_frames
 
 # Camera configuration (same as compare_recorded_vs_mujoco)
@@ -130,23 +135,6 @@ def apply_color_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.n
     out = np.clip(out, 0.0, 1.0)
     out_rgb = (out.reshape(img.shape) * 255.0).astype(np.uint8)
     return out_rgb
-
-
-# ============================================================================
-# xArm state conversion (qpos -> lerobot state)
-# ============================================================================
-
-def mujoco_qpos_to_lerobot_state(qpos: np.ndarray, gripper_mj_range: tuple) -> np.ndarray:
-    """
-    Convert MuJoCo qpos (8-dim: 7 joints rad + gripper) to xArm LeRobot state.
-    State format: [joint1..7 in degrees, gripper in mm (0=closed, 800=open)]
-    """
-    state = np.zeros(8, dtype=np.float32)
-    state[:7] = np.rad2deg(qpos[:7])
-    mj_lo, mj_hi = gripper_mj_range
-    grip_frac = np.clip((qpos[7] - mj_lo) / (mj_hi - mj_lo), 0.0, 1.0)
-    state[7] = grip_frac * GRIPPER_OPEN_MM
-    return state
 
 
 def load_dataset_frames(episode_data: dict):
