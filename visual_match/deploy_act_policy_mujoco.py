@@ -14,6 +14,9 @@ Usage:
         --policy-path outputs/train/act_pick_cuber/checkpoints/080000/pretrained_model \
         --prompt "Pick up the cube" \
         --fps 30
+
+    # Use real-world dataset images as policy input (instead of MuJoCo rendering):
+    python visual_match/deploy_act_policy_mujoco.py --obs --dataset-path data --episode 0
 """
 
 import sys
@@ -60,19 +63,24 @@ from lerobot.utils.constants import OBS_STATE
 from lerobot.policies.factory import make_pre_post_processors
 
 # ============================================================================
-# Import from compare_recorded_vs_mujoco
+# Imports: composite rendering from composite_rendering, xArm conversion from compare_recorded
 # ============================================================================
 from camera_config import load_camera_config, set_mujoco_camera_from_config
-from compare_recorded_vs_mujoco import (
+from composite_rendering import (
+    get_mujoco_camera_pose,
     get_robot_geom_ids,
     load_scene_data,
-    render_gaussian,
-    get_mujoco_camera_pose,
     mj_pose_to_gaussian_w2c,
-    lerobot_state_to_mujoco_ctrl,
-    GRIPPER_OPEN_MM,
+    render,
+    T_splat2mj,
 )
-from compare_recorded_vs_mujoco import T_splat2mj
+from compare_recorded_vs_mujoco import load_episode
+from lerobot_mujoco_utils import (
+    GRIPPER_OPEN_MM,
+    lerobot_state_to_mujoco_ctrl,
+    mujoco_qpos_to_lerobot_state,
+)
+from lerobot.datasets.video_utils import decode_video_frames
 
 # Camera configuration (same as compare_recorded_vs_mujoco)
 _stationary_cfg = load_camera_config("stationary_cam")
@@ -129,21 +137,47 @@ def apply_color_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.n
     return out_rgb
 
 
-# ============================================================================
-# xArm state conversion (qpos -> lerobot state)
-# ============================================================================
+def load_dataset_frames(episode_data: dict):
+    """
+    Load video frames for all cameras from episode data.
+    Returns dict: cam_key -> list of RGB frames (H, W, 3) uint8.
+    """
+    dataset = episode_data["dataset"]
+    episode_idx = episode_data["episode_index"]
+    num_frames = episode_data["num_frames"]
+    start_idx = episode_data["video_start_frame"]
+    video_fps = dataset.fps
 
-def mujoco_qpos_to_lerobot_state(qpos: np.ndarray, gripper_mj_range: tuple) -> np.ndarray:
-    """
-    Convert MuJoCo qpos (8-dim: 7 joints rad + gripper) to xArm LeRobot state.
-    State format: [joint1..7 in degrees, gripper in mm (0=closed, 800=open)]
-    """
-    state = np.zeros(8, dtype=np.float32)
-    state[:7] = np.rad2deg(qpos[:7])
-    mj_lo, mj_hi = gripper_mj_range
-    grip_frac = np.clip((qpos[7] - mj_lo) / (mj_hi - mj_lo), 0.0, 1.0)
-    state[7] = grip_frac * GRIPPER_OPEN_MM
-    return state
+    relative_timestamps = [i / video_fps for i in range(num_frames)]
+    ep_meta = dataset.meta.episodes[episode_idx]
+
+    cam_frames = {}
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        dataset_cam = cam_cfg["dataset_cam"]
+        camera_key = f"observation.images.{dataset_cam}"
+        try:
+            video_path_rel = dataset.meta.get_video_file_path(episode_idx, camera_key)
+            video_path = dataset.root / video_path_rel
+            if not video_path.exists():
+                print(f"[WARN] Video not found for {cam_key}: {video_path}")
+                cam_frames[cam_key] = []
+                continue
+            from_timestamp = ep_meta.get(f"videos/{camera_key}/from_timestamp", 0.0)
+            absolute_timestamps = [from_timestamp + ts for ts in relative_timestamps]
+            frames_tensor = decode_video_frames(
+                video_path, absolute_timestamps, tolerance_s=1e-4, backend="pyav"
+            )
+            frames_list = []
+            for i in range(frames_tensor.shape[0]):
+                frame = frames_tensor[i].permute(1, 2, 0).cpu().numpy()
+                frame = (frame * 255).astype(np.uint8)  # RGB uint8
+                frames_list.append(frame)
+            cam_frames[cam_key] = frames_list
+            print(f"[INFO] Loaded {len(frames_list)} real frames for {cam_key}")
+        except Exception as e:
+            print(f"[WARN] Failed to load {cam_key} video: {e}")
+            cam_frames[cam_key] = []
+    return cam_frames
 
 
 def display_camera_images(observation: dict, policy_config=None, window_name_prefix: str = "Camera"):
@@ -199,13 +233,30 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
                                   gripper_mj_range: tuple,
                                   seg_renderer: mujoco.Renderer,
                                   robot_geom_ids: set,
-                                  gaussian_data: dict | None) -> dict:
+                                  gaussian_data: dict | None,
+                                  obs_frames: dict | None = None,
+                                  frame_idx: int = 0) -> dict:
     """
     Build observation dict for xArm policy from MuJoCo state.
     Uses 2 cameras: cam_high (stationary) and cam_wrist, both with composite rendering.
+    When obs_frames is provided (--obs mode), use real dataset images instead of rendered.
     """
     state = mujoco_qpos_to_lerobot_state(data.qpos, gripper_mj_range)
     observation = {OBS_STATE: state}
+
+    # Use real-world dataset images when --obs
+    if obs_frames is not None:
+        for cam_key, cam_cfg in CAMERA_CONFIG.items():
+            obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
+            frames = obs_frames.get(cam_key, [])
+            if frames:
+                idx = frame_idx % len(frames)
+                observation[obs_key] = frames[idx].copy()
+            else:
+                # Fallback: render if no real frames
+                renderer.update_scene(data, camera=cam_cfg["mujoco_cam"])
+                observation[obs_key] = renderer.render()
+        return observation
 
     use_composite = (gaussian_data is not None and
                      gaussian_data.get('scene_data') is not None and
@@ -264,8 +315,8 @@ def render_composite_view(model: MjModel, data: MjData,
                 camera_pose = get_mujoco_camera_pose(model, data, cam_name)
             w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
             viz_cfg = gaussian_data['viz_cfg']
-            bg_im = render_gaussian(w2c, intrinsics, gaussian_data['scene_data'],
-                                    gaussian_data['scene_depth_data'], viz_cfg)
+            bg_im = render(w2c, intrinsics, gaussian_data['scene_data'],
+                          gaussian_data['scene_depth_data'], viz_cfg)[0]
             bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
             bg_np = (bg_np * 255).astype(np.uint8)
             composite = bg_np.copy()
@@ -334,8 +385,34 @@ def main():
         default=None,
         help="Path to color calibration YAML file (optional)"
     )
+    parser.add_argument(
+        "--obs",
+        action="store_true",
+        help="Use real-world dataset images as policy input (instead of MuJoCo/composite rendering)"
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="data",
+        help="Path to dataset directory (required when --obs)"
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=str,
+        default=None,
+        help="Dataset root (optional, for Hub datasets)"
+    )
+    parser.add_argument(
+        "--episode",
+        type=int,
+        default=0,
+        help="Episode index for real observations (default: 0)"
+    )
 
     args = parser.parse_args()
+
+    if args.obs:
+        print("[INFO] --obs: using real-world dataset images as policy input")
 
     # Load policy
     policy, config_dict = load_policy(args.policy_path)
@@ -414,7 +491,7 @@ def main():
         try:
             init_pose = get_mujoco_camera_pose(model, data, "stationary_cam")
             w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
-            scene_data, scene_depth_data = load_scene_data(
+            scene_data, scene_depth_data, _ = load_scene_data(
                 args.scene_path, w2c_init, camera_intrinsics["stationary"]
             )
             color_calib = None
@@ -441,14 +518,41 @@ def main():
     else:
         print(f"[WARN] Scene file not found: {args.scene_path}")
 
+    # Load real-world dataset frames for display (and for policy when --obs)
+    obs_frames = None
+    try:
+        episode_data = load_episode(args.dataset_path, args.episode, dataset_root=args.dataset_root)
+        obs_frames = load_dataset_frames(episode_data)
+        num_obs_frames = max(len(obs_frames.get(k, [])) for k in CAMERA_CONFIG) or 1
+        print(f"[INFO] Loaded real dataset images: {num_obs_frames} frames from episode {args.episode}")
+    except Exception as e:
+        if args.obs:
+            print(f"[ERROR] Failed to load dataset for --obs: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        print(f"[WARN] Could not load dataset for Real windows display: {e}")
+
     policy.reset()
 
     if not args.headless:
-        for cam_key in CAMERA_CONFIG:
+        WINDOW_W, WINDOW_H = 400, 300
+        X_START, Y_START = 50, 30
+        X_STEP, Y_STEP = 410, 340
+        cam_keys = list(CAMERA_CONFIG.keys())
+        for i, cam_key in enumerate(cam_keys):
             obs_key = f"observation.images.{CAMERA_CONFIG[cam_key]['dataset_cam']}"
-            cv2.namedWindow(f"Camera: {obs_key.split('.')[-1]}", cv2.WINDOW_NORMAL)
+            cam_short = obs_key.split('.')[-1]
+            win_real = f"Real: {cam_short}"
+            win_comp = f"Composite: {cam_short}"
+            cv2.namedWindow(win_real, cv2.WINDOW_NORMAL)
+            cv2.namedWindow(win_comp, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win_real, WINDOW_W, WINDOW_H)
+            cv2.resizeWindow(win_comp, WINDOW_W, WINDOW_H)
+            cv2.moveWindow(win_real, X_START + i * X_STEP, Y_START)
+            cv2.moveWindow(win_comp, X_START + i * X_STEP, Y_START + Y_STEP)
 
-    print(f"[INFO] Starting policy deployment (max {args.max_steps} steps)")
+    print(f"[INFO] Starting policy deployment (max {args.max_steps} steps)" + (" [real obs]" if args.obs else ""))
 
     step_dt = 1.0 / args.fps
     step = 0
@@ -472,16 +576,31 @@ def main():
                 if cam_cfg["config"].get("type", "stationary") == "stationary":
                     set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
-            observation = build_observation_from_mujoco(
+    
+            real_obs = build_observation_from_mujoco(
+                    model, data, renderer, gripper_mj_range,
+                    seg_renderer=seg_renderer,
+                    robot_geom_ids=robot_geom_ids,
+                    gaussian_data=gaussian_data,
+                    obs_frames=obs_frames,
+                    frame_idx=step,
+                )
+            composite_obs = build_observation_from_mujoco(
                 model, data, renderer, gripper_mj_range,
                 seg_renderer=seg_renderer,
                 robot_geom_ids=robot_geom_ids,
                 gaussian_data=gaussian_data,
+                obs_frames=None,
+                frame_idx=step,
             )
 
             if not args.headless:
-                display_camera_images(observation, policy_config=policy.config)
-
+                display_camera_images(real_obs, policy_config=policy.config, window_name_prefix="Real")
+                display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
+            if args.obs:
+                observation = real_obs
+            else:
+                observation = composite_obs
             if hasattr(policy.config, 'language_features') and policy.config.language_features:
                 observation["observation.language"] = args.prompt
 

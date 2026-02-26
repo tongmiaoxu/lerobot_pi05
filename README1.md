@@ -1,39 +1,3 @@
-
-## Data Collection
-src/lerobot/scripts/lerobot_record.py    ← Main entry point (lerobot-record command)
-├── src/lerobot/robots/aloha_follower/   ← Robot implementation
-│   ├── aloha_follower.py                  (AlohaFollower class)
-│   ├── aloha_arm.py                       (Single arm implementation)
-│   └── config_aloha_follower.py           (Robot config)
-├── src/lerobot/teleoperators/aloha_leader/  ← Teleoperator implementation
-│   ├── bi_aloha_leader.py                 (BiAlohaLeader class)
-│   ├── aloha_leader_arm.py                (Single arm implementation)
-│   └── config_aloha_leader.py             (Teleop config)
-├── src/lerobot/datasets/lerobot_dataset.py  ← Dataset creation & saving
-├── src/lerobot/utils/control_utils.py       ← Keyboard listener
-└── .cache/calibration/                      ← Calibration files
-### Command (ALOHA-style state machine)
-```bash
-# Data collection with default cameras (cam_high, cam_low, cam_left_wrist, cam_right_wrist): the defalut dataset path is -/home/tongmiao/.cache/huggingface/lerobot/{repo_id}: Episode data: all episodes are in data/chunk-000/file-000.parquet
-lerobot-record \
-    --robot.type=aloha_follower \
-    --teleop.type=bi_aloha_leader \
-    --dataset.repo_id=tongmiao/aloha_pick_cube \
-    --dataset.single_task="Pick up the cube" \
-    --dataset.num_episodes=20 \
-    --dataset.fps=30 \
-    --dataset.root=data 
-
-```
-or some other parameters:
-```bash
-    --resume=true \
-    --dataset.push_to_hub=false \
-    --display_data=true
-```
-
----
-
 ## Data Collection (xArm + GELLO)
 src/lerobot/scripts/lerobot_record.py    ← Main entry point (lerobot-record command)
 ├── src/lerobot/robots/xarm_follower/     ← Robot implementation
@@ -114,23 +78,6 @@ python visual_match/compare_recorded_vs_mujoco.py --cma
 ```bash
 python visual_match/load_model_xarm.py
 ```
-### Policy Training for aloha
-```bash
-lerobot-train \
-  --policy.type=act \
-  --policy.device=cuda \
-  --policy.push_to_hub=false \
-  --dataset.repo_id=tongmiao/aloha_pick_cube \
-  --dataset.root=data/tongmiao/aloha_pick_cube \
-  --output_dir=./outputs/act2_training_wrist \
-  --policy.image_keys_filter='["cam_right_wrist", "cam_left_wrist"]' \
-  --batch_size=8 \
-  --steps=80000 \
-  --wandb.enable=true \
-  --wandb.project=aloha_pick_cube_lerobot0.4.3_wrist \
-  --dataset.image_transforms.enable=true
-
-```
 
 ### Policy Training for xarm
 ```bash
@@ -162,56 +109,11 @@ lerobot-train \
   --dataset.image_transforms.enable=true \
   --policy.horizon=64 \
   --policy.n_action_steps=50 \
-  --batch_size=64
+  --batch_size=64 \
+  --steps=7000
 ```
-```bash
-lerobot-train \
-  --policy.type=diffusion \
-  --policy.device=cuda \
-  --policy.push_to_hub=false \
-  --dataset.repo_id=tongmiao/aloha_pick_cube \
-  --dataset.root=data/tongmiao/aloha_pick_cube \
-  --output_dir=./outputs/diffusion_training_wrist \
-  --policy.image_keys_filter='["cam_right_wrist", "cam_left_wrist"]' \
-  --wandb.enable=true \
-  --wandb.project=aloha_pick_cube_lerobot0.4.3_wrist \
-  --dataset.image_transforms.enable=true \
-  --policy.horizon=64 \
-  --policy.n_action_steps=50 \
-  --batch_size=64
-```
-### Policy Deployment for aloha
-```bash
-lerobot-record \
-  --robot.type=aloha_follower \
-  --teleop.type=bi_aloha_leader \
-  --policy.path=outputs/act_training_wrist/checkpoints/last/pretrained_model \
-  --dataset.repo_id=tongmiao/eval_act_aloha \
-  --dataset.single_task="Pick up the cube" \
-  --dataset.num_episodes=10 \
-  --dataset.fps=30 \
-  --dataset.root=data_eval \
-  --dataset.push_to_hub=false \
-  --resume=true
 
-```
-```bash
-lerobot-train \
-  --policy.type=pi05 \
-  --policy.device=cuda \
-  --policy.pretrained_path=lerobot/pi05_base \
-  --policy.push_to_hub=false \
-  --policy.compile_model=true \
-  --policy.gradient_checkpointing=true \
-  --policy.dtype=bfloat16 \
-  --dataset.repo_id=tongmiao/xarm_pick_cube \
-  --dataset.root=data \
-  --output_dir=./outputs/pi05_xarm_training \
-  --batch_size=32 \
-  --steps=3000 \
-  --wandb.enable=true \
-  --wandb.project=xarm_pick_cube_pi05
-```
+
 
 ### Policy Deployment for xarm
 ```bash
@@ -221,7 +123,7 @@ lerobot-record \
   --robot.cameras='{"cam_high": {"type": "intelrealsense", "serial_number_or_name": "246322303954", "fps": 30, "width": 640, "height": 480}, "cam_wrist": {"type": "intelrealsense", "serial_number_or_name": "213622251153", "fps": 30, "width": 640, "height": 480}}' \
   --teleop.type=gello_leader \
   --teleop.port=/dev/ttyUSB0 \
-  --policy.path=outputs/act_xarm_training/checkpoints/last/pretrained_model \
+  --policy.path=outputs/diffusion_xarm_training/checkpoints/020000/pretrained_model \
   --dataset.repo_id=tongmiao/eval_xarm_pick_cube \
   --dataset.single_task="Pick up the cube" \
   --dataset.num_episodes=10 \
@@ -230,49 +132,13 @@ lerobot-record \
   --dataset.push_to_hub=false
 
 ```
-### Policy rollout in Simulation for xarm
+### Policy rollout in Simulation for xarm (--obs means replace obs with real world images)
 ```bash
-python visual_match/deploy_act_policy_mujoco.py \
+python visual_match/deploy_act_policy_mujoco.py --obs
 ```
-
-### Teleoperation (no data recording)
-To config which arm to use: edit `config_aloha_follower.py` (line 48-49) and `config_aloha_leader.py` (line 68-69)
+### Adjust obj position in mujoco (or --stiker)
 ```bash
-lerobot-teleoperate \
-    --robot.type=aloha_follower \
-    --teleop.type=bi_aloha_leader \
-    --fps=30
-```
-### Load model
-```bash
-python visual_match/load_model.py
-```
-### Replay in mujoco (--new means using new normalization method in lerobot0.4.3)
-```bash
-python visual_match/run_prerecorded_traj_mujoco.py     --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new
-```
-
-### Policy rollout in Simulation
-Color calibration is applied automatically if calibration_pairs_wrist/calibrated/color_mapping.yaml exists.
-
-```bash
-python visual_match/deploy_act_policy_mujoco.py \
-    --policy-path outputs/act_training_wrist/checkpoints/last/pretrained_model \
-    --prompt "Pick up the cube" \
-    --fps 30 \
-    --new
-
-python visual_match/deploy_act_policy_mujoco.py \
-    --policy-path outputs/diffusion_training_wrist/checkpoints/last/pretrained_model \
-    --prompt "Pick up the cube" \
-    --fps 30 \
-    --new
-```
-```bash
-python visual_match/deploy_act_policy_mujoco.py \
-    --policy-path outputs/train_alohacodebase/act_pick_cuber/checkpoints/080000/pretrained_model \
-    --prompt "Pick up the cube" \
-    --fps 30
+python visual_match/sticker_alpha_calibration.py --cube 
 ```
 
 ### Compare Recorded vs MuJoCo (--new means using new normalization method in lerobot0.4.3)

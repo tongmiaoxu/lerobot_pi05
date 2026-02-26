@@ -24,6 +24,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from camera_config import load_camera_config, set_mujoco_camera_from_config
+from composite_rendering import (
+    get_robot_geom_ids,
+    get_mujoco_camera_pose,
+    load_scene_data,
+    mj_pose_to_gaussian_w2c,
+    render,
+    setup_camera,
+    T_splat2mj,
+)
 
 # ============================================================================
 # Camera Configuration — loaded from configs/ JSON files
@@ -78,9 +87,9 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
 
 # ============================================================================
-# xArm conversion constants
+# xArm conversion (imported from shared utils)
 # ============================================================================
-GRIPPER_OPEN_MM = 800.0
+from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -113,19 +122,6 @@ def get_end_effector_pose(model, data, site_name: str, run_forward: bool = False
     pos = data.site_xpos[site_id].copy()
     rot_mat = data.site_xmat[site_id].reshape(3, 3).copy()
     return pos, rot_mat
-
-
-def lerobot_state_to_mujoco_ctrl(state: np.ndarray, gripper_mj_range: tuple) -> np.ndarray:
-    """
-    Convert xArm LeRobot state (8-dim: 7 joints in degrees + gripper in mm)
-    to MuJoCo ctrl (8-dim: 7 joints in radians + gripper in [0, 255]).
-    """
-    ctrl = np.zeros(8, dtype=np.float64)
-    ctrl[:7] = np.deg2rad(state[:7])
-    grip_frac = np.clip(state[7] / GRIPPER_OPEN_MM, 0.0, 1.0)
-    mj_hi, mj_lo= gripper_mj_range
-    ctrl[7] = mj_lo + grip_frac * (mj_hi - mj_lo)
-    return ctrl
 
 
 def compute_pose_difference(pos1, rot1, pos2, rot2):
@@ -234,173 +230,6 @@ def apply_color_transform(img, A, b):
     out = np.clip(out, 0.0, 1.0)
     out_rgb = (out.reshape(img_rgb.shape) * 255.0).astype(np.uint8)
     return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-
-
-# ============================================================================
-# Gaussian Splatting helpers
-# ============================================================================
-
-try:
-    from splatam.utils.recon_helpers import setup_camera
-except ImportError:
-    print("[WARN] splatam.utils.recon_helpers.setup_camera not found. Using basic implementation.")
-    class CameraParams:
-        def __init__(self, image_height, image_width, tanfovx, tanfovy, scale_modifier,
-                     viewmatrix, projmatrix, sh_degree, campos, prefiltered):
-            self.image_height = image_height
-            self.image_width = image_width
-            self.tanfovx = tanfovx
-            self.tanfovy = tanfovy
-            self.scale_modifier = scale_modifier
-            self.viewmatrix = viewmatrix
-            self.projmatrix = projmatrix
-            self.sh_degree = sh_degree
-            self.campos = campos
-            self.prefiltered = prefiltered
-
-    def setup_camera(w, h, k, w2c, near=0.01, far=100):
-        fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
-        w2c = torch.tensor(w2c).cuda().float()
-        cam_center = torch.inverse(w2c)[:3, 3]
-        w2c = w2c.unsqueeze(0).transpose(1, 2)
-        opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
-                                    [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
-                                    [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
-                                    [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
-        full_proj = w2c.bmm(opengl_proj)
-        cam = CameraParams(
-            image_height=h, image_width=w,
-            tanfovx=w / (2 * fx), tanfovy=h / (2 * fy),
-            scale_modifier=1.0, viewmatrix=w2c, projmatrix=full_proj,
-            sh_degree=0, campos=cam_center, prefiltered=False
-        )
-        return cam
-
-ICP_TRANSFORM_PATH = "pointclouds/icp_transform.npy"
-T_splat2mj = np.load(ICP_TRANSFORM_PATH) if os.path.exists(ICP_TRANSFORM_PATH) else np.eye(4)
-
-
-# ============================================================================
-# MuJoCo helpers
-# ============================================================================
-
-def get_robot_geom_ids(model):
-    """Returns geom IDs belonging to the xArm robot (all mesh geoms) and the cube."""
-    robot_geom_ids = set()
-    for geom_id in range(model.ngeom):
-        if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH:
-            robot_geom_ids.add(geom_id)
-    # Also include the cube as foreground
-    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube")
-    if cube_id != -1:
-        robot_geom_ids.add(cube_id)
-    return robot_geom_ids
-
-
-def load_scene_data(scene_path, first_frame_w2c, intrinsics):
-    """Load Gaussian Splatting scene data."""
-    def build_rotation(quat):
-        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
-        return torch.stack([
-            torch.stack([1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)]),
-            torch.stack([2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)]),
-            torch.stack([2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)])
-        ])
-
-    all_params = dict(np.load(scene_path, allow_pickle=True))
-    for k in all_params.keys():
-        all_params[k] = torch.tensor(all_params[k]).cuda().float()
-    intrinsics = torch.tensor(intrinsics).cuda().float()
-    first_frame_w2c = torch.tensor(first_frame_w2c).cuda().float()
-
-    keys = [k for k in all_params.keys() if
-            k not in ['org_width', 'org_height', 'w2c', 'intrinsics',
-                      'gt_w2c_all_frames', 'cam_unnorm_rots',
-                      'cam_trans', 'keyframe_time_indices']]
-    params = all_params
-    for k in keys:
-        if not isinstance(all_params[k], torch.Tensor):
-            params[k] = torch.tensor(all_params[k]).cuda().float()
-        else:
-            params[k] = all_params[k].cuda().float()
-
-    if params['log_scales'].shape[-1] == 1:
-        log_scales = torch.tile(params['log_scales'], (1, 3))
-    else:
-        log_scales = params['log_scales']
-
-    rendervar = {
-        'means3D': params['means3D'],
-        'colors_precomp': params['rgb_colors'],
-        'rotations': F.normalize(params['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
-        'scales': torch.exp(log_scales),
-        'means2D': torch.zeros_like(params['means3D'], device="cuda")
-    }
-
-    def get_depth_colors(means3D, w2c):
-        ones = torch.ones((means3D.shape[0], 1), device=means3D.device, dtype=means3D.dtype)
-        points_h = torch.cat([means3D, ones], dim=1)
-        cam_points = (w2c @ points_h.T).T
-        depth = cam_points[:, 2]
-        depth_min, depth_max = depth.min(), depth.max()
-        if depth_max > depth_min:
-            depth_norm = (depth - depth_min) / (depth_max - depth_min)
-        else:
-            depth_norm = torch.zeros_like(depth)
-        return depth_norm.unsqueeze(1).repeat(1, 3)
-
-    depth_rendervar = {
-        'means3D': params['means3D'],
-        'colors_precomp': get_depth_colors(params['means3D'], first_frame_w2c),
-        'rotations': F.normalize(params['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
-        'scales': torch.exp(log_scales),
-        'means2D': torch.zeros_like(params['means3D'], device="cuda")
-    }
-
-    return rendervar, depth_rendervar
-
-
-def render_gaussian(w2c, k, scene_data, scene_depth_data, viz_cfg):
-    try:
-        from diff_gaussian_rasterization import GaussianRasterizer as Renderer
-        from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
-    except ImportError:
-        raise ImportError("diff_gaussian_rasterization not installed")
-
-    cam = setup_camera(viz_cfg['viz_w'], viz_cfg['viz_h'], k, w2c, viz_cfg['viz_near'], viz_cfg['viz_far'])
-    white_bg_cam = Camera(
-        image_height=cam.image_height, image_width=cam.image_width,
-        tanfovx=cam.tanfovx, tanfovy=cam.tanfovy,
-        bg=torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda"),
-        scale_modifier=cam.scale_modifier, viewmatrix=cam.viewmatrix,
-        projmatrix=cam.projmatrix, sh_degree=cam.sh_degree,
-        campos=cam.campos, prefiltered=cam.prefiltered, debug=False
-    )
-    im, depth = Renderer(raster_settings=white_bg_cam)(**scene_data)
-    return im
-
-
-def get_mujoco_camera_pose(model, data, cam_name):
-    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
-    if cam_id == -1:
-        raise ValueError(f"Camera '{cam_name}' not found")
-    camera_xpos = data.cam_xpos[cam_id]
-    camera_xmat = data.cam_xmat[cam_id].reshape(3, 3)
-    camera_pose = np.eye(4)
-    camera_pose[:3, :3] = camera_xmat
-    camera_pose[:3, 3] = camera_xpos
-    return camera_pose
-
-
-def mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj):
-    T_mj2splat = np.linalg.inv(T_splat2mj)
-    P_gs_cam = T_mj2splat @ camera_pose
-    transform_matrix = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-    w2c = P_gs_cam @ transform_matrix
-    w2c = np.linalg.inv(w2c)
-    return w2c
 
 
 # ============================================================================
@@ -617,7 +446,7 @@ def main():
             from diff_gaussian_rasterization import GaussianRasterizer
             init_pose = get_mujoco_camera_pose(model, data, "stationary_cam")
             w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
-            scene_data, scene_depth_data = load_scene_data(
+            scene_data, scene_depth_data, _ = load_scene_data(
                 args.scene_path, w2c_init, camera_intrinsics["stationary"]
             )
             gaussian_available = True
@@ -848,13 +677,15 @@ def main():
                             # Wrist camera — read kinematic world pose from MuJoCo
                             camera_pose = get_mujoco_camera_pose(model, data, mujoco_cam)
                         w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
-                        bg_im = render_gaussian(w2c, camera_intrinsics[cam_key],
-                                                scene_data, scene_depth_data, viz_cfg)
+                        bg_im = render(w2c, camera_intrinsics[cam_key],
+                                       scene_data, scene_depth_data, viz_cfg)[0]
                         bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
                         bg_np = (bg_np * 255).astype(np.uint8)
                         bg_bgr = cv2.cvtColor(bg_np, cv2.COLOR_RGB2BGR)
                         composite_frame = bg_bgr.copy()
                         composite_frame[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
+                        foreground_only = np.zeros_like(fg_bgr)
+                        foreground_only[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
                         if args.color_calibrate and color_calib is not None:
                             composite_frame = apply_color_transform(composite_frame, *color_calib)
                     except Exception as e:
@@ -958,16 +789,23 @@ def main():
         print(f"       Rotation:    mean={np.degrees(np.mean(rot_errors[:, 3])):.2f}°, "
               f"max={np.degrees(np.max(rot_errors[:, 3])):.2f}°")
 
-        # save_path = f"fk_comparison_ep{args.episode}.png"
-        # if realtime_plot_enabled and fig_fk is not None:
-        #     try:
-        #         fig_fk.savefig(save_path, dpi=150, bbox_inches='tight')
-        #         print(f"[INFO] Saved FK plot to: {save_path}")
-        #         plt.show()
-        #     except Exception:
-        #         pass
-        # else:
-        #     plot_fk_comparison(trans_errors, rot_errors, args.fps, save_path=save_path)
+        save_path = f"fk_comparison_ep{args.episode}.png"
+        if fig_fk is not None and ax_trans is not None and ax_rot is not None:
+            # Add mean/max text to the real-time figure before saving
+            mean_trans = np.mean(trans_errors[:, 3]) * 1000
+            max_trans = np.max(trans_errors[:, 3]) * 1000
+            mean_rot = np.degrees(np.mean(rot_errors[:, 3]))
+            max_rot = np.degrees(np.max(rot_errors[:, 3]))
+            ax_trans.text(0.02, 0.98, f'Mean: {mean_trans:.2f} mm\nMax: {max_trans:.2f} mm',
+                          transform=ax_trans.transAxes, va='top', fontsize=10,
+                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax_rot.text(0.02, 0.98, f'Mean: {mean_rot:.2f}°\nMax: {max_rot:.2f}°',
+                        transform=ax_rot.transAxes, va='top', fontsize=10,
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            fig_fk.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"[INFO] Saved FK plot to: {save_path}")
+        else:
+            plot_fk_comparison(trans_errors, rot_errors, args.fps, save_path=save_path)
 
 
 if __name__ == "__main__":

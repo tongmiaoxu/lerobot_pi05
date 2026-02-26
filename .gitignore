@@ -179,3 +179,7 @@ data_eval/
 calibration_pairs_wrist/
 outputs*/
 data_aloha*/
+!xarm7/xarm7.xml
+!xarm7/scene.xml
+
+data_eval_old/

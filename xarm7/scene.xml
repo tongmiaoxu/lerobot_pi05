@@ -1,0 +1,46 @@
+<mujoco model="xarm7 scene">
+  <include file="xarm7.xml"/>
+
+  <statistic center="0.2 0 0.4" extent=".65"/>
+
+  <visual>
+    <headlight diffuse="0.3 0.3 0.3" ambient="0.1 0.1 0.1" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="150" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <!-- Matte material: no specular highlights so colors render true (e.g. pink sticker) -->
+    <material name="matte_pink" specular="0" shininess="1" reflectance="0"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true" diffuse="0.5 0.5 0.5" specular="0 0 0"/>
+    <geom type="cylinder" size=".06 .06" pos="0 0 .06" rgba="1 1 1 1"/>
+
+    <!-- Table surface: top at Z=-0.0709 so cube rests on it -->
+    <geom name="table" type="box" size="0.4 1 0.005"
+          pos="0.45 0 0.0581" rgba="0.553 0.529 0.482 1"/>
+
+    <!-- Cube: 28mm, color rgb(2,102,193), MuJoCo world-frame pose [541.5,-11,-56.9,180,0,0] -->
+    <body name="cube" pos="0.5286 0.0086 0.0771">
+      <freejoint name="cube_joint"/>
+      <geom name="cube" type="box" size="0.014 0.017 0.014"
+            rgba="0.008 0.4 0.757 1" mass="0.01"/>
+    </body>
+    <body name="sticker" pos="0.5265 0.1360 0.0631"> 
+      <geom name="sticker" type="box" size="0.038 0.038 0.01"
+            material="matte_pink" rgba="0.996 0.698 0.706 1" mass="0"/>
+    </body>
+
+    <!-- Stationary camera matching RealSense D455 serial 246322303954.
+         Pose is overridden at runtime from calibration data. -->
+    <camera name="stationary_cam" pos="0.5 0.0 0.8" xyaxes="0 -1 0 0.5 0 1"
+            fovy="63.8"/>
+  </worldbody>
+
+</mujoco>
