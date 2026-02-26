@@ -176,3 +176,6 @@ outputs/
 *.xml
 *.part
 data_eval/
+calibration_pairs_wrist/
+outputs*/
+data_aloha*/
