@@ -112,8 +112,27 @@ lerobot-train \
   --batch_size=64 \
   --steps=7000
 ```
-
-
+```bash
+lerobot-train \
+  --policy.type=pi05 \
+  --policy.device=cuda \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.push_to_hub=false \
+  --policy.compile_model=false \
+  --policy.gradient_checkpointing=true \
+  --policy.dtype=bfloat16 \
+  --policy.train_expert_only=true \
+  --dataset.repo_id=tongmiao/xarm_pick_cube \
+  --dataset.root=data \
+  --output_dir=./outputs/pi05_xarm_training \
+  --batch_size=8 \
+  --steps=3000 \
+  --wandb.enable=true \
+  --wandb.project=xarm_pick_cube_lerobot0.4.3
+```
+```bash
+accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_cube \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=xarm_pick_cube_lerobot0.4.3
+```
 
 ### Policy Deployment for xarm
 ```bash
