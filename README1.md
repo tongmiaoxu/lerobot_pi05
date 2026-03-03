@@ -123,13 +123,14 @@ lerobot-record \
   --robot.cameras='{"cam_high": {"type": "intelrealsense", "serial_number_or_name": "246322303954", "fps": 30, "width": 640, "height": 480}, "cam_wrist": {"type": "intelrealsense", "serial_number_or_name": "213622251153", "fps": 30, "width": 640, "height": 480}}' \
   --teleop.type=gello_leader \
   --teleop.port=/dev/ttyUSB0 \
-  --policy.path=outputs/diffusion_xarm_training/checkpoints/020000/pretrained_model \
+  --policy.path=outputs/pi05_xarm_training/checkpoints/001000/pretrained_model \
   --dataset.repo_id=tongmiao/eval_xarm_pick_cube \
   --dataset.single_task="Pick up the cube" \
   --dataset.num_episodes=10 \
   --dataset.fps=30 \
   --dataset.root=data_eval \
-  --dataset.push_to_hub=false
+  --dataset.push_to_hub=false \
+  --policy.pretrained_path=lerobot/pi05_base
 
 ```
 ### Policy rollout in Simulation for xarm (--obs means replace obs with real world images)

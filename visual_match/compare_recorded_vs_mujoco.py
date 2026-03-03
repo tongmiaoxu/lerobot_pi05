@@ -136,6 +136,15 @@ def compute_pose_difference(pos1, rot1, pos2, rot2):
     return trans_diff, rot_diff
 
 
+def _fig_to_bgr_overlay(fig, target_w: int, target_h: int) -> np.ndarray:
+    """Render matplotlib figure to BGR numpy array for OpenCV overlay."""
+    fig.canvas.draw()
+    buf = np.asarray(fig.canvas.buffer_rgba())
+    # buf is (H, W, 4) RGBA
+    buf_bgr = cv2.cvtColor(buf[:, :, :3], cv2.COLOR_RGB2BGR)
+    return cv2.resize(buf_bgr, (target_w, target_h))
+
+
 def plot_fk_comparison(trans_errors, rot_errors, fps, save_path=None):
     try:
         import matplotlib.pyplot as plt
@@ -153,6 +162,8 @@ def plot_fk_comparison(trans_errors, rot_errors, fps, save_path=None):
     ax1.plot(time_s, trans_errors[:, 1] * 1000, 'g-', label='dy', alpha=0.7)
     ax1.plot(time_s, trans_errors[:, 2] * 1000, 'b-', label='dz', alpha=0.7)
     ax1.plot(time_s, trans_errors[:, 3] * 1000, 'k-', label='||d||', linewidth=2)
+    ax1.set_ylim(-20, 20)
+    ax1.set_autoscale_on(False)
     ax1.set_xlabel('Time (s)')
     ax1.set_ylabel('Translation Error (mm)')
     ax1.set_title('End Effector Translation Error: Real vs Simulated')
@@ -169,6 +180,8 @@ def plot_fk_comparison(trans_errors, rot_errors, fps, save_path=None):
     ax2.plot(time_s, np.degrees(rot_errors[:, 1]), 'g-', label='pitch', alpha=0.7)
     ax2.plot(time_s, np.degrees(rot_errors[:, 2]), 'b-', label='yaw', alpha=0.7)
     ax2.plot(time_s, np.degrees(rot_errors[:, 3]), 'k-', label='angle', linewidth=2)
+    ax2.set_ylim(-20, 20)
+    ax2.set_autoscale_on(False)
     ax2.set_xlabel('Time (s)')
     ax2.set_ylabel('Rotation Error (degrees)')
     ax2.set_title('End Effector Rotation Error: Real vs Simulated')
@@ -321,6 +334,8 @@ def parse_args():
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
                    help="Apply CMA-ES optimised parameters to the model.")
+    p.add_argument("--no-mujoco-view", action="store_true",
+                   help="Disable the MuJoCo 3D interactive viewer window")
     return p.parse_args()
 
 
@@ -480,6 +495,7 @@ def main():
     ])
 
     # Create windows — 2 rows: stationary + wrist, 4 columns: recorded, mujoco, composite, alpha
+    # When --no-mujoco-view: only wrist alpha, fullscreen
     win_stat_rec = "Stationary - Recorded"
     win_stat_mj = "Stationary - MuJoCo"
     win_stat_comp = "Stationary - Composite"
@@ -489,24 +505,29 @@ def main():
     win_wrist_comp = "Wrist - Composite"
     win_wrist_alpha = "Wrist - Alpha"
 
-    WINDOW_W, WINDOW_H = 400, 300
-    for win in [win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha,
-                win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha]:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
+    if args.no_mujoco_view:
+        cv2.namedWindow(win_stat_alpha, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(win_stat_alpha, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        print("[INFO] Minimal mode: only Stationary - Alpha window (fullscreen)")
+    else:
+        WINDOW_W, WINDOW_H = 400, 300
+        for win in [win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha,
+                    win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha]:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
 
-    X_START, Y_START = 50, 30
-    X_STEP, Y_STEP = 410, 340
-    cv2.moveWindow(win_stat_rec, X_START, Y_START)
-    cv2.moveWindow(win_stat_mj, X_START + X_STEP, Y_START)
-    cv2.moveWindow(win_stat_comp, X_START + 2 * X_STEP, Y_START)
-    cv2.moveWindow(win_stat_alpha, X_START + 3 * X_STEP, Y_START)
-    cv2.moveWindow(win_wrist_rec, X_START, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_mj, X_START + X_STEP, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_comp, X_START + 2 * X_STEP, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_alpha, X_START + 3 * X_STEP, Y_START + Y_STEP)
+        X_START, Y_START = 50, 30
+        X_STEP, Y_STEP = 410, 340
+        cv2.moveWindow(win_stat_rec, X_START, Y_START)
+        cv2.moveWindow(win_stat_comp, X_START + X_STEP, Y_START)
+        cv2.moveWindow(win_stat_mj, X_START + 2 * X_STEP, Y_START)
+        cv2.moveWindow(win_stat_alpha, X_START + 3 * X_STEP, Y_START)
+        cv2.moveWindow(win_wrist_rec, X_START, Y_START + Y_STEP)
+        cv2.moveWindow(win_wrist_comp, X_START + X_STEP, Y_START + Y_STEP)
+        cv2.moveWindow(win_wrist_mj, X_START + 2 * X_STEP, Y_START + Y_STEP)
+        cv2.moveWindow(win_wrist_alpha, X_START + 3 * X_STEP, Y_START + Y_STEP)
 
-    print("[INFO] Starting playback (q=quit, SPACE=pause, +/-=alpha)")
+    print("[INFO] Starting playback (q=quit, SPACE=pause, +/-=alpha). Click an OpenCV video window for key input.")
     alpha = args.alpha
 
     # FK comparison setup
@@ -523,49 +544,58 @@ def main():
     trans_errors = []
     rot_errors = []
 
-    # Real-time FK plot
+    # Real-time FK plot (rendered as overlay on stationary alpha window, bottom-left)
     realtime_plot_enabled = False
     fig_fk = ax_trans = ax_rot = None
     line_dx = line_dy = line_dz = line_norm = None
     line_roll = line_pitch = line_yaw = line_angle = None
+    FK_OVERLAY_W, FK_OVERLAY_H = 320, 200  # overlay size in pixels (render at 2x for sharpness)
+    FK_OVERLAY_PAD = 10  # padding from bottom-left corner
+    FK_RENDER_SCALE = 2  # render at 2x resolution for crisp output
 
     if ee_site is not None:
         try:
             import matplotlib
-            matplotlib.use('TkAgg')
+            matplotlib.use('Agg')
             import matplotlib.pyplot as plt
 
-            plt.ion()
-            fig_fk, (ax_trans, ax_rot) = plt.subplots(2, 1, figsize=(10, 6))
-            fig_fk.suptitle('FK Comparison: Real vs Simulated (Real-time)')
+            # Render at 2x resolution for sharp overlay
+            fig_fk, (ax_trans, ax_rot) = plt.subplots(2, 1, figsize=(3.2, 2.0), dpi=100 * FK_RENDER_SCALE)
+            fig_fk.patch.set_facecolor('white')
+            fig_fk.patch.set_alpha(0.95)
+            ax_trans.set_facecolor('white')
+            ax_rot.set_facecolor('white')
 
-            line_dx, = ax_trans.plot([], [], 'r-', label='dx', alpha=0.7)
-            line_dy, = ax_trans.plot([], [], 'g-', label='dy', alpha=0.7)
-            line_dz, = ax_trans.plot([], [], 'b-', label='dz', alpha=0.7)
-            line_norm, = ax_trans.plot([], [], 'k-', label='||d||', linewidth=2)
+            line_dx, = ax_trans.plot([], [], 'r-', label='dx', alpha=0.8, linewidth=1.2)
+            line_dy, = ax_trans.plot([], [], 'g-', label='dy', alpha=0.8, linewidth=1.2)
+            line_dz, = ax_trans.plot([], [], 'b-', label='dz', alpha=0.8, linewidth=1.2)
+            line_norm, = ax_trans.plot([], [], 'k-', label='||d||', linewidth=1.5)
             ax_trans.set_xlim(0, num_frames / args.fps)
-            ax_trans.set_ylim(-50, 150)
-            ax_trans.set_xlabel('Time (s)')
-            ax_trans.set_ylabel('Translation Error (mm)')
-            ax_trans.legend(loc='upper right')
+            ax_trans.set_ylim(-20, 20)
+            ax_trans.set_autoscale_on(False)
+            ax_trans.set_xlabel('Time (s)', fontsize=8)
+            ax_trans.set_ylabel('Trans (mm)', fontsize=8)
+            ax_trans.legend(loc='upper right', fontsize=7)
             ax_trans.grid(True, alpha=0.3)
+            ax_trans.tick_params(labelsize=7)
 
-            line_roll, = ax_rot.plot([], [], 'r-', label='roll', alpha=0.7)
-            line_pitch, = ax_rot.plot([], [], 'g-', label='pitch', alpha=0.7)
-            line_yaw, = ax_rot.plot([], [], 'b-', label='yaw', alpha=0.7)
-            line_angle, = ax_rot.plot([], [], 'k-', label='angle', linewidth=2)
+            line_roll, = ax_rot.plot([], [], 'r-', label='roll', alpha=0.8, linewidth=1.2)
+            line_pitch, = ax_rot.plot([], [], 'g-', label='pitch', alpha=0.8, linewidth=1.2)
+            line_yaw, = ax_rot.plot([], [], 'b-', label='yaw', alpha=0.8, linewidth=1.2)
+            line_angle, = ax_rot.plot([], [], 'k-', label='angle', linewidth=1.5)
             ax_rot.set_xlim(0, num_frames / args.fps)
-            ax_rot.set_ylim(-15, 15)
-            ax_rot.set_xlabel('Time (s)')
-            ax_rot.set_ylabel('Rotation Error (degrees)')
-            ax_rot.legend(loc='upper right')
+            ax_rot.set_ylim(-20, 20)
+            ax_rot.set_autoscale_on(False)
+            ax_rot.set_xlabel('Time (s)', fontsize=8)
+            ax_rot.set_ylabel('Rot (deg)', fontsize=8)
+            ax_rot.legend(loc='upper right', fontsize=7)
             ax_rot.grid(True, alpha=0.3)
+            ax_rot.tick_params(labelsize=7)
 
-            plt.tight_layout()
-            fig_fk.canvas.draw()
-            plt.pause(0.01)
+            plt.tight_layout(pad=0.3)
             realtime_plot_enabled = True
-            print("[INFO] Real-time FK plotting enabled")
+            overlay_target = "Stationary - Alpha"
+            print(f"[INFO] Real-time FK plot will overlay on {overlay_target} (bottom-left)")
         except Exception as e:
             print(f"[WARN] Could not enable real-time plotting: {e}")
 
@@ -575,10 +605,13 @@ def main():
 
     # --- MuJoCo 3D Viewer Setup ---
     viewer = None
-    if _HAS_MJ_VIEWER:
+    viewer_ctx = None
+    if _HAS_MJ_VIEWER and not args.no_mujoco_view:
         viewer_ctx = mujoco.viewer.launch_passive(model, data)
         viewer = viewer_ctx.__enter__()
         print("[INFO] MuJoCo 3D viewer launched (synchronized)")
+    elif args.no_mujoco_view:
+        print("[INFO] MuJoCo 3D viewer disabled (--no-mujoco-view)")
     else:
         print("[WARN] mujoco.viewer not available; 3D viewer disabled.")
 
@@ -594,15 +627,15 @@ def main():
                 if viewer is not None:
                     viewer.sync()
 
-            # Re-apply stationary camera world-pose (mj_step resets data.cam_xpos).
-            # Wrist camera pose is computed by kinematics from the model-local
-            # offset set once at startup — no per-frame override needed.
-            for cam_key, cam_cfg in CAMERA_CONFIG.items():
-                if cam_cfg["config"].get("type", "stationary") == "stationary":
-                    set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+                # Re-apply stationary camera world-pose (mj_step resets data.cam_xpos).
+                # Wrist camera pose is computed by kinematics from the model-local
+                # offset set once at startup — no per-frame override needed.
+                for cam_key, cam_cfg in CAMERA_CONFIG.items():
+                    if cam_cfg["config"].get("type", "stationary") == "stationary":
+                        set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
             # FK comparison (site positions are already valid from mj_step)
-            if ee_site is not None:
+            if ee_site is not None and not paused:
                 sim_pos, sim_rot = get_end_effector_pose(model, data, ee_site, run_forward=False)
 
                 data_real = MjData(model)
@@ -615,7 +648,7 @@ def main():
                 trans_errors.append(trans_diff)
                 rot_errors.append(rot_diff)
 
-                if realtime_plot_enabled and len(trans_errors) > 1 and frame_idx % 5 == 0:
+                if realtime_plot_enabled and len(trans_errors) > 1:
                     time_data = np.arange(len(trans_errors)) / args.fps
                     trans_arr = np.array(trans_errors)
                     rot_arr = np.array(rot_errors)
@@ -627,26 +660,17 @@ def main():
                     line_pitch.set_data(time_data, np.degrees(rot_arr[:, 1]))
                     line_yaw.set_data(time_data, np.degrees(rot_arr[:, 2]))
                     line_angle.set_data(time_data, np.degrees(rot_arr[:, 3]))
-                    max_trans = np.max(np.abs(trans_arr[:, :3])) * 1000
-                    max_norm = np.max(trans_arr[:, 3]) * 1000
-                    if max_norm > 100 or max_trans > 40:
-                        ax_trans.set_ylim(-max(50, max_trans * 1.2), max(150, max_norm * 1.2))
-                    max_rot = np.max(np.abs(rot_arr[:, :3]))
-                    max_angle = np.max(rot_arr[:, 3])
-                    if np.degrees(max_angle) > 10:
-                        ax_rot.set_ylim(-max(15, np.degrees(max_rot) * 1.2),
-                                        max(15, np.degrees(max_angle) * 1.2))
-                    fig_fk.canvas.draw_idle()
-                    fig_fk.canvas.flush_events()
 
-            # Render both cameras
+            # Render cameras (only wrist when --no-mujoco-view)
             cam_renders = {}
+            cams_to_render = ["stationary"] if args.no_mujoco_view else list(CAMERA_CONFIG.keys())
             window_map = {
                 "stationary": (win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha),
                 "wrist": (win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha),
             }
 
-            for cam_key, cam_cfg in CAMERA_CONFIG.items():
+            for cam_key in cams_to_render:
+                cam_cfg = CAMERA_CONFIG[cam_key]
                 mujoco_cam = cam_cfg["mujoco_cam"]
                 frames_list = cam_frames.get(cam_key, [])
 
@@ -727,7 +751,7 @@ def main():
             # Overlays
             gripper_mm = observations_raw[frame_idx, 7]
             mujoco_grip_ctrl = data.ctrl[7]
-            for cam_key in CAMERA_CONFIG:
+            for cam_key in cams_to_render:
                 for ft in ["recorded", "mujoco", "composite", "alpha"]:
                     frame = cam_renders[cam_key][ft]
                     cv2.putText(frame, f"Frame: {frame_idx}/{num_frames}", (10, 30),
@@ -735,24 +759,54 @@ def main():
                     if ft == "alpha":
                         cv2.putText(frame, f"Alpha: {alpha:.2f}", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    if paused:
+                        cv2.putText(frame, "PAUSED (SPACE=resume, click window first)", (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            # Overlay FK plot on alpha window (bottom-left)
+            if realtime_plot_enabled and fig_fk is not None and len(trans_errors) > 1:
+                try:
+                    plot_img = _fig_to_bgr_overlay(fig_fk, FK_OVERLAY_W, FK_OVERLAY_H)
+                    alpha_frame = cam_renders["stationary"]["alpha"]
+                    y1 = alpha_frame.shape[0] - FK_OVERLAY_H - FK_OVERLAY_PAD
+                    y2 = y1 + FK_OVERLAY_H
+                    x1 = FK_OVERLAY_PAD
+                    x2 = x1 + FK_OVERLAY_W
+                    if y1 >= 0 and x2 <= alpha_frame.shape[1]:
+                        # Alpha blend for semi-transparency (0.95 = plot, 0.05 = video)
+                        roi = alpha_frame[y1:y2, x1:x2].astype(np.float32)
+                        overlay = plot_img.astype(np.float32)
+                        blended = (0.95 * overlay + 0.05 * roi).astype(np.uint8)
+                        alpha_frame[y1:y2, x1:x2] = blended
+                except Exception as e:
+                    if frame_idx == 0:
+                        print(f"[WARN] FK overlay failed: {e}")
 
             # Display
-            for cam_key, (w_rec, w_mj, w_comp, w_alpha) in window_map.items():
-                cv2.imshow(w_rec, cam_renders[cam_key]["recorded"])
-                cv2.imshow(w_mj, cam_renders[cam_key]["mujoco"])
-                cv2.imshow(w_comp, cam_renders[cam_key]["composite"])
-                cv2.imshow(w_alpha, cam_renders[cam_key]["alpha"])
+            if args.no_mujoco_view:
+                cv2.imshow(win_stat_alpha, cam_renders["stationary"]["alpha"])
+            else:
+                for cam_key, (w_rec, w_mj, w_comp, w_alpha) in window_map.items():
+                    cv2.imshow(w_rec, cam_renders[cam_key]["recorded"])
+                    cv2.imshow(w_mj, cam_renders[cam_key]["mujoco"])
+                    cv2.imshow(w_comp, cam_renders[cam_key]["composite"])
+                    cv2.imshow(w_alpha, cam_renders[cam_key]["alpha"])
 
-
+            if not paused:
                 frame_idx += 1
 
-            key = cv2.waitKey(frame_delay) & 0xFF
+            # When paused, wait longer for key input (focus must be on an OpenCV window)
+            key = cv2.waitKey(100 if paused else frame_delay) & 0xFF
             if key == ord('q'):
                 print("[INFO] Quit requested")
                 break
             elif key == ord(' '):
+                was_paused = paused
                 paused = not paused
                 print(f"[INFO] {'Paused' if paused else 'Resumed'}")
+                if was_paused:
+                    # Advance to next frame when resuming (avoid re-processing)
+                    frame_idx += 1
             elif key == ord('n') and paused:
                 paused = False
                 continue
@@ -763,17 +817,10 @@ def main():
                 alpha = max(0.0, alpha - 0.05)
                 print(f"[INFO] Alpha: {alpha:.2f}")
     finally:
-        if viewer is not None:
+        if viewer is not None and viewer_ctx is not None:
             viewer_ctx.__exit__(None, None, None)
         cv2.destroyAllWindows()
         print("[INFO] Playback finished")
-
-    if realtime_plot_enabled and fig_fk is not None:
-        try:
-            import matplotlib.pyplot as plt
-            plt.ioff()
-        except:
-            pass
 
     if ee_site is not None and len(trans_errors) > 0:
         trans_errors = np.array(trans_errors)
@@ -791,7 +838,16 @@ def main():
 
         save_path = f"fk_comparison_ep{args.episode}.png"
         if fig_fk is not None and ax_trans is not None and ax_rot is not None:
-            # Add mean/max text to the real-time figure before saving
+            # Update line data and add mean/max text before saving
+            time_s = np.arange(len(trans_errors)) / args.fps
+            line_dx.set_data(time_s, trans_errors[:, 0] * 1000)
+            line_dy.set_data(time_s, trans_errors[:, 1] * 1000)
+            line_dz.set_data(time_s, trans_errors[:, 2] * 1000)
+            line_norm.set_data(time_s, trans_errors[:, 3] * 1000)
+            line_roll.set_data(time_s, np.degrees(rot_errors[:, 0]))
+            line_pitch.set_data(time_s, np.degrees(rot_errors[:, 1]))
+            line_yaw.set_data(time_s, np.degrees(rot_errors[:, 2]))
+            line_angle.set_data(time_s, np.degrees(rot_errors[:, 3]))
             mean_trans = np.mean(trans_errors[:, 3]) * 1000
             max_trans = np.max(trans_errors[:, 3]) * 1000
             mean_rot = np.degrees(np.mean(rot_errors[:, 3]))

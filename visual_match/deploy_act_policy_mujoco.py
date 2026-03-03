@@ -347,7 +347,7 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/act_xarm_training/checkpoints/last/pretrained_model",
+        default="outputs/pi05_xarm_training/checkpoints/001000/pretrained_model",
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
