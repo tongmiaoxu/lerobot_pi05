@@ -68,6 +68,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .xarm_follower import XarmFollower
 
         return XarmFollower(config)
+    elif config.type == "xarm_sim_follower":
+        from .xarm_sim_follower import XarmSimFollower
+
+        return XarmSimFollower(config)
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 

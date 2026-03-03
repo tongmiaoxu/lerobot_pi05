@@ -44,6 +44,10 @@ Other useful parameters:
 ```bash
 lerobot-teleoperate --robot.type=xarm_follower --teleop.type=gello_leader --robot.ip=192.168.1.228 --teleop.port=/dev/ttyUSB0 --fps=100
 ```
+in simulation: 
+```bash
+lerobot-teleoperate --robot.type=xarm_sim_follower --robot.launch_sim=true --teleop.type=gello_leader --teleop.port=/dev/ttyUSB0 --fps=100
+```
 
 ### GELLO Calibration (get offsets)
 save offsets to `.cache/calibration/gello_leader/gello_offsets.json`.

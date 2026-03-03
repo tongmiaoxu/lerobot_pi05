@@ -15,7 +15,27 @@
 """
 Simple script to control a robot from teleoperation.
 
-Example:
+Example (xArm real robot + GELLO):
+```shell
+lerobot-teleoperate \
+    --robot.type=xarm_follower \
+    --robot.ip=192.168.1.228 \
+    --teleop.type=gello_leader \
+    --teleop.port=/dev/ttyUSB0 \
+    --fps=100
+```
+
+Example (xArm simulation + GELLO):
+```shell
+# Terminal 1: python experiments/launch_nodes.py --robot sim_xarm
+lerobot-teleoperate \
+    --robot.type=xarm_sim_follower \
+    --teleop.type=gello_leader \
+    --teleop.port=/dev/ttyUSB0 \
+    --fps=100
+```
+
+Example (SO101):
 
 ```shell
 lerobot-teleoperate \
@@ -52,8 +72,10 @@ lerobot-teleoperate \
 """
 
 import logging
+import subprocess
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 
 import rerun as rr
@@ -81,6 +103,10 @@ from lerobot.robots import (  # noqa: F401
 )
 from lerobot.robots.aloha_follower import AlohaFollower, AlohaFollowerConfig  # noqa: F401
 from lerobot.robots.xarm_follower import XarmFollower, XarmFollowerConfig  # noqa: F401
+from lerobot.robots.xarm_sim_follower import (  # noqa: F401
+    XarmSimFollower,
+    XarmSimFollowerConfig,
+)
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -204,6 +230,51 @@ def teleop_loop(
             return
 
 
+def _launch_sim_process(config) -> subprocess.Popen | None:
+    """Spawn built-in MuJoCo sim server if config.launch_sim is True."""
+    if config.type != "xarm_sim_follower" or not getattr(config, "launch_sim", False):
+        return None
+    host = getattr(config, "host", "127.0.0.1")
+    port = getattr(config, "port", 6001)
+    cmd = [
+        "python",
+        "-m",
+        "lerobot.robots.xarm_sim_follower.sim_server",
+        "--host",
+        host,
+        "--port",
+        str(port),
+    ]
+    logging.info("Spawning sim: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    # Wait for server to be ready
+    for _ in range(30):
+        time.sleep(0.5)
+        try:
+            import socket
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect((host, port))
+            s.close()
+            logging.info("Sim server ready on %s:%d", host, port)
+            break
+        except (socket.error, OSError):
+            if proc.poll() is not None:
+                _, err = proc.communicate()
+                raise RuntimeError(
+                    f"Sim server exited: {err.decode() if err else 'unknown'}"
+                )
+    else:
+        proc.kill()
+        raise RuntimeError(f"Sim server did not start within 15s on {host}:{port}")
+    return proc
+
+
 @parser.wrap()
 def teleoperate(cfg: TeleoperateConfig):
     init_logging()
@@ -215,6 +286,8 @@ def teleoperate(cfg: TeleoperateConfig):
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
         else cfg.display_compressed_images
     )
+
+    sim_proc = _launch_sim_process(cfg.robot)
 
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
@@ -242,6 +315,12 @@ def teleoperate(cfg: TeleoperateConfig):
             rr.rerun_shutdown()
         teleop.disconnect()
         robot.disconnect()
+        if sim_proc is not None:
+            sim_proc.terminate()
+            try:
+                sim_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                sim_proc.kill()
 
 
 def main():
