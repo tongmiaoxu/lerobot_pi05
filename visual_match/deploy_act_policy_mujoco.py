@@ -111,27 +111,36 @@ def _get_aug(x: np.ndarray, add_ones: bool = False) -> np.ndarray:
 
 
 def load_color_mapping(yaml_path: str):
-    """Load color transform from color_mapping.yaml file."""
+    """Load color transform from color_mapping.yaml file. Supports affine (3x3) or quadratic (3x6)."""
     with open(yaml_path, 'r') as f:
         content = f.read()
     a_match = re.search(r'color_A:\s*\[(.*?)\]', content, re.DOTALL)
     if not a_match:
         raise ValueError(f"Could not find color_A in {yaml_path}")
     a_values = [float(x.strip()) for x in a_match.group(1).replace('\n', '').split(',')]
-    A = np.array(a_values, dtype=np.float32).reshape(3, 6)
     b_match = re.search(r'color_b:\s*\[(.*?)\]', content, re.DOTALL)
     if not b_match:
         raise ValueError(f"Could not find color_b in {yaml_path}")
     b_values = [float(x.strip()) for x in b_match.group(1).replace('\n', '').split(',')]
     b = np.array(b_values, dtype=np.float32)
-    return A, b
+    if len(a_values) == 9:
+        A = np.array(a_values, dtype=np.float32).reshape(3, 3)
+        return ("affine", A, b)
+    if len(a_values) == 18:
+        A = np.array(a_values, dtype=np.float32).reshape(3, 6)
+        return ("quadratic", A, b)
+    raise ValueError(f"color_A must have 9 (affine) or 18 (quadratic) values, got {len(a_values)}")
 
 
-def apply_color_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Apply quadratic color transform to image (RGB uint8)."""
+def apply_color_transform(img: np.ndarray, calib: tuple) -> np.ndarray:
+    """Apply color transform. calib is (fmt, A, b) from load_color_mapping."""
+    fmt, A, b = calib
     flat = img.reshape(-1, 3).astype(np.float32) / 255.0
-    flat_aug = _get_aug(flat, add_ones=False)
-    out = flat_aug @ A.T + b
+    if fmt == "affine":
+        out = flat @ A.T + b
+    else:
+        flat_aug = _get_aug(flat, add_ones=False)
+        out = flat_aug @ A.T + b
     out = np.clip(out, 0.0, 1.0)
     out_rgb = (out.reshape(img.shape) * 255.0).astype(np.uint8)
     return out_rgb
@@ -322,8 +331,7 @@ def render_composite_view(model: MjModel, data: MjData,
             composite = bg_np.copy()
             composite[mask_uint8 > 0] = fg_rgb[mask_uint8 > 0]
             if 'color_calib' in gaussian_data and gaussian_data['color_calib'] is not None:
-                color_A, color_b = gaussian_data['color_calib']
-                composite = apply_color_transform(composite, color_A, color_b)
+                composite = apply_color_transform(composite, gaussian_data['color_calib'])
             return composite
         except Exception as e:
             print(f"[WARN] Gaussian rendering failed for {cam_name}: {e}")
@@ -497,8 +505,7 @@ def main():
             color_calib = None
             if args.color_calib_path and os.path.exists(args.color_calib_path):
                 try:
-                    color_A, color_b = load_color_mapping(args.color_calib_path)
-                    color_calib = (color_A, color_b)
+                    color_calib = load_color_mapping(args.color_calib_path)
                     print(f"[INFO] Loaded color calibration from: {args.color_calib_path}")
                 except Exception as e:
                     print(f"[WARN] Failed to load color calibration: {e}")

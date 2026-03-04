@@ -14,16 +14,26 @@ src/lerobot/scripts/lerobot_record.py    ← Main entry point (lerobot-record co
 ```bash
 pip install xarm-python-sdk
 ```
+### Camera calibration
+1. go to /home/tina/Documents/residual_physics-main
+```bash
+conda activate calib
+pip install opencv-contrib-python
+python experiments/real_world/calibrate.py --calibrate
+```
+2. in this codebase, run: (stationary cam, wrist cam)
+```bash
+python visual_match/load_calibration_to_config.py 311322300308 213622251153
+```
 
 ### Command (xArm + GELLO data collection)
 
 ```bash
-# With 2 RealSense cameras (stationary + wrist):
-# To find serial numbers, run: lerobot-find-cameras realsense
+# Cameras auto-loaded from visual_match/configs/ (stationary_cam.json -> cam_high, wrist_cam.json -> cam_wrist)
+# To disable: --robot.cameras='{}'
 lerobot-record \
     --robot.type=xarm_follower \
     --robot.ip=192.168.1.228 \
-    --robot.cameras='{"cam_high": {"type": "intelrealsense", "serial_number_or_name": "246322303954", "fps": 30, "width": 640, "height": 480}, "cam_wrist": {"type": "intelrealsense", "serial_number_or_name": "213622251153", "fps": 30, "width": 640, "height": 480}}' \
     --teleop.type=gello_leader \
     --teleop.port=/dev/ttyUSB0 \
     --dataset.repo_id=tongmiao/xarm_pick_cube \
@@ -78,6 +88,10 @@ python visual_match/run_prerecorded_traj_mujoco.py --cma
 python visual_match/compare_recorded_vs_mujoco.py --cma
 ```
 
+```bash
+python visual_match/compare_recorded_vs_mujoco.py --no-mujoco-view
+```
+
 ### load model in mujoco
 ```bash
 python visual_match/load_model_xarm.py
@@ -96,7 +110,7 @@ lerobot-train \
   --batch_size=8 \
   --steps=80000 \
   --wandb.enable=true \
-  --wandb.project=xarm_pick_cube_lerobot0.4.3 \
+  --wandb.project=xarm_pick_mug_lerobot0.4.3 \
   --dataset.image_transforms.enable=true
 ```
 ```bash
@@ -109,7 +123,7 @@ lerobot-train \
   --output_dir=./outputs/diffusion_xarm_training \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --wandb.enable=true \
-  --wandb.project=xarm_pick_cube_lerobot0.4.3  \
+  --wandb.project=xarm_pick_mug_lerobot0.4.3  \
   --dataset.image_transforms.enable=true \
   --policy.horizon=64 \
   --policy.n_action_steps=50 \
@@ -130,12 +144,12 @@ lerobot-train \
   --dataset.root=data \
   --output_dir=./outputs/pi05_xarm_training \
   --batch_size=8 \
-  --steps=3000 \
+  --steps=10000 \
   --wandb.enable=true \
-  --wandb.project=xarm_pick_cube_lerobot0.4.3
+  --wandb.project=xarm_pick_mug_lerobot0.4.3
 ```
 ```bash
-accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_cube \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=xarm_pick_cube_lerobot0.4.3
+accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_cube \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=xarm_pick_mug_lerobot0.4.3
 ```
 
 ### Policy Deployment for xarm
@@ -143,7 +157,6 @@ accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which l
 lerobot-record \
   --robot.type=xarm_follower \
   --robot.ip=192.168.1.228 \
-  --robot.cameras='{"cam_high": {"type": "intelrealsense", "serial_number_or_name": "246322303954", "fps": 30, "width": 640, "height": 480}, "cam_wrist": {"type": "intelrealsense", "serial_number_or_name": "213622251153", "fps": 30, "width": 640, "height": 480}}' \
   --teleop.type=gello_leader \
   --teleop.port=/dev/ttyUSB0 \
   --policy.path=outputs/pi05_xarm_training/checkpoints/001000/pretrained_model \
@@ -154,7 +167,6 @@ lerobot-record \
   --dataset.root=data_eval \
   --dataset.push_to_hub=false \
   --policy.pretrained_path=lerobot/pi05_base
-
 ```
 ### Policy rollout in Simulation for xarm (--obs means replace obs with real world images)
 ```bash
@@ -165,17 +177,25 @@ python visual_match/deploy_act_policy_mujoco.py --obs
 python visual_match/sticker_alpha_calibration.py --cube 
 ```
 
-### Compare Recorded vs MuJoCo (--new means using new normalization method in lerobot0.4.3)
-Color calibration is applied automatically if calibration_pairs_wrist/calibrated/color_mapping.yaml exists.
-
+### Wrist color calibration (sim → real)
+1. **Save calibration pairs** from replay (frames 0,5,10,15,20):
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new --color-calibrate --alpha 0.6 --save-images
+python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
 ```
-
+2. **Run calibration** to learn affine transforms:
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py --dataset-path data/tongmiao/aloha_pick_cube/ --episode 0 --new --alpha 0.6
+python visual_match/calibrate_color_wrist.py
 ```
+3. **Verify**: check `calibration_pairs_wrist/calibrated/combined_*.png` (sim | real | calibrated side-by-side).
 
+4. **implement**: color calibration during replay: 
+```bash
+python visual_match/compare_recorded_vs_mujoco.py --color-calibrate
+```
+5.**deployment**:
+```bash
+python visual_match/deploy_act_policy_mujoco.py --color-calib-path
+```
 
 
 ```bash

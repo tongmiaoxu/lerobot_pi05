@@ -68,6 +68,7 @@ class XarmFollower(Robot):
         self._target_gripper: float | None = None
         self._current_joints: np.ndarray | None = None
         self._current_gripper: float = 0.0
+        self._prev_command: np.ndarray | None = None
 
     @property
     def _joint_names(self) -> list[str]:
@@ -113,7 +114,12 @@ class XarmFollower(Robot):
         self.arm.clean_warn()
         self.arm.motion_enable(True)
         time.sleep(1)
-        self.arm.set_mode(1)
+        #Use 4 for velocity control, 0 for position control.
+        mode = {
+            "velocity": 4,
+            "position": 0,
+        }.get(self.config.control_mode, 1)
+        self.arm.set_mode(mode)
         time.sleep(1)
         self.arm.set_collision_sensitivity(0)
         time.sleep(1)
@@ -138,12 +144,110 @@ class XarmFollower(Robot):
             self.config.gripper_close_mm - self.config.gripper_open_mm
         )
 
+    @property
+    def _cur_gripper_pos_mm(self) -> float | None:
+        """Current gripper position in mm, or None if unavailable."""
+        if self.arm is None:
+            return None
+        code, gripper_pos = self.arm.get_gripper_position()
+        if code != 0 or gripper_pos is None:
+            return None
+        return gripper_pos
+
+    def _check_code(self, code: int, op_name: str) -> bool:
+        """Check xArm API return code. Returns True if successful."""
+        if code == 0:
+            return True
+        logger.warning(f"{op_name} failed (code={code})")
+        return False
+
+    def velocity_control(
+        self,
+        next_state: np.ndarray,
+        current_state: np.ndarray,
+        ignore_error: bool = True,
+    ) -> None:
+        """Execute velocity control by sending streaming velocity targets to robot."""
+        # NOTE: velocity control don't use ema
+        # next_joints = ema_factor * next_joints + (1 - ema_factor) * current_joints
+
+        # NOTE: delta for velocity control
+        next_joints = next_state[0 : self.config.dof] - current_state[0 : self.config.dof]
+
+        # denormalize gripper position
+        if self._gripper_enabled and len(next_state) > self.config.dof:
+            gripper_pos = next_state[-1]
+            denormalized_gripper_pos = (
+                gripper_pos * (self.config.gripper_close_mm - self.config.gripper_open_mm)
+                + self.config.gripper_open_mm
+            )
+
+        if not self._running or self.arm is None:
+            raise ValueError("Robot is not alive!")
+        if (
+            self._gripper_enabled
+            and len(next_state) > self.config.dof
+            and self._cur_gripper_pos_mm is not None
+        ):
+            isclose = np.isclose(self._cur_gripper_pos_mm, denormalized_gripper_pos)
+            if not isclose:
+                self.arm.set_gripper_position(denormalized_gripper_pos, wait=False)
+
+        v = next_joints * self.config.velocity_control_scale
+        v = v.tolist()
+        code = self.arm.vc_set_joint_velocity(v, is_radian=True, is_sync=False, duration=0)
+
+        if not self._check_code(code, "vc_set_joint_velocity"):
+            raise ValueError("velocity control error")
+        if ignore_error:
+            self.arm.clean_error()
+            self.arm.clean_warn()
+
+    def position_control(
+        self,
+        next_arm_goal: np.ndarray,
+        prev_arm_goal: np.ndarray,
+        next_gripper: float | None = None,
+        ema_factor: float | None = None,
+        ignore_error: bool = True,
+    ) -> None:
+        """Execute position control by sending streaming position/servo targets with EMA smoothing."""
+        if ema_factor is None:
+            ema_factor = self.config.ema_factor
+        next_arm_goal = ema_factor * next_arm_goal + (1 - ema_factor) * prev_arm_goal
+
+        # denormalize gripper position
+        if self._gripper_enabled:
+            assert next_gripper is not None, "next_gripper must be provided when gripper_enable is True"
+            denormalized_gripper_pos = (
+                next_gripper * (self.config.gripper_close_mm - self.config.gripper_open_mm)
+                + self.config.gripper_open_mm
+            )
+
+        if not self._running or self.arm is None:
+            raise ValueError("Robot is not alive!")
+
+        if (
+            self._gripper_enabled
+            and len(next_arm_goal) == self.config.dof
+            and self._cur_gripper_pos_mm is not None
+        ):
+            if np.abs(self._cur_gripper_pos_mm - denormalized_gripper_pos) > 5.0:
+                self.arm.set_gripper_position(denormalized_gripper_pos, wait=False, speed=2500)
+
+        next_arm_goal = next_arm_goal.tolist()
+        code = self.arm.set_servo_angle_j(angles=next_arm_goal, is_radian=True, wait=False)
+
+        if not self._check_code(code, "set_servo_angle_j"):
+            raise ValueError("position control error")
+        if ignore_error:
+            self.arm.clean_error()
+            self.arm.clean_warn()
+
     def _control_loop(self) -> None:
         """
-        Background thread: reads current state, computes delta toward target,
-        limits delta norm to max_delta, and sends servo command.
-
-        Matches gello_software's XArmRobot._robot_thread.
+        Background thread: reads current state and sends commands.
+        Uses position control (EMA smoothing) or velocity control based on config.
         """
         rate = _Rate(duration=1.0 / self.config.control_frequency)
         dof = self.config.dof
@@ -165,17 +269,31 @@ class XarmFollower(Robot):
                 target = self._target_joints.copy()
                 gripper_cmd = self._target_gripper
 
-            # Compute delta and limit by L2 norm
-            delta = target - current
-            norm = np.linalg.norm(delta)
-            if norm > self.config.max_delta:
-                delta = delta / norm * self.config.max_delta
-
-            # Send servo command
-            command = current + delta
-            ret = self.arm.set_servo_angle_j(command.tolist(), wait=False, is_radian=True)
-            if ret in (1, 9):
+            try:
+                if self.config.control_mode == "velocity":
+                    # Velocity control: send (target - current) as velocity
+                    grip_target = (
+                        gripper_cmd if gripper_cmd is not None else self._current_gripper
+                    )
+                    next_state = np.concatenate([target, [grip_target]])
+                    current_state = np.concatenate([current, [self._current_gripper]])
+                    self.velocity_control(next_state, current_state, ignore_error=True)
+                else:
+                    # Position control (default): EMA smoothing + set_servo_angle_j
+                    prev = self._prev_command if self._prev_command is not None else current
+                    self.position_control(
+                        target,
+                        prev,
+                        next_gripper=gripper_cmd if gripper_cmd is not None else self._current_gripper,
+                        ignore_error=True,
+                    )
+                    self._prev_command = (
+                        self.config.ema_factor * target
+                        + (1 - self.config.ema_factor) * prev
+                    )
+            except ValueError:
                 self._clear_error_states()
+                self._prev_command = current.copy()
 
             # Gripper
             if gripper_cmd is not None and self._gripper_enabled:
@@ -205,6 +323,7 @@ class XarmFollower(Robot):
             raise RuntimeError(f"Failed to read xArm joint angles (code={code})")
         self._current_joints = np.array(servo_angle[: self.config.dof])
         self._target_joints = self._current_joints.copy()
+        self._prev_command = self._current_joints.copy()
         self._target_gripper = None
 
         # Start background control thread

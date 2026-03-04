@@ -226,20 +226,31 @@ def load_color_mapping(yaml_path):
     if not a_match:
         raise ValueError(f"Could not find color_A in {yaml_path}")
     a_values = [float(x.strip()) for x in a_match.group(1).replace('\n', '').split(',')]
-    A = np.array(a_values, dtype=np.float32).reshape(3, 6)
     b_match = re.search(r'color_b:\s*\[(.*?)\]', content, re.DOTALL)
     if not b_match:
         raise ValueError(f"Could not find color_b in {yaml_path}")
     b_values = [float(x.strip()) for x in b_match.group(1).replace('\n', '').split(',')]
     b = np.array(b_values, dtype=np.float32)
-    return A, b
+    # Support affine (3x3, 9 values) or quadratic (3x6, 18 values)
+    if len(a_values) == 9:
+        A = np.array(a_values, dtype=np.float32).reshape(3, 3)
+        return ("affine", A, b)
+    if len(a_values) == 18:
+        A = np.array(a_values, dtype=np.float32).reshape(3, 6)
+        return ("quadratic", A, b)
+    raise ValueError(f"color_A must have 9 (affine) or 18 (quadratic) values, got {len(a_values)}")
 
 
-def apply_color_transform(img, A, b):
+def apply_color_transform(img, calib):
+    """Apply color transform. calib is (fmt, A, b) from load_color_mapping."""
+    fmt, A, b = calib
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     flat = img_rgb.reshape(-1, 3).astype(np.float32) / 255.0
-    flat_aug = _get_aug(flat)
-    out = flat_aug @ A.T + b
+    if fmt == "affine":
+        out = flat @ A.T + b
+    else:
+        flat_aug = _get_aug(flat)
+        out = flat_aug @ A.T + b
     out = np.clip(out, 0.0, 1.0)
     out_rgb = (out.reshape(img_rgb.shape) * 255.0).astype(np.uint8)
     return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
@@ -315,21 +326,19 @@ def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None =
 
 def parse_args():
     p = argparse.ArgumentParser(description="Compare recorded xArm video with MuJoCo replay + composite")
-    p.add_argument("--dataset-path", type=str, default="data",
+    p.add_argument("--dataset-path", type=str, default="data_pc",
                    help="Path to dataset directory (local) or repo_id (Hub)")
     p.add_argument("--dataset-root", type=str, default=None)
     p.add_argument("--episode", type=int, default=0)
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--scene-path", type=str, default="pointclouds/xarm7.npz",
                    help="Path to Gaussian Splatting scene file")
-    p.add_argument("--color-calib-path", type=str, default=None,
-                   help="Path to color calibration YAML file (optional)")
     p.add_argument("--alpha", type=float, default=0.5,
                    help="Alpha for blending (0=fully real, 1=fully robot)")
     p.add_argument("--color-calibrate", action="store_true",
                    help="Apply color calibration to composite renderings")
-    p.add_argument("--save-images", action="store_true",
-                   help="Save frames 0,5,10,15,20 to calibration_pairs/")
+    p.add_argument("--save-calibration-pairs", action="store_true",
+                   help="Save frames 0,5,10,15,20 to calibration_pairs_wrist/ for color calibration")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
@@ -479,13 +488,11 @@ def main():
 
     # Load color calibration
     color_calib = None
-    if args.color_calib_path and os.path.exists(args.color_calib_path):
-        try:
-            color_A, color_b = load_color_mapping(args.color_calib_path)
-            color_calib = (color_A, color_b)
-            print(f"[INFO] Loaded color calibration from: {args.color_calib_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to load color calibration: {e}")
+    if args.color_calibrate:
+        default_calib = Path(__file__).parent.parent / "calibration_pairs_wrist" / "calibrated" / "color_mapping.yaml"
+        if default_calib.exists():
+            color_calib = load_color_mapping(str(default_calib))
+            print(f"[INFO] Loaded default color calibration from: {default_calib}")
 
     # Pre-compute ctrl sequence
     print("[INFO] Converting xArm states to MuJoCo ctrl...")
@@ -493,6 +500,13 @@ def main():
         lerobot_state_to_mujoco_ctrl(observations_raw[i], gripper_mj_range)
         for i in range(num_frames)
     ])
+
+    # Initialize sim from dataset's first frame (instead of home keyframe) for aligned replay
+    data.qpos[:7] = ctrl_sequence[0, :7]
+    data.qpos[7] = ctrl_sequence[0, 7] / 255.0 * 0.85  # gripper ctrl -> qpos
+    data.qvel[:8] = 0
+    mujoco.mj_forward(model, data)
+    print("[INFO] Initialized sim from dataset first frame (aligned with replay start)")
 
     # Create windows — 2 rows: stationary + wrist, 4 columns: recorded, mujoco, composite, alpha
     # When --no-mujoco-view: only wrist alpha, fullscreen
@@ -661,9 +675,13 @@ def main():
                     line_yaw.set_data(time_data, np.degrees(rot_arr[:, 2]))
                     line_angle.set_data(time_data, np.degrees(rot_arr[:, 3]))
 
-            # Render cameras (only wrist when --no-mujoco-view)
+            # Render cameras (only stationary when --no-mujoco-view, unless saving calibration pairs)
             cam_renders = {}
-            cams_to_render = ["stationary"] if args.no_mujoco_view else list(CAMERA_CONFIG.keys())
+            cams_to_render = (
+                list(CAMERA_CONFIG.keys())
+                if args.save_calibration_pairs
+                else (["stationary"] if args.no_mujoco_view else list(CAMERA_CONFIG.keys()))
+            )
             window_map = {
                 "stationary": (win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha),
                 "wrist": (win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha),
@@ -708,16 +726,19 @@ def main():
                         bg_bgr = cv2.cvtColor(bg_np, cv2.COLOR_RGB2BGR)
                         composite_frame = bg_bgr.copy()
                         composite_frame[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
+                        composite_raw = composite_frame.copy()  # before color calib (for calibration pairs)
                         foreground_only = np.zeros_like(fg_bgr)
                         foreground_only[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
                         if args.color_calibrate and color_calib is not None:
-                            composite_frame = apply_color_transform(composite_frame, *color_calib)
+                            composite_frame = apply_color_transform(composite_frame, color_calib)
                     except Exception as e:
                         if frame_idx == 0:
                             print(f"[WARN] {cam_key} Gaussian rendering failed: {e}")
                         composite_frame = fg_bgr.copy()
+                        composite_raw = composite_frame.copy()
                 else:
                     composite_frame = fg_bgr.copy()
+                    composite_raw = composite_frame.copy()
 
                 alpha_mask = (mask_uint8 / 255.0).astype(np.float32)
                 alpha_mask_3ch = np.stack([alpha_mask] * 3, axis=-1)
@@ -731,22 +752,24 @@ def main():
                     "recorded": recorded_frame,
                     "mujoco": fg_bgr.copy(),
                     "composite": composite_frame,
+                    "composite_raw": composite_raw,
                     "alpha": alpha_frame,
                 }
 
-            # Save calibration frames
-            # (disabled: do not save any images or create directories)
-            # SAVE_FRAMES = [0, 5, 10, 15, 20]
-            # if args.save_images and frame_idx in SAVE_FRAMES:
-            #     gs_dir = Path("calibration_pairs/gs_renders")
-            #     real_dir = Path("calibration_pairs/real_captures")
-            #     gs_dir.mkdir(parents=True, exist_ok=True)
-            #     real_dir.mkdir(parents=True, exist_ok=True)
-            #     gs_path = gs_dir / f"frame_{frame_idx:04d}.png"
-            #     real_path = real_dir / f"frame_{frame_idx:04d}.png"
-            #     cv2.imwrite(str(gs_path), cam_renders["stationary"]["composite"])
-            #     cv2.imwrite(str(real_path), cam_renders["stationary"]["recorded"])
-            #     print(f"[INFO] Saved frame {frame_idx}: {gs_path}, {real_path}")
+            # Save calibration pairs for wrist color calibration
+            SAVE_CALIB_FRAMES = [0, 5, 10, 15, 20]
+            if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES and "wrist" in cam_renders:
+                base_dir = Path(__file__).parent.parent / "calibration_pairs_wrist"
+                gs_dir = base_dir / "gs_renders"
+                real_dir = base_dir / "real_captures"
+                gs_dir.mkdir(parents=True, exist_ok=True)
+                real_dir.mkdir(parents=True, exist_ok=True)
+                # Save sim composite (before color calibration) and real recorded
+                gs_path = gs_dir / f"frame_{frame_idx:04d}.png"
+                real_path = real_dir / f"frame_{frame_idx:04d}.png"
+                cv2.imwrite(str(gs_path), cam_renders["wrist"]["composite_raw"])
+                cv2.imwrite(str(real_path), cam_renders["wrist"]["recorded"])
+                print(f"[INFO] Saved calibration pair frame {frame_idx}: {gs_path}, {real_path}")
 
             # Overlays
             gripper_mm = observations_raw[frame_idx, 7]

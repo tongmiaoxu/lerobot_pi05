@@ -255,6 +255,13 @@ def main():
         [lerobot_state_to_mujoco_ctrl(source[i], gripper_mj_range) for i in range(num_frames)]
     )
 
+    # Initialize sim from dataset's first frame (instead of home keyframe) for aligned replay
+    data.qpos[:7] = ctrl_seq[0, :7]
+    data.qpos[7] = ctrl_seq[0, 7] / 255.0 * 0.85  # gripper ctrl -> qpos
+    data.qvel[:8] = 0
+    mujoco.mj_forward(model, data)
+    print("[INFO] Initialized sim from dataset first frame (aligned with replay start)")
+
     print(f"[INFO] Ctrl range per actuator:")
     for i in range(8):
         print(f"  act[{i}]: [{ctrl_seq[:, i].min():.4f}, {ctrl_seq[:, i].max():.4f}]")
@@ -292,8 +299,7 @@ def main():
                 calib_path = args.color_calib_path if Path(args.color_calib_path).is_absolute() else str(_PROJECT_ROOT / args.color_calib_path)
                 if os.path.exists(calib_path):
                     try:
-                        color_A, color_b = load_color_mapping(calib_path)
-                        color_calib = (color_A, color_b)
+                        color_calib = load_color_mapping(calib_path)
                     except Exception as e:
                         print(f"[WARN] Failed to load color calibration: {e}")
             viz_cfg = {"viz_w": RENDER_W, "viz_h": RENDER_H, "viz_near": 0.1, "viz_far": 10.0}

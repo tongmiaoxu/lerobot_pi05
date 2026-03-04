@@ -178,6 +178,13 @@ def main():
     except Exception:
         mujoco.mj_resetData(model, data)
 
+    # Initialize sim from dataset's first frame (instead of home keyframe) for aligned replay
+    data.qpos[:7] = ctrl_seq[0, :7]
+    data.qpos[7] = ctrl_seq[0, 7] / 255.0 * 0.85  # gripper ctrl -> qpos
+    data.qvel[:8] = 0
+    mujoco.mj_forward(model, data)
+    print("[INFO] Initialized sim from dataset first frame (aligned with replay start)")
+
     # Apply camera calibration (same as compare_recorded_vs_mujoco).
     # Wrist cam: patches model (local pose) — only needs to be done once.
     # Stationary cam: patches data (world pose) — re-applied after every mj_forward.

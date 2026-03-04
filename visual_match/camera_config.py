@@ -174,6 +174,40 @@ def get_all_cameras() -> dict:
     return cameras
 
 
+def get_lerobot_cameras() -> dict:
+    """
+    Build lerobot camera config dict from visual_match configs.
+
+    Maps stationary_cam -> cam_high, wrist_cam -> cam_wrist for use with
+    lerobot-record and lerobot-teleoperate. Returns a dict of camera name
+    -> config dict in the format expected by lerobot (type, serial_number_or_name,
+    fps, width, height).
+
+    Returns:
+        Dict suitable for --robot.cameras or config.cameras, e.g.:
+        {"cam_high": {...}, "cam_wrist": {...}}
+    """
+    lerobot_cameras = {}
+    mapping = [
+        ("stationary_cam", "cam_high"),
+        ("wrist_cam", "cam_wrist"),
+    ]
+    for config_name, lerobot_key in mapping:
+        config_path = _CONFIGS_DIR / f"{config_name}.json"
+        if not config_path.exists():
+            continue
+        with open(config_path) as f:
+            cfg = json.load(f)
+        lerobot_cameras[lerobot_key] = {
+            "type": "intelrealsense",
+            "serial_number_or_name": cfg["serial_number"],
+            "fps": cfg["fps"],
+            "width": cfg["width"],
+            "height": cfg["height"],
+        }
+    return lerobot_cameras
+
+
 def set_mujoco_camera_from_config(data, model, cam_name: str, cam_cfg: dict) -> int:
     """
     Apply calibration to a MuJoCo camera.

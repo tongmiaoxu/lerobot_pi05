@@ -18,7 +18,7 @@ TIMESTEP = 1.0 / FPS
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 XML_DIR = _PROJECT_ROOT / "xarm7"
-PARQUET_PATH = _PROJECT_ROOT / "data" / "data" / "chunk-000" / "file-000.parquet"
+PARQUET_PATH = _PROJECT_ROOT / "data"/ "data" / "chunk-000" / "file-000.parquet"
 
 # xarm7 XML defaults per actuator class:
 #   size1 (j1,j2):    gainprm=1500  biasprm=[0,-1500,-150]  dof_damping=10
@@ -159,8 +159,11 @@ def main():
             model.actuator_biasprm[:7, 2] = -act_damp
             model.dof_damping[:7] = jnt_damp
 
+            # Initialize from dataset's first frame (aligned with replay)
             data.qpos[:7] = obs_mj[0, :7]
-            mujoco.mj_step(model, data)
+            data.qpos[7] = obs_mj[0, 7] / 255.0 * 0.85  # gripper ctrl -> qpos
+            data.qvel[:8] = 0
+            mujoco.mj_forward(model, data)
 
             for i in range(N):
                 err = np.linalg.norm(obs_mj[i, :7] - data.qpos[:7])
