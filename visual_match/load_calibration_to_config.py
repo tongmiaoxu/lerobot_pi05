@@ -139,7 +139,7 @@ def main():
     parser.add_argument(
         "stationary_cam_serial",
         type=str,
-        help="Serial number of the stationary camera (e.g. 246322303954)",
+        help="Serial number of the stationary camera (e.g. 311322300308)",
     )
     parser.add_argument(
         "wrist_cam_serial",

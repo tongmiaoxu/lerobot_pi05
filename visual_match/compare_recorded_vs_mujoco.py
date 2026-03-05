@@ -326,7 +326,7 @@ def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None =
 
 def parse_args():
     p = argparse.ArgumentParser(description="Compare recorded xArm video with MuJoCo replay + composite")
-    p.add_argument("--dataset-path", type=str, default="data_pc",
+    p.add_argument("--dataset-path", type=str, default="data",
                    help="Path to dataset directory (local) or repo_id (Hub)")
     p.add_argument("--dataset-root", type=str, default=None)
     p.add_argument("--episode", type=int, default=0)
@@ -758,7 +758,7 @@ def main():
 
             # Save calibration pairs for wrist color calibration
             SAVE_CALIB_FRAMES = [0, 5, 10, 15, 20]
-            if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES and "wrist" in cam_renders:
+            if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES and "stationary" in cam_renders:
                 base_dir = Path(__file__).parent.parent / "calibration_pairs_wrist"
                 gs_dir = base_dir / "gs_renders"
                 real_dir = base_dir / "real_captures"
@@ -767,8 +767,8 @@ def main():
                 # Save sim composite (before color calibration) and real recorded
                 gs_path = gs_dir / f"frame_{frame_idx:04d}.png"
                 real_path = real_dir / f"frame_{frame_idx:04d}.png"
-                cv2.imwrite(str(gs_path), cam_renders["wrist"]["composite_raw"])
-                cv2.imwrite(str(real_path), cam_renders["wrist"]["recorded"])
+                cv2.imwrite(str(gs_path), cam_renders["stationary"]["composite_raw"])
+                cv2.imwrite(str(real_path), cam_renders["stationary"]["recorded"])
                 print(f"[INFO] Saved calibration pair frame {frame_idx}: {gs_path}, {real_path}")
 
             # Overlays
