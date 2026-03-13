@@ -113,7 +113,7 @@ class Args:
     cma: bool = False
     cma_params: str = "cma_result.pkl"
     dataset_path: Optional[str] = None
-    scene_path: str = "pointclouds/xarm7.npz"
+    scene_path: str = "pointclouds/xarm7_black.npz"
     color_calib_path: Optional[str] = None
     headless: bool = False
 
@@ -148,7 +148,7 @@ def parse_cli() -> Args:
         help="Path to LeRobot dataset directory for Real camera windows (optional)",
     )
     p.add_argument(
-        "--scene-path", type=str, default="pointclouds/xarm7.npz",
+        "--scene-path", type=str, default="pointclouds/xarm7_black.npz",
         help="Path to Gaussian Splatting scene for composite rendering",
     )
     p.add_argument(

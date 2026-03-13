@@ -16,6 +16,10 @@ from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
 FPS = 30.0
 TIMESTEP = 1.0 / FPS
 
+# Objective shaping to avoid overfitting to an initial pose mismatch
+SETTLE_RATIO = 0.05
+EFFORT_WEIGHT = 1e-4
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 XML_DIR = _PROJECT_ROOT / "xarm7"
 PARQUET_PATH = _PROJECT_ROOT / "data"/ "data" / "chunk-000" / "file-000.parquet"
@@ -34,9 +38,10 @@ PARQUET_PATH = _PROJECT_ROOT / "data"/ "data" / "chunk-000" / "file-000.parquet"
 #   biasprm[2]  = -act_damping   (actuator velocity damping)
 #   dof_damping =  jnt_damping   (passive joint damping)
 
-KP_INIT = np.array([1500.0, 1500, 1000, 1000, 1000, 800, 800])
+KP_INIT = np.array([1000.0, 1000, 800, 800, 800, 700, 700])
 KP_LOW = np.ones(7)
-KP_HIGH = np.array([3000.0, 3000, 2000, 2000, 2000, 1600, 1600])
+# KP_HIGH = np.array([3000.0, 3000, 2000, 2000, 2000, 1600, 1600])
+KP_HIGH = np.array([1100.0, 1100, 1100, 1100, 1100, 1000, 1000])
 
 ACT_DAMP_INIT = np.array([150.0, 150, 100, 100, 100, 80, 80])
 ACT_DAMP_LOW = np.zeros(7)
@@ -145,12 +150,13 @@ def main():
         act_damp = prms[7:14]
         jnt_damp = prms[14:]
 
-        score = 0
+        score = 0.0
         L = 0
 
         for obs_mj in episodes_mj.values():
             N = len(obs_mj)
             L += N
+            settle_steps = max(1, int(np.ceil(SETTLE_RATIO * N)))
 
             mujoco.mj_resetDataKeyframe(model, data, home_id)
 
@@ -165,9 +171,28 @@ def main():
             data.qvel[:8] = 0
             mujoco.mj_forward(model, data)
 
+            # Let controller settle at first command to reduce sensitivity
+            # to small hidden-state mismatches at reset.
+            for _ in range(settle_steps):
+                data.ctrl[:] = obs_mj[0]
+                curr_sim_time = data.time
+                while data.time < curr_sim_time + TIMESTEP:
+                    mujoco.mj_step(model, data)
+
+            # Compare relative joint motion w.r.t. each trajectory start.
+            # This avoids rewarding high gains that only compensate a static offset.
+            real_q0 = obs_mj[0, :7]
+            sim_q0 = data.qpos[:7].copy()
+
             for i in range(N):
-                err = np.linalg.norm(obs_mj[i, :7] - data.qpos[:7])
-                score += err
+                real_rel = obs_mj[i, :7] - real_q0
+                sim_rel = data.qpos[:7] - sim_q0
+                track_err = np.linalg.norm(real_rel - sim_rel)
+
+                # Penalize aggressive actuator usage to prevent unrealistically
+                # high-gain solutions.
+                effort = np.linalg.norm(data.qfrc_actuator[:7])
+                score += track_err + EFFORT_WEIGHT * effort
 
                 data.ctrl[:] = obs_mj[i]
                 curr_sim_time = data.time
@@ -194,6 +219,7 @@ def main():
             'bounds': [lower_bounds.tolist(), upper_bounds.tolist()],
             'maxiter': max_epochs,
             'verbose': 1,
+            # 'popsize': 30,
         }
     )
 
@@ -201,7 +227,7 @@ def main():
     prev_best = float('inf')
     stall_counter = 0
     patience = 20
-    tol = 1e-6
+    tol = 1e-10
     while not es.stop():
         population = es.ask()
         fitness_values = [evaluate_trajectory(c) for c in population]
@@ -241,7 +267,7 @@ def main():
         f.write(f"Act damping b2 (biasprm[2]): {best_solution[7:14].tolist()}\n")
         f.write(f"Jnt damping d  (dof_damping): {best_solution[14:].tolist()}\n")
 
-    with open("cma_result.pkl", "wb") as f:
+    with open(f"cma_result_0.05ratio_new_new_new_{timestamp}.pkl", "wb") as f:
         pickle.dump({
             'xbest': es.result.xbest,
             'fbest': es.result.fbest,
@@ -253,7 +279,7 @@ def main():
 
     print(f"Results saved to: {log_path}")
 
-
+0
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)

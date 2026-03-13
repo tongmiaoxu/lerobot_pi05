@@ -37,7 +37,9 @@ from scipy.spatial.transform import Rotation as Rot
 _CONFIGS_DIR = Path(__file__).parent / "configs"
 
 # MuJoCo xarm7/scene.xml places link_base at (0, 0, 0.12)
-MJ_BASE_OFFSET = np.array([0.0, 0.0, 0.12])
+# MJ_BASE_OFFSET = np.array([-0.014, -0.008, 0.0])
+# MJ_BASE_OFFSET = np.array([-0.0, 0, 0.12])
+MJ_BASE_OFFSET = np.array([-0.01, -0.01, 0.0])
 
 # OpenCV camera convention -> MuJoCo camera convention
 # OpenCV: +Z forward, +Y down.  MuJoCo: -Z forward, +Y up.

@@ -77,18 +77,39 @@ def sample_mesh_surface(vertices: np.ndarray, faces: np.ndarray, num_points: int
     return points
 
 
+def sample_box_surface(half_extents: np.ndarray, num_points: int) -> np.ndarray:
+    """Sample points on box surface. half_extents: (3,) = [sx, sy, sz]."""
+    sx, sy, sz = half_extents
+    n = max(num_points // 6, 100)
+    all_pts = []
+    for axis in range(3):
+        for sign in (1, -1):
+            u = np.random.uniform(-1, 1, (n,))
+            v = np.random.uniform(-1, 1, (n,))
+            pts = np.zeros((n, 3))
+            pts[:, axis] = sign * half_extents[axis]
+            other = [i for i in range(3) if i != axis]
+            pts[:, other[0]] = u * half_extents[other[0]]
+            pts[:, other[1]] = v * half_extents[other[1]]
+            all_pts.append(pts)
+    return np.vstack(all_pts)
+
+
 def extract_robot_pointcloud(
     model_path: str,
     points_per_mesh: int = 5000,
+    include_table: bool = False,
+    points_per_box: int = 2000,
 ) -> np.ndarray:
     """
     Load MuJoCo model, set joint angles, run FK, and extract mesh vertices in world frame.
+    Optionally include table and sticker (box geoms).
 
     Args:
         model_path: Path to the MuJoCo XML model file.
-        gripper_qpos: Optional (6,) array of gripper joint positions.
-                      If None, defaults to zeros (gripper open).
         points_per_mesh: Number of points to sample per mesh geometry.
+        include_table: If True, also sample table and sticker (box geoms).
+        points_per_box: Points per box geom when include_table=True.
 
     Returns:
         (N, 3) array of 3D points in world frame.
@@ -111,8 +132,31 @@ def extract_robot_pointcloud(
     all_points = []
     geom_count = 0
 
+    # Names of non-robot objects to exclude (e.g. mug, other manipulated objects)
+    EXCLUDE_GEOMS = {"mug"}
+
     for geom_id in range(model.ngeom):
         geom_type = model.geom_type[geom_id]
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        R = data.geom_xmat[geom_id].reshape(3, 3)
+        t = data.geom_xpos[geom_id]
+
+        # Skip non-robot objects (mug, etc.)
+        if geom_name in EXCLUDE_GEOMS:
+            print(f"  Skipping geom {geom_id} ({geom_name}): excluded object")
+            continue
+
+        # Box geoms (table, sticker) when include_table
+        if geom_type == mujoco.mjtGeom.mjGEOM_BOX and include_table and geom_name in ("table", "sticker", "cube"):
+            half_extents = model.geom_size[geom_id].copy()
+            sampled = sample_box_surface(half_extents, points_per_box)
+            points_world = (R @ sampled.T).T + t
+            body_id = model.geom_bodyid[geom_id]
+            body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or f"body_{body_id}"
+            print(f"  Geom {geom_id} ({geom_name}, box): {len(points_world)} points")
+            all_points.append(points_world)
+            geom_count += 1
+            continue
 
         # Only process mesh geoms (type 7 in MuJoCo)
         if geom_type != mujoco.mjtGeom.mjGEOM_MESH:
@@ -140,8 +184,6 @@ def extract_robot_pointcloud(
             sampled = vertices[idx]
 
         # Transform to world frame: P_world = R @ P_local + t
-        R = data.geom_xmat[geom_id].reshape(3, 3)
-        t = data.geom_xpos[geom_id]
         points_world = (R @ sampled.T).T + t
 
         body_id = model.geom_bodyid[geom_id]
@@ -151,7 +193,7 @@ def extract_robot_pointcloud(
         all_points.append(points_world)
         geom_count += 1
 
-    print(f"Processed {geom_count} mesh geoms")
+    print(f"Processed {geom_count} geoms")
 
     if len(all_points) == 0:
         raise RuntimeError("No mesh geoms found in the model.")
@@ -220,7 +262,7 @@ def main():
         description="Generate ground-truth point cloud of xArm7 in world frame from MuJoCo model."
     )
     parser.add_argument(
-        "--output", type=str, default="pointclouds/output1.pcd",
+        "--output", type=str, default="pointclouds/output.pcd",
         help="Output PCD file path.",
     )
     parser.add_argument(
@@ -230,6 +272,14 @@ def main():
     parser.add_argument(
         "--points-per-mesh", type=int, default=5000,
         help="Points to sample per mesh geometry (default: 5000).",
+    )
+    parser.add_argument(
+        "--include-table", action="store_true",
+        help="Include table, sticker, cube (box geoms) in the point cloud.",
+    )
+    parser.add_argument(
+        "--points-per-box", type=int, default=2000,
+        help="Points per box geom when --include-table (default: 2000).",
     )
 
     # Joint angle source (pick one)
@@ -255,6 +305,8 @@ def main():
     points = extract_robot_pointcloud(
         model_path=args.model,
         points_per_mesh=args.points_per_mesh,
+        include_table=args.include_table,
+        points_per_box=args.points_per_box,
     )
 
     print(f"\nTotal points: {points.shape[0]}")

@@ -31,6 +31,7 @@ from composite_rendering import (
     mj_pose_to_gaussian_w2c,
     render,
     setup_camera,
+    shift_for_principal_point,
     T_splat2mj,
 )
 
@@ -74,6 +75,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import cv2
+try:
+    import open3d as o3d
+    _HAS_OPEN3D = True
+except ImportError:
+    _HAS_OPEN3D = False
 
 import mujoco
 from mujoco import MjModel, MjData
@@ -145,6 +151,79 @@ def _fig_to_bgr_overlay(fig, target_w: int, target_h: int) -> np.ndarray:
     return cv2.resize(buf_bgr, (target_w, target_h))
 
 
+def _build_camera_frustum_local_points(K: np.ndarray, width: int, height: int,
+                                       depth: float = 0.18) -> np.ndarray:
+    """Build 5 local frustum points (origin + 4 image-corner rays at fixed depth)."""
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+    corners = np.array([
+        [0.0, 0.0],
+        [float(width), 0.0],
+        [float(width), float(height)],
+        [0.0, float(height)],
+    ], dtype=np.float64)
+    xy = np.empty((4, 2), dtype=np.float64)
+    xy[:, 0] = (corners[:, 0] - cx) / fx * depth
+    xy[:, 1] = (corners[:, 1] - cy) / fy * depth
+    pts = np.zeros((5, 3), dtype=np.float64)
+    pts[1:, 0] = xy[:, 0]
+    pts[1:, 1] = xy[:, 1]
+    pts[1:, 2] = depth
+    return pts
+
+
+def _transform_points(T: np.ndarray, pts_local: np.ndarray) -> np.ndarray:
+    R = T[:3, :3]
+    t = T[:3, 3]
+    return (pts_local @ R.T) + t[None, :]
+
+
+def _make_camera_frustum_lineset(local_pts: np.ndarray, pose: np.ndarray,
+                                 color=(1.0, 0.6, 0.0)):
+    pts_world = _transform_points(pose, local_pts)
+    lines = [
+        [0, 1], [0, 2], [0, 3], [0, 4],
+        [1, 2], [2, 3], [3, 4], [4, 1],
+    ]
+    colors = [list(color)] * len(lines)
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(pts_world)
+    ls.lines = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    return ls
+
+
+def _update_frame_mesh_pose(frame_mesh, prev_pose: np.ndarray, new_pose: np.ndarray):
+    delta = new_pose @ np.linalg.inv(prev_pose)
+    frame_mesh.transform(delta)
+
+
+def _rotation_matrix_axis(axis: int, angle_deg: float) -> np.ndarray:
+    """3x3 rotation about axis (0=X, 1=Y, 2=Z)."""
+    a = np.radians(angle_deg)
+    c, s = np.cos(a), np.sin(a)
+    if axis == 0:
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    elif axis == 1:
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    else:
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def _make_cam_increment(tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0, rz=0.0):
+    """Build a 4x4 incremental camera-local transform. Rotation args in degrees."""
+    T = np.eye(4)
+    T[:3, 3] = [tx, ty, tz]
+    R = np.eye(3)
+    for axis, angle in enumerate([rx, ry, rz]):
+        if abs(angle) > 1e-9:
+            R = _rotation_matrix_axis(axis, angle) @ R
+    T[:3, :3] = R
+    return T
+
+
 def plot_fk_comparison(trans_errors, rot_errors, fps, save_path=None):
     try:
         import matplotlib.pyplot as plt
@@ -200,13 +279,6 @@ def plot_fk_comparison(trans_errors, rot_errors, fps, save_path=None):
     plt.show()
 
 
-def plot_fk_from_file(npz_path: str, save_path: str = None):
-    """Load FK comparison data from saved .npz and plot."""
-    d = np.load(npz_path)
-    if save_path is None:
-        save_path = npz_path.replace('.npz', '.png')
-    print(f"[INFO] Loaded FK data from: {npz_path}")
-    plot_fk_comparison(d['trans_errors'], d['rot_errors'], float(d['fps']), save_path)
 
 
 # ============================================================================
@@ -331,7 +403,7 @@ def parse_args():
     p.add_argument("--dataset-root", type=str, default=None)
     p.add_argument("--episode", type=int, default=0)
     p.add_argument("--fps", type=float, default=30.0)
-    p.add_argument("--scene-path", type=str, default="pointclouds/xarm7.npz",
+    p.add_argument("--scene-path", type=str, default="pointclouds/xarm7_black.npz",
                    help="Path to Gaussian Splatting scene file")
     p.add_argument("--alpha", type=float, default=0.5,
                    help="Alpha for blending (0=fully real, 1=fully robot)")
@@ -345,6 +417,14 @@ def parse_args():
                    help="Apply CMA-ES optimised parameters to the model.")
     p.add_argument("--no-mujoco-view", action="store_true",
                    help="Disable the MuJoCo 3D interactive viewer window")
+    p.add_argument("--open3d-cam-view", action="store_true",
+                   help="Open a lightweight Open3D viewer showing simulated camera pose(s)")
+    p.add_argument("--open3d-cam", type=str, default="stationary", choices=["stationary", "wrist", "both"],
+                   help="Which simulated camera pose(s) to display in Open3D")
+    p.add_argument("--open3d-cam-save-path", type=str, default="camera_adjust.npy",
+                   help="Path to save camera adjustment delta transform (.npy)")
+    p.add_argument("--load-camera-adjust", action="store_true",
+                   help="Load camera adjustment delta from --open3d-cam-save-path if it exists")
     return p.parse_args()
 
 
@@ -421,6 +501,13 @@ def main():
     )
     print(f"[INFO] Gripper ctrl range: [{gripper_mj_range[0]}, {gripper_mj_range[1]}]")
 
+    # Apply high damping to mug freejoint to prevent drift during physics
+    mug_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
+    if mug_jnt_id >= 0:
+        mug_dof_addr = model.jnt_dofadr[mug_jnt_id]
+        model.dof_damping[mug_dof_addr:mug_dof_addr + 6] = 100
+        print(f"[INFO] Set mug freejoint dof_damping=100 (DOFs {mug_dof_addr}:{mug_dof_addr+6})")
+
     # Apply CMA-ES parameters if provided
     if args.cma:
         import pickle
@@ -437,6 +524,20 @@ def main():
         print(f"[INFO] Applied CMA-ES params from {args.cma_params}")
 
     RENDER_W, RENDER_H = 640, 480
+
+    # Fix #1: correct MuJoCo fovy to match real camera intrinsics.
+    # MuJoCo assumes a centered symmetric frustum; we at least match fy.
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        K = cam_cfg["config"]["intrinsics"]
+        fy = K[1, 1]
+        correct_fovy = float(2.0 * np.degrees(np.arctan(RENDER_H / (2.0 * fy))))
+        mj_cam = cam_cfg["mujoco_cam"]
+        cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, mj_cam)
+        if cid >= 0:
+            old_fovy = model.cam_fovy[cid]
+            model.cam_fovy[cid] = correct_fovy
+            print(f"[INFO] Corrected fovy for '{mj_cam}': {old_fovy:.2f}° → {correct_fovy:.2f}°")
+
     renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer.enable_segmentation_rendering()
@@ -459,6 +560,100 @@ def main():
     camera_intrinsics = {}
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
         camera_intrinsics[cam_key] = cam_cfg["config"]["intrinsics"]
+
+    # Optional Open3D camera pose viewer
+    o3d_vis = None
+    o3d_cam_geoms = {}
+    o3d_cam_prev_pose = {}
+    o3d_cam_keys = []
+    if args.open3d_cam_view:
+        if not _HAS_OPEN3D:
+            print("[WARN] open3d not installed. Disable --open3d-cam-view or install open3d.")
+        else:
+            try:
+                if args.open3d_cam == "both":
+                    o3d_cam_keys = ["stationary", "wrist"]
+                else:
+                    o3d_cam_keys = [args.open3d_cam]
+
+                o3d_vis = o3d.visualization.Visualizer()
+                o3d_vis.create_window(window_name="Sim Camera Pose (Open3D)", width=960, height=720)
+
+                world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
+                o3d_vis.add_geometry(world_frame)
+
+                cam_colors = {
+                    "stationary": (1.0, 0.6, 0.0),
+                    "wrist": (0.0, 0.7, 1.0),
+                }
+
+                for cam_key in o3d_cam_keys:
+                    cam_name = CAMERA_CONFIG[cam_key]["mujoco_cam"]
+                    pose = get_mujoco_camera_pose(model, data, cam_name)
+                    frame_mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.08)
+                    frame_mesh.transform(pose)
+                    local_frustum = _build_camera_frustum_local_points(
+                        camera_intrinsics[cam_key], RENDER_W, RENDER_H, depth=0.18
+                    )
+                    frustum = _make_camera_frustum_lineset(
+                        local_frustum, pose, color=cam_colors.get(cam_key, (1.0, 1.0, 0.0))
+                    )
+
+                    o3d_vis.add_geometry(frame_mesh)
+                    o3d_vis.add_geometry(frustum)
+                    o3d_cam_geoms[cam_key] = {
+                        "frame": frame_mesh,
+                        "frustum": frustum,
+                        "local_frustum": local_frustum,
+                    }
+                    o3d_cam_prev_pose[cam_key] = pose
+
+                vc = o3d_vis.get_view_control()
+                vc.set_front([0.2, -0.9, 0.3])
+                vc.set_lookat([0.25, 0.0, 0.25])
+                vc.set_up([0.0, 0.0, 1.0])
+                vc.set_zoom(0.5)
+                o3d_vis.poll_events()
+                o3d_vis.update_renderer()
+                print(f"[INFO] Open3D camera viewer enabled for: {', '.join(o3d_cam_keys)}")
+            except Exception as e:
+                print(f"[WARN] Failed to launch Open3D camera viewer: {e}")
+                o3d_vis = None
+
+    # Camera adjustment state (interactive Open3D camera control)
+    o3d_cam_user_delta = {}    # cam_key -> 4x4 accumulated user delta
+    o3d_cam_base_pose = {}     # cam_key -> 4x4 base world pose (updated each sim step)
+    o3d_active_cam_idx = 0     # index into o3d_cam_keys
+    o3d_trans_step = 0.005     # translation step in meters (5 mm)
+    o3d_rot_step = 0.5         # rotation step in degrees
+
+    # Load saved camera adjustment delta (applies even without Open3D viewer)
+    _loaded_delta = None
+    if args.load_camera_adjust:
+        _adj_path = Path(args.open3d_cam_save_path)
+        if _adj_path.exists():
+            _loaded_delta = np.load(str(_adj_path))
+            print(f"[INFO] Loaded camera adjustment delta from: {_adj_path}")
+        else:
+            print(f"[WARN] --load-camera-adjust set but file not found: {_adj_path}")
+
+    # When --load-camera-adjust is used without --open3d-cam-view, still apply
+    # the delta to the first stationary camera each frame.
+    if _loaded_delta is not None and not o3d_cam_keys:
+        o3d_cam_keys = ["stationary"]
+
+    for _ck in o3d_cam_keys:
+        o3d_cam_user_delta[_ck] = _loaded_delta.copy() if _loaded_delta is not None else np.eye(4)
+        _cn = CAMERA_CONFIG[_ck]["mujoco_cam"]
+        o3d_cam_base_pose[_ck] = get_mujoco_camera_pose(model, data, _cn)
+
+    if o3d_vis is not None:
+        print(f"[INFO] Active camera for adjustment: {o3d_cam_keys[o3d_active_cam_idx]}")
+        print("[INFO] Camera adjustment keys (focus on OpenCV window):")
+        print("       SPACE=pause/resume  .=step 1 frame (while paused)")
+        print("       w/s=±Z  a/d=±X  r/f=±Y | i/k=pitch  j/l=yaw  u/o=roll")
+        print("       [/]=trans step  1/2=rot step  t=toggle cam")
+        print("       p=print delta  v=save  0=reset")
 
     # Load Gaussian Splatting scene
     scene_data = None
@@ -519,27 +714,22 @@ def main():
     win_wrist_comp = "Wrist - Composite"
     win_wrist_alpha = "Wrist - Alpha"
 
-    if args.no_mujoco_view:
-        cv2.namedWindow(win_stat_alpha, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(win_stat_alpha, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        print("[INFO] Minimal mode: only Stationary - Alpha window (fullscreen)")
-    else:
-        WINDOW_W, WINDOW_H = 400, 300
-        for win in [win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha,
-                    win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha]:
-            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
+    WINDOW_W, WINDOW_H = 400, 300
+    for win in [win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha,
+                win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha]:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
 
-        X_START, Y_START = 50, 30
-        X_STEP, Y_STEP = 410, 340
-        cv2.moveWindow(win_stat_rec, X_START, Y_START)
-        cv2.moveWindow(win_stat_comp, X_START + X_STEP, Y_START)
-        cv2.moveWindow(win_stat_mj, X_START + 2 * X_STEP, Y_START)
-        cv2.moveWindow(win_stat_alpha, X_START + 3 * X_STEP, Y_START)
-        cv2.moveWindow(win_wrist_rec, X_START, Y_START + Y_STEP)
-        cv2.moveWindow(win_wrist_comp, X_START + X_STEP, Y_START + Y_STEP)
-        cv2.moveWindow(win_wrist_mj, X_START + 2 * X_STEP, Y_START + Y_STEP)
-        cv2.moveWindow(win_wrist_alpha, X_START + 3 * X_STEP, Y_START + Y_STEP)
+    X_START, Y_START = 50, 30
+    X_STEP, Y_STEP = 410, 340
+    cv2.moveWindow(win_stat_rec, X_START, Y_START)
+    cv2.moveWindow(win_stat_comp, X_START + X_STEP, Y_START)
+    cv2.moveWindow(win_stat_mj, X_START + 2 * X_STEP, Y_START)
+    cv2.moveWindow(win_stat_alpha, X_START + 3 * X_STEP, Y_START)
+    cv2.moveWindow(win_wrist_rec, X_START, Y_START + Y_STEP)
+    cv2.moveWindow(win_wrist_comp, X_START + X_STEP, Y_START + Y_STEP)
+    cv2.moveWindow(win_wrist_mj, X_START + 2 * X_STEP, Y_START + Y_STEP)
+    cv2.moveWindow(win_wrist_alpha, X_START + 3 * X_STEP, Y_START + Y_STEP)
 
     print("[INFO] Starting playback (q=quit, SPACE=pause, +/-=alpha). Click an OpenCV video window for key input.")
     alpha = args.alpha
@@ -642,11 +832,54 @@ def main():
                     viewer.sync()
 
                 # Re-apply stationary camera world-pose (mj_step resets data.cam_xpos).
-                # Wrist camera pose is computed by kinematics from the model-local
-                # offset set once at startup — no per-frame override needed.
                 for cam_key, cam_cfg in CAMERA_CONFIG.items():
                     if cam_cfg["config"].get("type", "stationary") == "stationary":
                         set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+
+                # Snapshot base camera poses before applying user delta
+                for cam_key in o3d_cam_user_delta:
+                    cam_name = CAMERA_CONFIG[cam_key]["mujoco_cam"]
+                    o3d_cam_base_pose[cam_key] = get_mujoco_camera_pose(model, data, cam_name)
+
+            # Apply user camera delta to MuJoCo data (every iteration, incl. paused)
+            for cam_key, delta in o3d_cam_user_delta.items():
+                if cam_key not in o3d_cam_base_pose:
+                    continue
+                cam_name = CAMERA_CONFIG[cam_key]["mujoco_cam"]
+                _cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+                adjusted = o3d_cam_base_pose[cam_key] @ delta
+                data.cam_xpos[_cid] = adjusted[:3, 3]
+                data.cam_xmat[_cid] = adjusted[:3, :3].flatten()
+
+            # Update Open3D camera pose viewer (if enabled)
+            if o3d_vis is not None and len(o3d_cam_geoms) > 0:
+                try:
+                    for cam_key, geoms in o3d_cam_geoms.items():
+                        cam_name = CAMERA_CONFIG[cam_key]["mujoco_cam"]
+                        new_pose = get_mujoco_camera_pose(model, data, cam_name)
+                        _update_frame_mesh_pose(geoms["frame"], o3d_cam_prev_pose[cam_key], new_pose)
+                        new_pts = _transform_points(new_pose, geoms["local_frustum"])
+                        geoms["frustum"].points = o3d.utility.Vector3dVector(new_pts)
+                        o3d_vis.update_geometry(geoms["frame"])
+                        o3d_vis.update_geometry(geoms["frustum"])
+                        o3d_cam_prev_pose[cam_key] = new_pose
+
+                    if not o3d_vis.poll_events():
+                        o3d_vis.destroy_window()
+                        o3d_vis = None
+                        o3d_cam_geoms = {}
+                        o3d_cam_prev_pose = {}
+                    else:
+                        o3d_vis.update_renderer()
+                except Exception as e:
+                    print(f"[WARN] Open3D viewer update failed: {e}")
+                    try:
+                        o3d_vis.destroy_window()
+                    except Exception:
+                        pass
+                    o3d_vis = None
+                    o3d_cam_geoms = {}
+                    o3d_cam_prev_pose = {}
 
             # FK comparison (site positions are already valid from mj_step)
             if ee_site is not None and not paused:
@@ -677,11 +910,7 @@ def main():
 
             # Render cameras (only stationary when --no-mujoco-view, unless saving calibration pairs)
             cam_renders = {}
-            cams_to_render = (
-                list(CAMERA_CONFIG.keys())
-                if args.save_calibration_pairs
-                else (["stationary"] if args.no_mujoco_view else list(CAMERA_CONFIG.keys()))
-            )
+            cams_to_render = list(CAMERA_CONFIG.keys())
             window_map = {
                 "stationary": (win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha),
                 "wrist": (win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha),
@@ -703,21 +932,22 @@ def main():
                 seg_renderer.update_scene(data, camera=mujoco_cam)
                 seg_mask = seg_renderer.render()
                 seg_labels = seg_mask[:, :, 0].astype(np.int32)
-                seg_labels[seg_labels == -1] = 0
+                # Note: background pixels have seg label -1; do NOT remap to 0
+                # because geom ID 0 is the robot base cylinder.
+
+                # Fix #2: shift MuJoCo render to compensate for off-center principal point
+                K_cam = camera_intrinsics[cam_key]
+                fg_bgr = shift_for_principal_point(fg_bgr, K_cam)
+                seg_labels = shift_for_principal_point(seg_labels, K_cam, seg=True)
+
                 robot_mask = np.isin(seg_labels, list(robot_geom_ids))
                 mask_uint8 = (robot_mask.astype(np.uint8)) * 255
 
                 if gaussian_available and scene_data is not None:
                     try:
-                        cc = cam_cfg["config"]
-                        if cc.get("type", "stationary") == "stationary":
-                            # Fixed camera — use calibration pose directly
-                            camera_pose = np.eye(4)
-                            camera_pose[:3, :3] = cc["cam_xmat_mj"]
-                            camera_pose[:3, 3] = cc["cam_pos_mj"]
-                        else:
-                            # Wrist camera — read kinematic world pose from MuJoCo
-                            camera_pose = get_mujoco_camera_pose(model, data, mujoco_cam)
+                        # Read camera world pose from MuJoCo data
+                        # (includes any user delta adjustments)
+                        camera_pose = get_mujoco_camera_pose(model, data, mujoco_cam)
                         w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
                         bg_im = render(w2c, camera_intrinsics[cam_key],
                                        scene_data, scene_depth_data, viz_cfg)[0]
@@ -757,7 +987,7 @@ def main():
                 }
 
             # Save calibration pairs for wrist color calibration
-            SAVE_CALIB_FRAMES = [0, 5, 10, 15, 20]
+            SAVE_CALIB_FRAMES = [0, 1, 2, 3, 4]
             if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES and "stationary" in cam_renders:
                 base_dir = Path(__file__).parent.parent / "calibration_pairs_wrist"
                 gs_dir = base_dir / "gs_renders"
@@ -783,7 +1013,7 @@ def main():
                         cv2.putText(frame, f"Alpha: {alpha:.2f}", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                     if paused:
-                        cv2.putText(frame, "PAUSED (SPACE=resume, click window first)", (10, 90),
+                        cv2.putText(frame, "PAUSED (SPACE=resume, .=step frame)", (10, 90),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             # Overlay FK plot on alpha window (bottom-left)
@@ -806,14 +1036,11 @@ def main():
                         print(f"[WARN] FK overlay failed: {e}")
 
             # Display
-            if args.no_mujoco_view:
-                cv2.imshow(win_stat_alpha, cam_renders["stationary"]["alpha"])
-            else:
-                for cam_key, (w_rec, w_mj, w_comp, w_alpha) in window_map.items():
-                    cv2.imshow(w_rec, cam_renders[cam_key]["recorded"])
-                    cv2.imshow(w_mj, cam_renders[cam_key]["mujoco"])
-                    cv2.imshow(w_comp, cam_renders[cam_key]["composite"])
-                    cv2.imshow(w_alpha, cam_renders[cam_key]["alpha"])
+            for cam_key, (w_rec, w_mj, w_comp, w_alpha) in window_map.items():
+                cv2.imshow(w_rec, cam_renders[cam_key]["recorded"])
+                cv2.imshow(w_mj, cam_renders[cam_key]["mujoco"])
+                cv2.imshow(w_comp, cam_renders[cam_key]["composite"])
+                cv2.imshow(w_alpha, cam_renders[cam_key]["alpha"])
 
             if not paused:
                 frame_idx += 1
@@ -830,6 +1057,25 @@ def main():
                 if was_paused:
                     # Advance to next frame when resuming (avoid re-processing)
                     frame_idx += 1
+            elif key == ord('.') and paused:
+                # Single-frame step: advance one frame, stay paused
+                if frame_idx + 1 < min(num_frames, video_frame_count):
+                    frame_idx += 1
+                    data.ctrl[:] = ctrl_sequence[frame_idx]
+                    sim_target = data.time + 1.0 / args.fps
+                    while data.time < sim_target:
+                        mujoco.mj_step(model, data)
+                    if viewer is not None:
+                        viewer.sync()
+                    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+                        if cam_cfg["config"].get("type", "stationary") == "stationary":
+                            set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+                    for cam_key in o3d_cam_user_delta:
+                        cam_name = CAMERA_CONFIG[cam_key]["mujoco_cam"]
+                        o3d_cam_base_pose[cam_key] = get_mujoco_camera_pose(model, data, cam_name)
+                    print(f"[INFO] Stepped to frame {frame_idx}/{num_frames}")
+                else:
+                    print("[INFO] Already at last frame")
             elif key == ord('n') and paused:
                 paused = False
                 continue
@@ -839,7 +1085,80 @@ def main():
             elif key == ord('-') or key == ord('_'):
                 alpha = max(0.0, alpha - 0.05)
                 print(f"[INFO] Alpha: {alpha:.2f}")
+            # --- Camera adjustment keys (only when Open3D cam viewer active) ---
+            elif o3d_vis is not None and len(o3d_cam_user_delta) > 0:
+                _active_key = o3d_cam_keys[o3d_active_cam_idx] if o3d_cam_keys else None
+                _ts = o3d_trans_step
+                _rs = o3d_rot_step
+                _inc = None
+                # Translation: w/s = ±Z,  a/d = ±X,  r/f = ±Y
+                if key == ord('w'):
+                    _inc = _make_cam_increment(tz=-_ts)   # -Z = forward in MuJoCo cam
+                elif key == ord('s'):
+                    _inc = _make_cam_increment(tz=_ts)
+                elif key == ord('a'):
+                    _inc = _make_cam_increment(tx=-_ts)
+                elif key == ord('d'):
+                    _inc = _make_cam_increment(tx=_ts)
+                elif key == ord('r'):
+                    _inc = _make_cam_increment(ty=_ts)
+                elif key == ord('f'):
+                    _inc = _make_cam_increment(ty=-_ts)
+                # Rotation: i/k = pitch,  j/l = yaw,  u/o = roll
+                elif key == ord('i'):
+                    _inc = _make_cam_increment(rx=_rs)
+                elif key == ord('k'):
+                    _inc = _make_cam_increment(rx=-_rs)
+                elif key == ord('j'):
+                    _inc = _make_cam_increment(ry=-_rs)
+                elif key == ord('l'):
+                    _inc = _make_cam_increment(ry=_rs)
+                elif key == ord('u'):
+                    _inc = _make_cam_increment(rz=_rs)
+                elif key == ord('o'):
+                    _inc = _make_cam_increment(rz=-_rs)
+                if _inc is not None and _active_key is not None:
+                    o3d_cam_user_delta[_active_key] = o3d_cam_user_delta[_active_key] @ _inc
+                    _t = o3d_cam_user_delta[_active_key][:3, 3]
+                    print(f"[CAM] {_active_key}: "
+                          f"Δt=[{_t[0]*1000:.1f}, {_t[1]*1000:.1f}, {_t[2]*1000:.1f}] mm")
+                # Step size control
+                if key == ord('['):
+                    o3d_trans_step = max(o3d_trans_step / 2.0, 1e-5)
+                    print(f"[CAM] Trans step: {o3d_trans_step*1000:.3f} mm")
+                elif key == ord(']'):
+                    o3d_trans_step *= 2.0
+                    print(f"[CAM] Trans step: {o3d_trans_step*1000:.3f} mm")
+                elif key == ord('1'):
+                    o3d_rot_step = max(o3d_rot_step / 2.0, 0.01)
+                    print(f"[CAM] Rot step: {o3d_rot_step:.3f} deg")
+                elif key == ord('2'):
+                    o3d_rot_step *= 2.0
+                    print(f"[CAM] Rot step: {o3d_rot_step:.3f} deg")
+                # Toggle active camera (when controlling both)
+                elif key == ord('t') and len(o3d_cam_keys) > 1:
+                    o3d_active_cam_idx = (o3d_active_cam_idx + 1) % len(o3d_cam_keys)
+                    print(f"[CAM] Active camera: {o3d_cam_keys[o3d_active_cam_idx]}")
+                # Print current delta
+                elif key == ord('p') and _active_key is not None:
+                    print(f"\n[CAM] Delta for '{_active_key}':")
+                    np.set_printoptions(precision=6, suppress=True)
+                    print(o3d_cam_user_delta[_active_key])
+                # Save delta to file
+                elif key == ord('v') and _active_key is not None:
+                    _sp = args.open3d_cam_save_path
+                    np.save(_sp, o3d_cam_user_delta[_active_key])
+                    print(f"[CAM] Saved '{_active_key}' delta → {_sp}")
+                # Reset delta
+                elif key == ord('0') and _active_key is not None:
+                    o3d_cam_user_delta[_active_key] = np.eye(4)
+                    print(f"[CAM] Reset '{_active_key}' delta to identity")
     finally:
+        if o3d_vis is not None:
+            try:
+                o3d_vis.destroy_window()
+            except Exception:
+                pass
         if viewer is not None and viewer_ctx is not None:
             viewer_ctx.__exit__(None, None, None)
         cv2.destroyAllWindows()
@@ -848,11 +1167,6 @@ def main():
     if ee_site is not None and len(trans_errors) > 0:
         trans_errors = np.array(trans_errors)
         rot_errors = np.array(rot_errors)
-
-        data_path = f"fk_comparison_ep{args.episode}.npz"
-        np.savez(data_path, trans_errors=trans_errors, rot_errors=rot_errors,
-                 fps=args.fps, episode=args.episode)
-        print(f"[INFO] Saved FK comparison data to: {data_path}")
         print(f"\n[INFO] FK Comparison Summary (End Effector):")
         print(f"       Translation: mean={np.mean(trans_errors[:, 3])*1000:.2f} mm, "
               f"max={np.max(trans_errors[:, 3])*1000:.2f} mm")

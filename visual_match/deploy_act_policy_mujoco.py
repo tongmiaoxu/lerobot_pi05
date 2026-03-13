@@ -384,7 +384,7 @@ def main():
     parser.add_argument(
         "--scene-path",
         type=str,
-        default="pointclouds/xarm7.npz",
+        default="pointclouds/xarm7_black.npz",
         help="Path to Gaussian Splatting scene file for composite rendering"
     )
     parser.add_argument(

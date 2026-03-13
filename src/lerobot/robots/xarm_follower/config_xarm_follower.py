@@ -81,7 +81,7 @@ class XarmFollowerConfig(RobotConfig):
     # Maximum joint movement per control step (radians, L2 norm across all joints).
     # At 50 Hz with max_delta=0.05, the maximum total joint velocity is ~2.5 rad/s.
     # Matches gello_software's DEFAULT_MAX_DELTA.
-    max_delta: float = 0.05
+    max_delta: float = 0.07
 
     # Control mode: "position" (default) uses set_servo_angle_j with EMA smoothing,
     # "velocity" uses vc_set_joint_velocity for streaming velocity targets.

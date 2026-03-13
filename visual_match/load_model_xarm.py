@@ -83,6 +83,12 @@ def load_model(
             model.actuator_biasprm[:7, 2] = -act_damp
             model.dof_damping[:7] = jnt_damp
 
+    # Apply high damping to mug freejoint to prevent drift during physics
+    mug_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
+    if mug_jnt_id >= 0:
+        mug_dof_addr = model.jnt_dofadr[mug_jnt_id]
+        model.dof_damping[mug_dof_addr:mug_dof_addr + 6] = 100
+
     # Load camera configs
     stationary_cfg = load_camera_config("stationary_cam")
     wrist_cfg = load_camera_config("wrist_cam")
@@ -102,6 +108,34 @@ def load_model(
     return model, data, camera_configs
 
 
+def settle_mug(model, data, max_time=3.0, vel_threshold=1e-4):
+    """Step physics until the mug freejoint velocity is near zero."""
+    import numpy as np
+
+    mug_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
+    if mug_jnt_id < 0:
+        return
+    mug_qpos_addr = model.jnt_qposadr[mug_jnt_id]
+    mug_dof_addr = model.jnt_dofadr[mug_jnt_id]
+
+    start_time = data.time
+    while data.time - start_time < max_time:
+        mujoco.mj_step(model, data)
+        vel = np.linalg.norm(data.qvel[mug_dof_addr:mug_dof_addr + 6])
+        if vel < vel_threshold:
+            break
+
+    pos = data.qpos[mug_qpos_addr:mug_qpos_addr + 3]
+    quat = data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7]
+    print(f"\n[MUG SETTLED]  time={data.time - start_time:.3f}s")
+    print(f"  pos:  {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}")
+    print(f"  quat: {quat[0]:.4f} {quat[1]:.4f} {quat[2]:.4f} {quat[3]:.4f}")
+    print(f"\n  Paste into scene.xml <body name=\"mug\" ...>:")
+    print(f"    pos=\"{pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\"")
+    print(f"\n  Paste into xarm7.xml <key name=\"home\" ...> (mug portion of qpos):")
+    print(f"    {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f} {quat[0]:.4f} {quat[1]:.4f} {quat[2]:.4f} {quat[3]:.4f}")
+
+
 def main():
     model, data, camera_configs = load_model()
 
@@ -114,6 +148,9 @@ def main():
         cam_type = cc.get("type", "stationary")
         print(f"       - {cam_key}: type={cam_type}")
 
+    print("\n[INFO] Settling mug on table (running physics)...")
+    settle_mug(model, data)
+
     # Optional: launch passive viewer
     try:
         import mujoco.viewer
@@ -121,7 +158,6 @@ def main():
         with mujoco.viewer.launch_passive(model, data) as viewer:
             while viewer.is_running():
                 mujoco.mj_step(model, data)
-                # Re-apply stationary camera pose (mj_step resets it)
                 set_mujoco_camera_from_config(
                     data, model, "stationary_cam",
                     camera_configs["stationary"]["config"]

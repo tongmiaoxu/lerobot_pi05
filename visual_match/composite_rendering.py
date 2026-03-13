@@ -114,22 +114,54 @@ except ImportError:
 
 # ===== FOREGROUND FUNCTIONS (MuJoCo) =====
 
-def get_robot_geom_ids(model):
+def get_robot_geom_ids(model, include_list=None):
     """
-    Returns geom IDs belonging to the xArm robot (all mesh geoms) and the cube.
-    Excludes floor and primitive geoms (cylinder base, etc.).
+    Returns geom IDs belonging to the xArm robot (all mesh geoms, base cylinder).
+    Optionally include mug, sticker, table based on include_list.
+    Args:
+        model: MuJoCo model
+        include_list: [mug, sticker, table] (1=include, 0=exclude)
     """
+    # Default: exclude all
+    if include_list is None:
+        include_list = [1, 1, 1]
+    mug_flag, sticker_flag, table_flag = include_list
+    # Build exclusion set
+    EXCLUDE_GEOMS = set()
+    if not mug_flag:
+        EXCLUDE_GEOMS.add("mug")
+    if not sticker_flag:
+        EXCLUDE_GEOMS.add("sticker")
+    if not table_flag:
+        EXCLUDE_GEOMS.add("table")
+
     robot_geom_ids = set()
+    # Hide excluded geoms (mesh or box) by setting alpha to 0
     for geom_id in range(model.ngeom):
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if geom_name in EXCLUDE_GEOMS:
+            model.geom_rgba[geom_id, 3] = 0.0  # fully transparent
+            continue
         if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH:
             robot_geom_ids.add(geom_id)
-    # Also include the cube as foreground
-    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube")
-    sticker_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "sticker")
-    if cube_id != -1:
-        robot_geom_ids.add(cube_id)
-    if sticker_id != -1:
-        robot_geom_ids.add(sticker_id)
+    # Also check for box geoms (e.g. sticker)
+    for geom_id in range(model.ngeom):
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if geom_name in EXCLUDE_GEOMS:
+            continue
+        if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_BOX:
+            robot_geom_ids.add(geom_id)
+    # Include robot base cylinder (white cylinder at origin)
+    for geom_id in range(model.ngeom):
+        if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+            if not geom_name:
+                robot_geom_ids.add(geom_id)
+    # Optionally include table as foreground object
+    if table_flag:
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table")
+        if geom_id != -1:
+            robot_geom_ids.add(geom_id)
     return robot_geom_ids
 
 
@@ -154,6 +186,41 @@ def mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj):
     w2c = P_gs_cam @ transform_matrix
     w2c = np.linalg.inv(w2c)
     return w2c
+
+
+def shift_for_principal_point(image, intrinsics, seg=False):
+    """Shift a MuJoCo render to compensate for off-center principal point.
+
+    MuJoCo always renders with the principal point at the image center
+    (w/2, h/2).  The real camera has (cx, cy) which may differ by a few
+    pixels.  This function translates the rendered image by
+    (cx - w/2, cy - h/2) so that it aligns with a renderer that uses the
+    true intrinsics (e.g. Gaussian Splatting).
+
+    Args:
+        image: H×W or H×W×C numpy array (uint8 or int32).
+        intrinsics: 3×3 camera matrix with fx, fy, cx, cy.
+        seg: If True, use nearest-neighbour interpolation (for
+             segmentation labels); otherwise bilinear (for RGB).
+
+    Returns:
+        Shifted image of the same shape and dtype.
+    """
+    h, w = image.shape[:2]
+    cx = intrinsics[0, 2]
+    cy = intrinsics[1, 2]
+    tx = cx - w / 2.0
+    ty = cy - h / 2.0
+    # Skip if the shift is negligible (<0.05 px)
+    if abs(tx) < 0.05 and abs(ty) < 0.05:
+        return image
+    M = np.float32([[1, 0, tx],
+                    [0, 1, ty]])
+    flags = cv2.INTER_NEAREST if seg else cv2.INTER_LINEAR
+    border = cv2.BORDER_REPLICATE if not seg else cv2.BORDER_CONSTANT
+    shifted = cv2.warpAffine(image, M, (w, h), flags=flags,
+                             borderMode=border, borderValue=0)
+    return shifted
 
 
 # xArm: single stationary camera
@@ -346,8 +413,21 @@ def rgbd2pcd(color, depth, w2c, intrinsics, cfg):
 class InteractiveCompositeViewer:
     """
     Interactive viewer for composite MuJoCo + Gaussian Splatting rendering.
-    Allows mouse drag/rotate to change camera view and re-renders in real-time.
+
+    Uses **matplotlib** with three independent subplots so each panel can be
+    zoomed / panned individually via the mouse scroll-wheel.
+
+    Controls
+    --------
+    * **Left-drag** on any panel        → rotate the 3-D camera  (all panels update)
+    * **Middle-drag** on any panel      → pan the 3-D camera     (all panels update, like Open3D)
+    * **Right-drag** on any panel       → pan the 3-D camera     (all panels update)
+    * **Scroll-wheel**                  → zoom 3-D camera forward/backward (all panels update)
+    * **r**                            → reset camera + reset all zoom levels
+    * **s**                            → save current views to ``images/``
+    * **q**                            → quit
     """
+
     def __init__(self, model, data, renderer, seg_renderer, scene_data, scene_depth_data,
                  viz_cfg, k, camera_intrinsics, target_geom_ids, cam_name, T_splat2mj):
         self.model = model
@@ -364,16 +444,56 @@ class InteractiveCompositeViewer:
         self.T_splat2mj = T_splat2mj
 
         self.camera_pose = self._get_initial_camera_pose()
-        self.mouse_dragging = False
-        self.last_mouse_pos = None
 
-        self.window_name = "Interactive Composite View (Drag to rotate, Right-drag to pan, Scroll to zoom)"
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.window_name, 1920, 1080)
-        cv2.setMouseCallback(self.window_name, self._mouse_callback)
+        # Image dimensions (for zoom clamping)
+        self._img_w = viz_cfg['viz_w']
+        self._img_h = viz_cfg['viz_h']
 
+        # Mouse-drag state
+        self._dragging = False
+        self._drag_button = None
+        self._last_xy = None
+
+        # ---- Disable default matplotlib key bindings that clash with ours ----
+        for key_list_name in ('keymap.save', 'keymap.quit', 'keymap.quit_all',
+                              'keymap.fullscreen', 'keymap.home', 'keymap.back',
+                              'keymap.forward', 'keymap.pan', 'keymap.zoom'):
+            try:
+                plt.rcParams[key_list_name] = []
+            except KeyError:
+                pass
+
+        # ---- Create figure with three subplots ----
+        self.fig, self.axes = plt.subplots(1, 3, figsize=(18, 6))
+        self.fig.canvas.manager.set_window_title(
+            "Interactive Composite Viewer  |  Drag=rotate  Right-drag=pan  Scroll=zoom-panel  r=reset  +/-=alpha  q=quit")
+        titles = ["MuJoCo Foreground", "Gaussian Background", "Alpha Blend (α=0.50)"]
+        for ax, title in zip(self.axes, titles):
+            ax.set_title(title)
+            ax.axis('off')
+
+        # Alpha-blend factor for the third panel (0=background only, 1=robot only)
+        self._blend_alpha = 0.5
+
+        # Handles for imshow images (set on first render)
+        self._im_handles = [None, None, None]
+
+        # ---- Connect matplotlib events ----
+        self._cids = [
+            self.fig.canvas.mpl_connect('button_press_event',  self._on_press),
+            self.fig.canvas.mpl_connect('button_release_event', self._on_release),
+            self.fig.canvas.mpl_connect('motion_notify_event', self._on_motion),
+            self.fig.canvas.mpl_connect('scroll_event',        self._on_scroll),
+            self.fig.canvas.mpl_connect('key_press_event',     self._on_key),
+        ]
+
+        # Initial render
         self._render_and_display()
+        plt.tight_layout()
 
+    # ------------------------------------------------------------------
+    # Camera helpers
+    # ------------------------------------------------------------------
     def _get_initial_camera_pose(self):
         """Get camera pose from calibration (already set on data)."""
         cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.cam_name)
@@ -384,41 +504,82 @@ class InteractiveCompositeViewer:
         camera_pose[:3, 3] = camera_xpos
         return camera_pose
 
-    def _mouse_callback(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.mouse_dragging = True
-            self.last_mouse_pos = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.mouse_dragging = False
-            self.last_mouse_pos = None
-        elif event == cv2.EVENT_MOUSEMOVE and self.mouse_dragging:
-            if self.last_mouse_pos is not None:
-                dx = x - self.last_mouse_pos[0]
-                dy = y - self.last_mouse_pos[1]
-                self._rotate_camera(dx, dy)
-                self.last_mouse_pos = (x, y)
-                self._render_and_display()
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            self.mouse_dragging = True
-            self.last_mouse_pos = (x, y)
-        elif event == cv2.EVENT_RBUTTONUP:
-            self.mouse_dragging = False
-            self.last_mouse_pos = None
-        elif event == cv2.EVENT_MOUSEMOVE and self.mouse_dragging and flags & cv2.EVENT_FLAG_RBUTTON:
-            if self.last_mouse_pos is not None:
-                dx = x - self.last_mouse_pos[0]
-                dy = y - self.last_mouse_pos[1]
-                self._pan_camera(dx, dy)
-                self.last_mouse_pos = (x, y)
-                self._render_and_display()
-        elif event == cv2.EVENT_MOUSEWHEEL:
-            delta = (flags >> 16)
-            if delta > 32767:
-                delta -= 65536
-            zoom_factor = 1.0 + np.clip((delta / 120.0) * 0.02, -0.1, 0.1)
-            self._zoom_camera(zoom_factor)
+    # ------------------------------------------------------------------
+    # Matplotlib event callbacks
+    # ------------------------------------------------------------------
+    def _on_press(self, event):
+        if event.inaxes is None:
+            return
+        if event.button in (1, 2, 3):       # left / middle / right
+            self._dragging = True
+            self._drag_button = event.button
+            self._last_xy = (event.x, event.y)   # display-pixel coords
+
+    def _on_release(self, event):
+        self._dragging = False
+        self._drag_button = None
+        self._last_xy = None
+
+    def _on_motion(self, event):
+        if not self._dragging or self._last_xy is None:
+            return
+        dx = event.x - self._last_xy[0]
+        dy = event.y - self._last_xy[1]
+        self._last_xy = (event.x, event.y)
+
+        if self._drag_button == 1:              # left = rotate 3-D camera
+            self._rotate_camera(dx, dy)
+            self._render_and_display()
+        elif self._drag_button in (2, 3):       # middle or right = pan 3-D camera
+            self._pan_camera(dx, dy)
             self._render_and_display()
 
+    def _on_scroll(self, event):
+        """Zoom by moving the 3-D camera along its viewing direction.
+
+        Scroll-up  → move camera forward  (zoom in).
+        Scroll-down → move camera backward (zoom out).
+        Same convention as Open3D / most 3-D viewers.
+        All three panels update together.
+        """
+        if event.button == 'up':
+            zoom_factor = 1.1   # move toward scene
+        else:
+            zoom_factor = 0.9   # move away from scene
+
+        forward = -self.camera_pose[:3, 2]          # camera looks along -Z
+        zoom_amount = (zoom_factor - 1.0)            # +0.1 or -0.1
+        self.camera_pose[:3, 3] += forward * zoom_amount
+        self._render_and_display()
+
+    def _on_key(self, event):
+        if event.key == 'q':
+            plt.close(self.fig)
+        elif event.key == 'r':
+            self.camera_pose = self._get_initial_camera_pose()
+            # Reset zoom on all subplots to full image
+            for ax in self.axes:
+                ax.set_xlim(-0.5, self._img_w - 0.5)
+                ax.set_ylim(self._img_h - 0.5, -0.5)
+            self._render_and_display()
+        elif event.key == 's':
+            self._save_views()
+        elif event.key in ('+', '='):   # increase robot opacity
+            self._blend_alpha = min(1.0, self._blend_alpha + 0.05)
+            self._update_blend_title()
+            self._render_and_display()
+        elif event.key == '-':          # decrease robot opacity
+            self._blend_alpha = max(0.0, self._blend_alpha - 0.05)
+            self._update_blend_title()
+            self._render_and_display()
+
+    def _update_blend_title(self):
+        self.axes[2].set_title(f"Alpha Blend (α={self._blend_alpha:.2f})")
+        self.fig.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # 3-D camera manipulation  (affects all three panels)
+    # ------------------------------------------------------------------
     def _rotate_camera(self, dx, dy):
         rot_speed = 0.01
         angle_x = -dy * rot_speed
@@ -438,12 +599,9 @@ class InteractiveCompositeViewer:
         translation = (right * dx * pan_speed) - (up * dy * pan_speed)
         self.camera_pose[:3, 3] += translation
 
-    def _zoom_camera(self, zoom_factor):
-        forward = -self.camera_pose[:3, 2]
-        zoom_speed = 0.05
-        translation = forward * (zoom_factor - 1.0) * zoom_speed
-        self.camera_pose[:3, 3] += translation
-
+    # ------------------------------------------------------------------
+    # Rendering helpers
+    # ------------------------------------------------------------------
     def _render_mujoco_rgb_and_geomseg_from_pose(self, camera_pose_c2w):
         cam_pos = camera_pose_c2w[:3, 3]
         cam_rot_c2w = camera_pose_c2w[:3, :3]
@@ -465,14 +623,20 @@ class InteractiveCompositeViewer:
         self.seg_renderer.update_scene(self.data, camera=cam_id)
         seg = self.seg_renderer.render()
         seg_labels = seg[:, :, 0].astype(np.int32)
-        seg_labels[seg_labels == -1] = 0
+        # Note: background pixels have seg label -1; do NOT remap to 0
+        # because geom ID 0 is the robot base cylinder.
+
+        # Compensate for off-center principal point (MuJoCo assumes centered)
+        fg_bgr = shift_for_principal_point(fg_bgr, self.camera_intrinsics)
+        seg_labels = shift_for_principal_point(seg_labels, self.camera_intrinsics, seg=True)
 
         self.data.cam_xpos[cam_id] = original_pos
         self.data.cam_xmat[cam_id] = original_mat
 
         return fg_bgr, seg_labels
 
-    def _render_and_display(self):
+    def _compute_views(self):
+        """Render all three views and return them as RGB numpy arrays."""
         fg_image_bgr, seg_labels = self._render_mujoco_rgb_and_geomseg_from_pose(self.camera_pose)
 
         robot_mask_binary = np.isin(seg_labels, list(self.target_geom_ids))
@@ -491,79 +655,65 @@ class InteractiveCompositeViewer:
         w2c_bg = w2c_bg @ transform_matrix
         w2c_bg = np.linalg.inv(w2c_bg)
 
-        bg_im, depth, sil = render(w2c_bg, self.k, self.scene_data, self.scene_depth_data, self.viz_cfg)
+        bg_im, depth, sil = render(w2c_bg, self.k, self.scene_data,
+                                   self.scene_depth_data, self.viz_cfg)
 
         bg_im_np = bg_im.permute(1, 2, 0).cpu().numpy()
         bg_im_np = (bg_im_np * 255).astype(np.uint8)
-        bg_im_np = cv2.cvtColor(bg_im_np, cv2.COLOR_RGB2BGR)
 
-        composite = bg_im_np.copy()
-        composite[mask_uint8 > 0] = foreground_masked[mask_uint8 > 0]
+        # Alpha blend (work in BGR, then convert everything to RGB for matplotlib)
+        bg_bgr = cv2.cvtColor(bg_im_np, cv2.COLOR_RGB2BGR)
+        alpha = self._blend_alpha
+        mask_bool = mask_uint8 > 0
+        composite_bgr = bg_bgr.copy()
+        composite_bgr[mask_bool] = (
+            alpha * foreground_masked[mask_bool].astype(np.float32)
+            + (1.0 - alpha) * bg_bgr[mask_bool].astype(np.float32)
+        ).clip(0, 255).astype(np.uint8)
 
-        h, w = composite.shape[:2]
-        display_height = 480
-        display_width = int(w * display_height / h)
+        fg_rgb = cv2.cvtColor(fg_image_bgr, cv2.COLOR_BGR2RGB)
+        bg_rgb = bg_im_np  # already RGB
+        composite_rgb = cv2.cvtColor(composite_bgr, cv2.COLOR_BGR2RGB)
 
-        fg_resized = cv2.resize(fg_image_bgr, (display_width, display_height))
-        bg_resized = cv2.resize(bg_im_np, (display_width, display_height))
-        comp_resized = cv2.resize(composite, (display_width, display_height))
+        return fg_rgb, bg_rgb, composite_rgb, fg_image_bgr, bg_bgr, composite_bgr
 
-        side_by_side = np.hstack([fg_resized, bg_resized, comp_resized])
-        cv2.putText(side_by_side, "MuJoCo Foreground", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(side_by_side, "Gaussian Background", (display_width + 10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(side_by_side, "Composite", (2 * display_width + 10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    def _render_and_display(self):
+        fg_rgb, bg_rgb, composite_rgb, _, _, _ = self._compute_views()
+        images = [fg_rgb, bg_rgb, composite_rgb]
 
-        cv2.imshow(self.window_name, side_by_side)
+        for i, (ax, img) in enumerate(zip(self.axes, images)):
+            if self._im_handles[i] is None:
+                self._im_handles[i] = ax.imshow(img)
+            else:
+                self._im_handles[i].set_data(img)
 
+        self.fig.canvas.draw_idle()
+
+    def _save_views(self):
+        _, _, _, fg_bgr, bg_bgr, composite_bgr = self._compute_views()
+        os.makedirs("images", exist_ok=True)
+        timestamp = int(time.time())
+        cv2.imwrite(f"images/xarm_fg_{timestamp}.png", fg_bgr)
+        cv2.imwrite(f"images/xarm_bg_{timestamp}.png", bg_bgr)
+        cv2.imwrite(f"images/xarm_composite_{timestamp}.png", composite_bgr)
+        print(f"Saved: xarm_fg_{timestamp}.png, xarm_bg_{timestamp}.png, "
+              f"xarm_composite_{timestamp}.png")
+
+    # ------------------------------------------------------------------
     def run(self):
         print("\n=== Interactive Composite Viewer (xArm) ===")
         print("Controls:")
-        print("  - Left mouse drag: Rotate camera")
-        print("  - Right mouse drag: Pan camera")
-        print("  - Mouse wheel: Zoom in/out")
-        print("  - Press 'q' to quit")
-        print("  - Press 'r' to reset camera")
-        print("  - Press 's' to save current view")
+        print("  - Left mouse drag  : Rotate 3-D camera (all panels update)")
+        print("  - Middle-click drag: Pan 3-D camera    (all panels update, like Open3D)")
+        print("  - Right mouse drag : Pan 3-D camera    (all panels update)")
+        print("  - Scroll wheel     : Move camera forward/backward (all panels update)")
+        print("  - Press 'r'        : Reset camera & zoom")
+        print("  - Press 's'        : Save current views")
+        print("  - Press '+'/'-'    : Increase/decrease robot alpha in blend panel")
+        print("  - Press 'q'        : Quit")
         print("=============================================\n")
 
-        while True:
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('r'):
-                self.camera_pose = self._get_initial_camera_pose()
-                self._render_and_display()
-            elif key == ord('s'):
-                fg_image_bgr, seg_labels = self._render_mujoco_rgb_and_geomseg_from_pose(self.camera_pose)
-                robot_mask_binary = np.isin(seg_labels, list(self.target_geom_ids))
-                mask_uint8 = (robot_mask_binary.astype(np.uint8)) * 255
-                foreground_masked = cv2.bitwise_and(fg_image_bgr, fg_image_bgr, mask=mask_uint8)
-
-                P_mj_cam = self.camera_pose.copy()
-                T_mj2splat = np.linalg.inv(self.T_splat2mj)
-                P_gs_cam = T_mj2splat @ P_mj_cam
-                w2c_bg = P_gs_cam
-                transform_matrix = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-                w2c_bg = w2c_bg @ transform_matrix
-                w2c_bg = np.linalg.inv(w2c_bg)
-                bg_im, depth, sil = render(w2c_bg, self.k, self.scene_data, self.scene_depth_data, self.viz_cfg)
-                bg_im_np = bg_im.permute(1, 2, 0).cpu().numpy()
-                bg_im_np = (bg_im_np * 255).astype(np.uint8)
-                bg_im_np = cv2.cvtColor(bg_im_np, cv2.COLOR_RGB2BGR)
-                composite = bg_im_np.copy()
-                composite[mask_uint8 > 0] = foreground_masked[mask_uint8 > 0]
-
-                os.makedirs("images", exist_ok=True)
-                timestamp = int(time.time())
-                cv2.imwrite(f"images/xarm_fg_{timestamp}.png", fg_image_bgr)
-                cv2.imwrite(f"images/xarm_bg_{timestamp}.png", bg_im_np)
-                cv2.imwrite(f"images/xarm_composite_{timestamp}.png", composite)
-                print(f"Saved: xarm_fg_{timestamp}.png, xarm_bg_{timestamp}.png, xarm_composite_{timestamp}.png")
-
-        cv2.destroyAllWindows()
+        plt.show()   # enters matplotlib event loop; returns when window is closed
 
 
 # ===== MAIN =====
@@ -578,6 +728,16 @@ def main():
 
     im_height = 480
     im_width = 640
+
+    # Override MuJoCo fovy to match the real camera intrinsics exactly.
+    # MuJoCo uses a symmetric projection so we can only match fy, not cx/cy offset.
+    fy = REALSENSE_INTRINSICS_640x480[1, 1]
+    correct_fovy_deg = float(2.0 * np.degrees(np.arctan(im_height / (2.0 * fy))))
+    cam_id_tmp = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, xarm_cam_name)
+    old_fovy = model.cam_fovy[cam_id_tmp]
+    model.cam_fovy[cam_id_tmp] = correct_fovy_deg
+    print(f"Corrected MuJoCo fovy: {old_fovy:.2f}° → {correct_fovy_deg:.2f}° "
+          f"(from fy={fy:.3f}, h={im_height})")
 
     global renderer
     renderer = mujoco.Renderer(model, height=im_height, width=im_width)
@@ -598,7 +758,7 @@ def main():
     prompt = "Pick up the cube"
 
     # ----- Setup background (3DGS) -----
-    scene_path = "pointclouds/xarm7.npz"
+    scene_path = "pointclouds/xarm7_black.npz"
     cam_name = xarm_cam_name
 
     viz_cfg = {
@@ -613,12 +773,15 @@ def main():
         'show_sil': False
     }
 
-    # Use real RealSense D455 intrinsics (serial 246322303954)
+    # Use intrinsics from config (stationary_cam.json)
     k = REALSENSE_INTRINSICS_640x480.copy()
-    print(f"Using RealSense D455 intrinsics (serial 246322303954):")
+    serial = _stationary_cfg.get("serial_number", "N/A")
+    print(f"Using stationary_cam intrinsics (serial {serial}):")
     print(f"  fx={k[0,0]:.3f}, fy={k[1,1]:.3f}, cx={k[0,2]:.3f}, cy={k[1,2]:.3f}")
 
-    w2c_bg_init, _ = load_camera(viz_cfg, scene_path)
+    # Use calibrated camera pose for w2c_init (not from npz, which may have old camera baked in)
+    init_pose = get_mujoco_camera_pose(model, data, xarm_cam_name)
+    w2c_bg_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
 
     scene_data, scene_depth_data, all_w2cs = load_scene_data(scene_path, w2c_bg_init, k)
     scene_radius = torch.norm(scene_data['means3D'], dim=1).median()
@@ -644,11 +807,16 @@ def main():
             fg_image = renderer.render()
             fg_image_bgr = cv2.cvtColor(fg_image, cv2.COLOR_RGB2BGR)
 
+            # Compensate for off-center principal point (MuJoCo assumes centered)
+            fg_image_bgr = shift_for_principal_point(fg_image_bgr, k)
+
             # (2) Get segmentation mask and extract foreground (robot)
             seg_renderer.update_scene(data, camera=cam_name)
             seg_mask = seg_renderer.render()
             seg_labels = seg_mask[:, :, 0]
-            seg_labels[seg_labels == -1] = 0
+            # Note: background pixels have seg label -1; do NOT remap to 0
+            # because geom ID 0 is the robot base cylinder.
+            seg_labels = shift_for_principal_point(seg_labels.astype(np.int32), k, seg=True)
             robot_mask_binary = np.isin(seg_labels, list(target_geom_ids))
             mask_uint8 = (robot_mask_binary.astype(np.uint8)) * 255
             foreground_masked = cv2.bitwise_and(fg_image_bgr, fg_image_bgr, mask=mask_uint8)

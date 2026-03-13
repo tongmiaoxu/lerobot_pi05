@@ -6,7 +6,7 @@ import copy
 
 # Filenames: segmented point clouds for ICP alignment (cleaner alignment, less noise)
 SEGMENTED_TARGET_FILE = "pointclouds/output.pcd"   # moving: MuJoCo segmented robot
-SEGMENTED_SOURCE_FILE = "pointclouds/xarm7_robot.ply"   # fixed: Gaussian Splatting segmented robot
+SEGMENTED_SOURCE_FILE = "pointclouds/xarm7_robot_black.ply"   # fixed: Gaussian Splatting segmented robot
 
 # Filenames: original/full point clouds for visualization (to verify alignment on full scene)
 ORIGINAL_TARGET_FILE = "pointclouds/output.pcd"   # original MuJoCo full scene (from camera render)

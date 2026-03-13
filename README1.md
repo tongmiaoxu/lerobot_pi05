@@ -36,7 +36,7 @@ lerobot-record \
     --robot.ip=192.168.1.228 \
     --teleop.type=gello_leader \
     --teleop.port=/dev/ttyUSB0 \
-    --dataset.repo_id=tongmiao/xarm_pick_cube \
+    --dataset.repo_id=tongmiao/xarm_pick_mug \
     --dataset.single_task="Pick up the cube" \
     --dataset.num_episodes=20 \
     --dataset.fps=30 \
@@ -70,7 +70,7 @@ python tools/gello_get_offset.py --port /dev/ttyUSB0 --use-gello-software-offset
 
 ### Point Cloud of xArm (ground truth from MuJoCo model → PCD)
 ```bash
-python tools/get_xarm_pointcloud.py --points-per-mesh 100000
+python tools/get_xarm_pointcloud.py --points-per-mesh 10000
 ```
 
 ### Interactive Composite rendering
@@ -97,28 +97,34 @@ python visual_match/compare_recorded_vs_mujoco.py --no-mujoco-view
 python visual_match/load_model_xarm.py
 ```
 
+### extract initial states
+```bash
+python visual_match/initial_states_overlay.py
+```
+
 ### Policy Training for xarm
 ```bash
 lerobot-train \
   --policy.type=act \
   --policy.device=cuda \
   --policy.push_to_hub=false \
-  --dataset.repo_id=tongmiao/xarm_pick_cube \
+  --dataset.repo_id=tongmiao/xarm_pick_mug \
   --dataset.root=data \
   --output_dir=./outputs/act_xarm_training \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --batch_size=8 \
   --steps=80000 \
+  --save_freq=20000 \
   --wandb.enable=true \
   --wandb.project=xarm_pick_mug_lerobot0.4.3 \
   --dataset.image_transforms.enable=true
-```
+
 ```bash
 lerobot-train \
   --policy.type=diffusion \
   --policy.device=cuda \
   --policy.push_to_hub=false \
-  --dataset.repo_id=tongmiao/xarm_pick_cube \
+  --dataset.repo_id=tongmiao/xarm_pick_mug \
   --dataset.root=data \
   --output_dir=./outputs/diffusion_xarm_training \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
@@ -140,16 +146,17 @@ lerobot-train \
   --policy.gradient_checkpointing=true \
   --policy.dtype=bfloat16 \
   --policy.train_expert_only=true \
-  --dataset.repo_id=tongmiao/xarm_pick_cube \
+  --dataset.repo_id=tongmiao/xarm_pick_mug \
   --dataset.root=data \
   --output_dir=./outputs/pi05_xarm_training \
-  --batch_size=8 \
-  --steps=10000 \
+  --batch_size=16 \
+  --steps=30000 \
+  --save_freq=10000 \
   --wandb.enable=true \
   --wandb.project=xarm_pick_mug_lerobot0.4.3
 ```
 ```bash
-accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_cube \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=xarm_pick_mug_lerobot0.4.3
+accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_mug \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=xarm_pick_mug_lerobot0.4.3
 ```
 
 ### Policy Deployment for xarm
@@ -159,8 +166,8 @@ lerobot-record \
   --robot.ip=192.168.1.228 \
   --teleop.type=gello_leader \
   --teleop.port=/dev/ttyUSB0 \
-  --policy.path=outputs/pi05_xarm_training/checkpoints/001000/pretrained_model \
-  --dataset.repo_id=tongmiao/eval_xarm_pick_cube \
+  --policy.path=outputs/act_xarm_training/checkpoints/last/pretrained_model \
+  --dataset.repo_id=tongmiao/eval_xarm_pick_mug \
   --dataset.single_task="Pick up the cube" \
   --dataset.num_episodes=10 \
   --dataset.fps=30 \
@@ -177,22 +184,37 @@ python visual_match/deploy_act_policy_mujoco.py --obs
 python visual_match/sticker_alpha_calibration.py --cube 
 ```
 
-### Wrist color calibration (sim → real)
-1. **Save calibration pairs** from replay (frames 0,5,10,15,20):
+### Workflow
+Workflow:  gaussian splatting -> point cloud alignment-> camera calibration -> data collection -> color alignment -> dynamics matching
+
+Run point cloud alignment:(saved to icp_transform.npy)
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
+python tools/icp_register.py
 ```
-2. **Run calibration** to learn affine transforms:
+To munaully adjust icp result:
+```bash
+python tools/VisualizedAlignemnt.py
+```
+
+**adjust object position for color alignment** (press + to increase simulation blending)(arrows with w and s )
+```bash
+python visual_match/sticker_alpha_calibration.py --mug --sticker --table
+```
+**Save calibration pairs** from replay (frames 0,1,2,3,4) (press space to pause)
+```bash
+python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs --dataset-path data_color
+```
+**Run calibration** to learn affine transforms:
 ```bash
 python visual_match/calibrate_color_wrist.py
 ```
-3. **Verify**: check `calibration_pairs_wrist/calibrated/combined_*.png` (sim | real | calibrated side-by-side).
+ **Verify**: check `calibration_pairs_wrist/calibrated/combined_*.png` (sim | real | calibrated side-by-side).
 
-4. **implement**: color calibration during replay: 
+ **implement**: color calibration during replay: 
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --color-calibrate
 ```
-5.**deployment**:
+**deployment**:
 ```bash
 python visual_match/deploy_act_policy_mujoco.py --color-calib-path
 ```
