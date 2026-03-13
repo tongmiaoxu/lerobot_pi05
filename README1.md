@@ -73,7 +73,7 @@ python tools/gello_get_offset.py --port /dev/ttyUSB0 --use-gello-software-offset
 python tools/get_xarm_pointcloud.py --points-per-mesh 10000
 ```
 
-### Interactive Composite rendering
+### Interactive Composite rendering (you can change whether to include the object in the foreground here)
 ```bash
 python visual_match/composite_rendering.py 
 ```
@@ -185,7 +185,7 @@ python visual_match/sticker_alpha_calibration.py --cube
 ```
 
 ### Workflow
-Workflow:  gaussian splatting -> point cloud alignment-> camera calibration -> data collection -> color alignment -> dynamics matching
+Workflow:  gaussian splatting -> point cloud alignment-> camera calibration -> data collection -> composite rendering-> color alignment -> dynamics matching
 
 Run point cloud alignment:(saved to icp_transform.npy)
 ```bash
@@ -195,7 +195,10 @@ To munaully adjust icp result:
 ```bash
 python tools/VisualizedAlignemnt.py
 ```
-
+load camera config:
+```bash
+python tools/load_camera_config.py
+```
 **adjust object position for color alignment** (press + to increase simulation blending)(arrows with w and s )
 ```bash
 python visual_match/sticker_alpha_calibration.py --mug --sticker --table
