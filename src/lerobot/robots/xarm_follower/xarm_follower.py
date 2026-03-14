@@ -69,6 +69,10 @@ class XarmFollower(Robot):
         self._current_joints: np.ndarray | None = None
         self._current_gripper: float = 0.0
         self._prev_command: np.ndarray | None = None
+        # Offset between GELLO's initial pose and xArm's current pose.
+        # Computed on the first send_action call so the robot stays put
+        # until the operator actually moves the GELLO.
+        self._action_offset: np.ndarray | None = None
 
     @property
     def _joint_names(self) -> list[str]:
@@ -269,6 +273,16 @@ class XarmFollower(Robot):
                 target = self._target_joints.copy()
                 gripper_cmd = self._target_gripper
 
+            # # --- Safety: clamp target so joint delta doesn't exceed max_delta ---
+            delta = target - current
+            delta_norm = np.linalg.norm(delta)
+            if delta_norm > self.config.max_delta:
+                logger.warning(
+                    f"Joint delta {delta_norm:.4f} rad exceeds max_delta "
+                    f"{self.config.max_delta:.4f}, clamping."
+                )
+                target = current + delta * (self.config.max_delta / delta_norm)
+
             try:
                 if self.config.control_mode == "velocity":
                     # Velocity control: send (target - current) as velocity
@@ -377,12 +391,30 @@ class XarmFollower(Robot):
         """
         Set the target joint positions. The background control thread will
         smoothly move the xArm toward this target.
+
+        On the first call an offset is computed between the incoming GELLO
+        position and the xArm's current position.  This offset is subtracted
+        from every subsequent command so the robot stays in place until the
+        operator actually moves the GELLO.
         """
         goal_deg = []
         for i in range(self.config.dof):
             goal_deg.append(action.get(f"joint{i+1}.pos", 0.0))
 
         goal_rad = np.deg2rad(goal_deg)
+
+        # First call: compute offset so robot doesn't jump to GELLO's pose
+        if self._action_offset is None:
+            with self._state_lock:
+                current = self._current_joints.copy() if self._current_joints is not None else goal_rad
+            self._action_offset = goal_rad - current
+            logger.info(
+                f"Action offset initialised (max {np.rad2deg(np.max(np.abs(self._action_offset))):.1f}°). "
+                f"Robot will stay in place until GELLO moves."
+            )
+
+        # Subtract offset: target = gello_pos - offset  =  xarm_start + gello_delta
+        goal_rad = goal_rad - self._action_offset
 
         with self._target_lock:
             self._target_joints = goal_rad

@@ -134,7 +134,8 @@ lerobot-train \
   --policy.horizon=64 \
   --policy.n_action_steps=50 \
   --batch_size=64 \
-  --steps=7000
+  --save_freq=2000
+  --steps=8000
 ```
 ```bash
 lerobot-train \
@@ -173,7 +174,8 @@ lerobot-record \
   --dataset.fps=30 \
   --dataset.root=data_eval \
   --dataset.push_to_hub=false \
-  --policy.pretrained_path=lerobot/pi05_base
+  --policy.pretrained_path=lerobot/pi05_base \
+  --select=true
 ```
 ### Policy rollout in Simulation for xarm (--obs means replace obs with real world images)
 ```bash
@@ -217,9 +219,9 @@ python visual_match/calibrate_color_wrist.py
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --color-calibrate
 ```
-**deployment**:
+**deployment**:(use --select to select windows for different distributions)
 ```bash
-python visual_match/deploy_act_policy_mujoco.py --color-calib-path
+python visual_match/deploy_act_policy_mujoco.py --color-calibrate --select
 ```
 
 
@@ -231,4 +233,12 @@ or
 ```bash
 sudo usermod -aG dialout $USER
 reboot
+```
+
 ```bash
+python tools/query_gemini.py     --pairs         calibration_pairs_wrist2/gs_renders/frame_0001.png         calibration_pairs_wrist2/real_captures/frame_0001.png         calibration_pairs_wrist2/gs_renders/frame_0002.png         calibration_pairs_wrist2/real_captures/frame_0002.png     --query calibration_pairs_wrist/gs_renders/frame_0003.png     -o predicted_real_frame_0003.png
+Few-shot mode: 2 example pair(s), query=calibration_pairs_wrist/gs_renders/frame_0003.png
+  Response contained 1 image(s), using the last one.
+Saved: predicted_real_frame_0003.png
+  Overlay saved: predicted_real_frame_0003_overlay.png
+```
