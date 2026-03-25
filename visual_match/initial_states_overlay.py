@@ -135,7 +135,32 @@ def _filter_mask_by_neighbor_centroids(mask, neighbor_centroids):
     # Compute reference point from nearby episodes
     valid_neighbors = [c for c in neighbor_centroids if c is not None]
     if not valid_neighbors:
-        return mask                # no neighbours yet – keep full mask
+        # Interactive selection if multiple components and no neighbors
+        
+        n_components, labels = cv2.connectedComponents(mask.astype(np.uint8))
+        if n_components <= 2:
+            return mask
+        # Show all components and let user pick one
+        display = np.zeros((*mask.shape, 3), dtype=np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for lbl in range(1, n_components):
+            color = tuple(int(x) for x in np.random.randint(0, 255, 3))
+            display[labels == lbl] = color
+            # Find centroid for label
+            ys, xs = np.where(labels == lbl)
+            if len(xs) > 0 and len(ys) > 0:
+                cx, cy = int(xs.mean()), int(ys.mean())
+                cv2.putText(display, str(lbl), (cx, cy), font, 1, (255,255,255), 2, cv2.LINE_AA)
+        cv2.imshow("Select component: press 1, 2, ...", display)
+        print(f"Multiple components detected ({n_components-1}). Press key 1-{n_components-1} to select, or q to skip.")
+        key = cv2.waitKey(0)
+        cv2.destroyWindow("Select component: press 1, 2, ...")
+        if key in [ord(str(i)) for i in range(1, n_components)]:
+            chosen = int(chr(key))
+            return (labels == chosen)
+        else:
+            print("No valid selection, returning full mask.")
+            return mask
     ref = np.array(valid_neighbors).mean(axis=0)  # (cx, cy)
 
     best_label, best_dist = None, float("inf")

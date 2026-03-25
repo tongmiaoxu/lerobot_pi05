@@ -391,14 +391,25 @@ def record_loop(
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
         # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
         # Write to dataset
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            # When teleoperating, save the robot's own observation state as the
+            # action (not the teleoperator reading).  This keeps action and
+            # observation in the same coordinate frame and avoids the GELLO-xArm
+            # offset problem.  For policy deployment the predicted action is
+            # already in robot frame, so use it directly.
+            if policy is not None:
+                action_to_record = action_values
+            else:
+                # Re-read robot state right after the command so the recorded
+                # action reflects the target the robot is actually tracking.
+                obs_after = robot.get_observation()
+                obs_after_processed = robot_observation_processor(obs_after)
+                action_to_record = obs_after_processed
+
+            action_frame = build_dataset_frame(dataset.features, action_to_record, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
@@ -830,6 +841,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         print(">>> Start recording")
                     else:
                         # ── Standard warmup (teleop idle, wait for RIGHT) ──
+                        # During deployment (policy provided) do NOT follow the GELLO –
+                        # the robot should hold its current position until recording
+                        # begins and the policy takes over.
+                        warmup_teleop = None if policy is not None else teleop
                         record_loop(
                             robot=robot,
                             events=events,
@@ -837,7 +852,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                             teleop_action_processor=teleop_action_processor,
                             robot_action_processor=robot_action_processor,
                             robot_observation_processor=robot_observation_processor,
-                            teleop=teleop,
+                            teleop=warmup_teleop,
                             control_time_s=float("inf"),
                             single_task=cfg.dataset.single_task,
                             display_data=cfg.display_data,

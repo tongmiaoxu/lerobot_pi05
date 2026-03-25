@@ -67,7 +67,8 @@ def _detect_display():
     return False
 
 _HAS_DISPLAY = _detect_display()
-if not _HAS_DISPLAY:
+# Only exit when run as main (not when imported by deploy_act_policy_mujoco --headless)
+if not _HAS_DISPLAY and __name__ == "__main__":
     print("[ERROR] This script requires a display for visualization")
     sys.exit(1)
 

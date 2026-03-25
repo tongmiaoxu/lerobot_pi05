@@ -118,7 +118,7 @@ lerobot-train \
   --wandb.enable=true \
   --wandb.project=xarm_pick_mug_lerobot0.4.3 \
   --dataset.image_transforms.enable=true
-
+```
 ```bash
 lerobot-train \
   --policy.type=diffusion \

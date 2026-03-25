@@ -23,11 +23,18 @@ Modes:
         -o predicted_real_0003.png
 
 Requires: pip install google-genai Pillow
-API key: Set GEMINI_API_KEY env var or pass --api-key
+API key: Set GEMINI_API_KEY in .env (pip install python-dotenv), or as env var, or pass --api-key
 """
 import argparse
 import os
 from pathlib import Path
+
+# Load .env from project root (when run as python tools/query_gemini.py)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from PIL import Image
 
@@ -253,7 +260,7 @@ Examples:
     )
     parser.add_argument(
         "--api-key",
-        default="AIzaSyDS2r4sjj-2-ccHt1kEQIRm0LNUcKM48QM",
+        default=None,
         help="Gemini API key (default: GEMINI_API_KEY env var)",
     )
     args = parser.parse_args()

@@ -32,7 +32,12 @@ import json
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Auto-detect display
+# Use EGL for MuJoCo rendering to avoid GLX/OpenGL failures over X11 forwarding (SSH -X).
+# EGL works for offscreen rendering; cv2 windows still use X11 for display.
+if "MUJOCO_GL" not in os.environ:
+    os.environ["MUJOCO_GL"] = "egl"
+
+# Auto-detect display (for cv2.imshow, mujoco.viewer)
 def _detect_display():
     if os.environ.get("DISPLAY"):
         return True
@@ -43,9 +48,6 @@ def _detect_display():
     return False
 
 _HAS_DISPLAY = _detect_display()
-if not _HAS_DISPLAY:
-    os.environ["MUJOCO_GL"] = "egl"
-    print("[WARN] No display detected, using EGL rendering")
 
 import numpy as np
 import torch
@@ -542,7 +544,7 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/act_xarm_training/checkpoints/080000/pretrained_model",
+        default="outputs/diffusion_xarm_training/checkpoints/008000/pretrained_model",
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
@@ -808,7 +810,13 @@ def main():
 
     viewer = None
     viewer_ctx = None
-    if not args.headless and _HAS_DISPLAY:
+    # Skip mujoco 3D viewer when using EGL (e.g. SSH X11 forwarding) - GLFW/GLX fails
+    use_viewer = (
+        not args.headless
+        and _HAS_DISPLAY
+        and os.environ.get("MUJOCO_GL") != "egl"
+    )
+    if use_viewer:
         try:
             viewer_ctx = mujoco.viewer.launch_passive(model, data)
             viewer = viewer_ctx.__enter__()
