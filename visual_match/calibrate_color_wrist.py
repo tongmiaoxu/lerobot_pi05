@@ -116,7 +116,7 @@ def _apply_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.ndarra
 
 def main():
     project_root = Path(__file__).parent.parent
-    base_dir = project_root / "calibration_pairs_wrist"
+    base_dir = project_root / "calibration_pairs_stationary"
     gs_dir = base_dir / "gs_renders"
     real_dir = base_dir / "real_captures"
     out_dir = str(base_dir / "calibrated")

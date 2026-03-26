@@ -127,7 +127,7 @@ def parse_cli() -> Args:
         default="data/data/chunk-000/file-000.parquet",
         help="Path to .parquet data file",
     )
-    p.add_argument("--episode", type=int, default=0)
+    p.add_argument("--episode", type=int, default=1)
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument(
         "--use-actions", action="store_true",

@@ -32,11 +32,6 @@ import json
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Use EGL for MuJoCo rendering to avoid GLX/OpenGL failures over X11 forwarding (SSH -X).
-# EGL works for offscreen rendering; cv2 windows still use X11 for display.
-if "MUJOCO_GL" not in os.environ:
-    os.environ["MUJOCO_GL"] = "egl"
-
 # Auto-detect display (for cv2.imshow, mujoco.viewer)
 def _detect_display():
     if os.environ.get("DISPLAY"):
@@ -48,6 +43,11 @@ def _detect_display():
     return False
 
 _HAS_DISPLAY = _detect_display()
+
+# Use GLX when a display is available (supports interactive viewer + offscreen),
+# fall back to EGL for headless/SSH environments (offscreen only).
+if "MUJOCO_GL" not in os.environ:
+    os.environ["MUJOCO_GL"] = "glx" if _HAS_DISPLAY else "egl"
 
 import numpy as np
 import torch
@@ -527,6 +527,63 @@ def select_contours_ui(
     return selected_contours, selected_indices
 
 
+def save_selection_grid(
+    initial_states_dir,
+    object_name: str,
+    list_of_contours: list,
+    selected_indices: list,
+    output_path,
+) -> None:
+    """Save all_episodes_grid.png with user-selected cells highlighted in green."""
+    if initial_states_dir is None:
+        initial_states_dir = Path(__file__).parent / "initial_states"
+    grid_path = Path(initial_states_dir) / object_name / "all_episodes_grid.png"
+    if not grid_path.exists():
+        print(f"[WARN] Grid image not found, skipping selection grid: {grid_path}")
+        return
+    grid_img = cv2.imread(str(grid_path))
+    if grid_img is None:
+        print(f"[WARN] Failed to read grid image: {grid_path}")
+        return
+
+    n = len(list_of_contours)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    grid_h, grid_w = grid_img.shape[:2]
+    thumb_w = grid_w // cols
+    thumb_h = grid_h // rows
+
+    result = grid_img.copy()
+    for idx in range(n):
+        r, c = divmod(idx, cols)
+        x0, y0 = c * thumb_w, r * thumb_h
+        if not list_of_contours[idx]:
+            overlay = result.copy()
+            cv2.rectangle(overlay, (x0, y0), (x0 + thumb_w, y0 + thumb_h), (80, 80, 80), -1)
+            cv2.addWeighted(overlay, 0.6, result, 0.4, 0, result)
+        cv2.putText(
+            result, str(idx), (x0 + 4, y0 + 16),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+    for idx in selected_indices:
+        r, c = divmod(idx, cols)
+        x0, y0 = c * thumb_w, r * thumb_h
+        overlay = result.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + thumb_w, y0 + thumb_h), (0, 200, 0), -1)
+        cv2.addWeighted(overlay, 0.25, result, 0.75, 0, result)
+        cv2.rectangle(result, (x0 + 1, y0 + 1),
+                      (x0 + thumb_w - 2, y0 + thumb_h - 2), (0, 255, 0), 3)
+
+    label = f"Selected training eps: {selected_indices}"
+    cv2.rectangle(result, (0, grid_h - 30), (grid_w, grid_h), (40, 40, 40), -1)
+    cv2.putText(result, label[:100], (8, grid_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), result)
+    print(f"[INFO] Saved selection grid → {output_path}")
+
+
 def convert_action_to_mujoco(action: torch.Tensor, gripper_mj_range: tuple) -> np.ndarray:
     """
     Convert policy action (8-dim: 7 joints degrees + gripper mm) to MuJoCo ctrl (8-dim).
@@ -544,7 +601,7 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/diffusion_xarm_training/checkpoints/008000/pretrained_model",
+        default="outputs/act_xarm_training/checkpoints/last/pretrained_model",
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
@@ -626,9 +683,20 @@ def main():
         default="mug",
         help="Object name matching the segmentation prompt (default: mug)"
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="data_sim_eval",
+        help="Directory to save sim evaluation data (videos, states, grid image). Default: data_sim_eval"
+    )
 
     args = parser.parse_args()
     num_eval_episodes = args.num_eval_episodes
+
+    # Create output directory for sim evaluation data
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Sim eval output directory: {output_dir.resolve()}")
 
     # Load initial-state contours and open selection UI when --select is used
     list_of_contours = None
@@ -652,6 +720,13 @@ def main():
             print(f"[ERROR] Selected {len(selected_contours)} contours but "
                   f"num_eval_episodes={num_eval_episodes}. Must be equal.")
             sys.exit(1)
+        save_selection_grid(
+            initial_states_dir=args.initial_states_dir,
+            object_name=args.object_name,
+            list_of_contours=list_of_contours,
+            selected_indices=selected_episode_indices,
+            output_path=output_dir / "selected_states_grid.png",
+        )
 
     if args.obs:
         print("[INFO] --obs: using real-world dataset images as policy input")
@@ -746,7 +821,7 @@ def main():
             )
             color_calib = None
             if args.color_calibrate:
-                default_calib = Path(__file__).parent.parent / "calibration_pairs_wrist" / "calibrated" / "color_mapping.yaml"
+                default_calib = Path(__file__).parent.parent / "calibration_pairs_stationary" / "calibrated" / "color_mapping.yaml"
                 try:
                     color_calib = load_color_mapping(default_calib)
                     print(f"[INFO] Loaded color calibration from: {default_calib}")
@@ -997,6 +1072,7 @@ def main():
 
             episode_actions = []
             episode_states = []
+            episode_frames = {cam_key: [] for cam_key in CAMERA_CONFIG}
             step = 0
             episode_discarded = False
 
@@ -1042,6 +1118,12 @@ def main():
                     observation = composite_obs
                 if hasattr(policy.config, 'language_features') and policy.config.language_features:
                     observation["observation.language"] = args.prompt
+
+                # Capture frames for video recording (the images the policy actually sees)
+                for _cam_key, _cam_cfg in CAMERA_CONFIG.items():
+                    _obs_key = f"observation.images.{_cam_cfg['dataset_cam']}"
+                    if _obs_key in observation:
+                        episode_frames[_cam_key].append(observation[_obs_key].copy())
 
                 episode_states.append(observation[OBS_STATE].copy()
                                       if isinstance(observation[OBS_STATE], np.ndarray)
@@ -1100,6 +1182,24 @@ def main():
                     "actions": episode_actions,
                     "states": episode_states,
                 })
+                # Save episode data (states, actions, camera videos) to output directory
+                ep_dir = output_dir / f"episode_{completed_episodes:03d}"
+                ep_dir.mkdir(parents=True, exist_ok=True)
+                np.save(str(ep_dir / "states.npy"), np.array(episode_states))
+                np.save(str(ep_dir / "actions.npy"), np.array(episode_actions))
+                for _cam_key, _frames in episode_frames.items():
+                    if not _frames:
+                        continue
+                    _dataset_cam = CAMERA_CONFIG[_cam_key]["dataset_cam"]
+                    _video_path = ep_dir / f"{_dataset_cam}.mp4"
+                    _h, _w = _frames[0].shape[:2]
+                    _fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    _writer = cv2.VideoWriter(str(_video_path), _fourcc, args.fps, (_w, _h))
+                    for _frame in _frames:
+                        _writer.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
+                    _writer.release()
+                    print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
+                print(f"[INFO] Episode data saved → {ep_dir}")
                 completed_episodes += 1
                 print(f">>> Episode {episode_idx} SAVED - {reason} "
                       f"({step} steps, {completed_episodes}/{num_eval_episodes} done)")

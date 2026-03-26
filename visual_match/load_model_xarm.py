@@ -83,11 +83,13 @@ def load_model(
             model.actuator_biasprm[:7, 2] = -act_damp
             model.dof_damping[:7] = jnt_damp
 
-    # Apply high damping to mug freejoint to prevent drift during physics
+    # Light damping on mug freejoint — just enough to prevent numerical drift,
+    # but low enough that the mug can slide/tip realistically on contact.
+    # Previous value of 100 was far too high and prevented natural response.
     mug_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
     if mug_jnt_id >= 0:
         mug_dof_addr = model.jnt_dofadr[mug_jnt_id]
-        model.dof_damping[mug_dof_addr:mug_dof_addr + 6] = 100
+        model.dof_damping[mug_dof_addr:mug_dof_addr + 6] = 2.0
 
     # Load camera configs
     stationary_cfg = load_camera_config("stationary_cam")

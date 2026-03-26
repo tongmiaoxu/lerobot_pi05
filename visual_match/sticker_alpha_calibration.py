@@ -134,11 +134,7 @@ def load_episode_frames(dataset_path: str, episode_idx: int, dataset_root: str |
     episode_data = load_episode(dataset_path, episode_idx, dataset_root=dataset_root)
     dataset = episode_data["dataset"]
     ep_meta = dataset.meta.episodes[episode_idx]
-    start_idx = ep_meta["dataset_from_index"]
-    end_idx = ep_meta["dataset_to_index"]
-    dataset_size = len(dataset)
-    end_idx = min(end_idx, dataset_size - 1)
-    num_frames = end_idx - start_idx + 1
+    num_frames = episode_data["num_frames"]
     video_fps = dataset.fps
 
     relative_timestamps = [i / video_fps for i in range(num_frames)]
@@ -190,7 +186,7 @@ def main():
     p.add_argument("--dataset-path", type=str, default="data",
                   help="Path to dataset directory")
     p.add_argument("--dataset-root", type=str, default=None)
-    p.add_argument("--episode", type=int, default=0)
+    p.add_argument("--episode", type=int, default=1)
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--alpha", type=float, default=0.7,
                   help="Alpha for blending (0=fully real, 1=fully MuJoCo)")

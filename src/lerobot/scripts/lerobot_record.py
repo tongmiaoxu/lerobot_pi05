@@ -609,6 +609,67 @@ def select_contours_ui(
     return selected_contours, selected_indices
 
 
+def save_selection_grid(
+    initial_states_dir: str | Path | None,
+    object_name: str,
+    list_of_contours: list,
+    selected_indices: list[int],
+    output_path: str | Path,
+) -> None:
+    """Save all_episodes_grid.png with user-selected cells highlighted in green."""
+    import math
+    import cv2
+
+    if initial_states_dir is None:
+        logging.warning("initial_states_dir is None, skipping selection grid save")
+        return
+    grid_path = Path(initial_states_dir) / object_name / "all_episodes_grid.png"
+    if not grid_path.exists():
+        logging.warning(f"Grid image not found, skipping selection grid: {grid_path}")
+        return
+    grid_img = cv2.imread(str(grid_path))
+    if grid_img is None:
+        logging.warning(f"Failed to read grid image: {grid_path}")
+        return
+
+    n = len(list_of_contours)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    grid_h, grid_w = grid_img.shape[:2]
+    thumb_w = grid_w // cols
+    thumb_h = grid_h // rows
+
+    result = grid_img.copy()
+    for idx in range(n):
+        r, c = divmod(idx, cols)
+        x0, y0 = c * thumb_w, r * thumb_h
+        if not list_of_contours[idx]:
+            overlay = result.copy()
+            cv2.rectangle(overlay, (x0, y0), (x0 + thumb_w, y0 + thumb_h), (80, 80, 80), -1)
+            cv2.addWeighted(overlay, 0.6, result, 0.4, 0, result)
+        cv2.putText(
+            result, str(idx), (x0 + 4, y0 + 16),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+    for idx in selected_indices:
+        r, c = divmod(idx, cols)
+        x0, y0 = c * thumb_w, r * thumb_h
+        overlay = result.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + thumb_w, y0 + thumb_h), (0, 200, 0), -1)
+        cv2.addWeighted(overlay, 0.25, result, 0.75, 0, result)
+        cv2.rectangle(result, (x0 + 1, y0 + 1),
+                      (x0 + thumb_w - 2, y0 + thumb_h - 2), (0, 255, 0), 3)
+
+    label = f"Selected training eps: {selected_indices}"
+    cv2.rectangle(result, (0, grid_h - 30), (grid_w, grid_h), (40, 40, 40), -1)
+    cv2.putText(result, label[:100], (8, grid_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), result)
+    logging.info(f"Saved selection grid → {output_path}")
+
+
 def warmup_contour_alignment(
     robot,
     contour: list,
@@ -801,6 +862,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     f"Selected {len(selected_contours)} contours but "
                     f"num_episodes={cfg.dataset.num_episodes}. Must be equal."
                 )
+
+            save_selection_grid(
+                initial_states_dir=cfg.initial_states_dir,
+                object_name=cfg.object_name,
+                list_of_contours=list_of_contours,
+                selected_indices=selected_episode_indices,
+                output_path=dataset_root / "selected_states_grid.png",
+            )
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0

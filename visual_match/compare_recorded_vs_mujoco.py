@@ -364,31 +364,29 @@ def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None =
             video_backend="pyav"
         )
 
-    if episode_idx >= dataset.num_episodes:
-        raise ValueError(f"Episode {episode_idx} not found. Dataset has {dataset.num_episodes} episodes")
+    total_episodes = dataset.meta.total_episodes
+    if episode_idx >= total_episodes:
+        raise ValueError(f"Episode {episode_idx} not found. Dataset has {total_episodes} episodes")
 
     ep_meta = dataset.meta.episodes[episode_idx]
-    start_idx = ep_meta["dataset_from_index"]
-    end_idx = ep_meta["dataset_to_index"]
-    dataset_size = len(dataset)
-    end_idx = min(end_idx, dataset_size - 1)
-    num_frames = end_idx - start_idx + 1
+    num_frames = len(dataset)
 
-    print(f"[INFO] Episode {episode_idx} has {num_frames} frames (indices {start_idx} to {end_idx})")
+    print(f"[INFO] Episode {episode_idx} has {num_frames} frames (loaded dataset size: {num_frames})")
 
     actions = []
     observations = []
-    for frame_idx in range(start_idx, end_idx + 1):
+    for frame_idx in range(num_frames):
         sample = dataset[frame_idx]
         actions.append(sample["action"].numpy())
         observations.append(sample["observation.state"].numpy())
 
+    video_start_frame = ep_meta.get("dataset_from_index", 0)
     return {
         'action': torch.from_numpy(np.array(actions)),
         'observation.state': torch.from_numpy(np.array(observations)),
         'episode_index': episode_idx,
         'num_frames': num_frames,
-        'video_start_frame': start_idx,
+        'video_start_frame': video_start_frame,
         'dataset': dataset,
     }
 
@@ -411,7 +409,7 @@ def parse_args():
     p.add_argument("--color-calibrate", action="store_true",
                    help="Apply color calibration to composite renderings")
     p.add_argument("--save-calibration-pairs", action="store_true",
-                   help="Save frames 0,5,10,15,20 to calibration_pairs_wrist/ for color calibration")
+                   help="Save frames 0,5,10,15,20 to calibration_pairs_*/ for color calibration")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
@@ -685,7 +683,7 @@ def main():
     # Load color calibration
     color_calib = None
     if args.color_calibrate:
-        default_calib = Path(__file__).parent.parent / "calibration_pairs_wrist" / "calibrated" / "color_mapping.yaml"
+        default_calib = Path(__file__).parent.parent / "calibration_pairs_stationary" / "calibrated" / "color_mapping.yaml"
         if default_calib.exists():
             color_calib = load_color_mapping(str(default_calib))
             print(f"[INFO] Loaded default color calibration from: {default_calib}")
@@ -989,18 +987,31 @@ def main():
 
             # Save calibration pairs for wrist color calibration
             SAVE_CALIB_FRAMES = [0, 1, 2, 3, 4]
-            if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES and "stationary" in cam_renders:
-                base_dir = Path(__file__).parent.parent / "calibration_pairs_wrist"
-                gs_dir = base_dir / "gs_renders"
-                real_dir = base_dir / "real_captures"
-                gs_dir.mkdir(parents=True, exist_ok=True)
-                real_dir.mkdir(parents=True, exist_ok=True)
-                # Save sim composite (before color calibration) and real recorded
-                gs_path = gs_dir / f"frame_{frame_idx:04d}.png"
-                real_path = real_dir / f"frame_{frame_idx:04d}.png"
-                cv2.imwrite(str(gs_path), cam_renders["stationary"]["composite_raw"])
-                cv2.imwrite(str(real_path), cam_renders["stationary"]["recorded"])
-                print(f"[INFO] Saved calibration pair frame {frame_idx}: {gs_path}, {real_path}")
+            if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES:
+                # Save stationary camera images
+                if "stationary" in cam_renders:
+                    base_dir_stationary = Path(__file__).parent.parent / "calibration_pairs_stationary"
+                    gs_dir_stationary = base_dir_stationary / "gs_renders"
+                    real_dir_stationary = base_dir_stationary / "real_captures"
+                    gs_dir_stationary.mkdir(parents=True, exist_ok=True)
+                    real_dir_stationary.mkdir(parents=True, exist_ok=True)
+                    gs_path_stationary = gs_dir_stationary / f"frame_{frame_idx:04d}.png"
+                    real_path_stationary = real_dir_stationary / f"frame_{frame_idx:04d}.png"
+                    cv2.imwrite(str(gs_path_stationary), cam_renders["stationary"]["composite_raw"])
+                    cv2.imwrite(str(real_path_stationary), cam_renders["stationary"]["recorded"])
+                    print(f"[INFO] Saved stationary calibration pair frame {frame_idx}: {gs_path_stationary}, {real_path_stationary}")
+                # Save wrist camera images
+                if "wrist" in cam_renders:
+                    base_dir_wrist = Path(__file__).parent.parent / "calibration_pairs_wrist"
+                    gs_dir_wrist = base_dir_wrist / "gs_renders"
+                    real_dir_wrist = base_dir_wrist / "real_captures"
+                    gs_dir_wrist.mkdir(parents=True, exist_ok=True)
+                    real_dir_wrist.mkdir(parents=True, exist_ok=True)
+                    gs_path_wrist = gs_dir_wrist / f"frame_{frame_idx:04d}.png"
+                    real_path_wrist = real_dir_wrist / f"frame_{frame_idx:04d}.png"
+                    cv2.imwrite(str(gs_path_wrist), cam_renders["wrist"]["composite_raw"])
+                    cv2.imwrite(str(real_path_wrist), cam_renders["wrist"]["recorded"])
+                    print(f"[INFO] Saved wrist calibration pair frame {frame_idx}: {gs_path_wrist}, {real_path_wrist}")
 
             # Overlays
             gripper_mm = observations_raw[frame_idx, 7]
