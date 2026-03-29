@@ -63,6 +63,7 @@ lerobot-record \
 """
 
 import logging
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -109,7 +110,7 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.robots.aloha_follower import AlohaFollower, AlohaFollowerConfig  # noqa: F401
-from lerobot.robots.xarm_follower import XarmFollower, XarmFollowerConfig  # noqa: F401
+from lerobot.robots.xarm_follower import XarmFollower, XarmFollowerConfig
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -146,15 +147,19 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
+# Defaults for `lerobot-record` with no CLI args (xArm + GELLO + diffusion eval workflow).
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/pi05_xarm_training/checkpoints/last/pretrained_model"
+_DEFAULT_POLICY_PRETRAINED_HUB = "lerobot/pi05_base"
+
 
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
-    repo_id: str
+    repo_id: str = "tongmiao/eval_xarm_pick_mug"
     # A short but accurate description of the task performed during the recording (e.g. "Pick the Lego block and drop it in the box on the right.")
-    single_task: str
+    single_task: str = "Pick up the mug"
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
-    root: str | Path | None = None
+    root: str | Path | None = "data_eval"
     # Limit the frames per second.
     fps: int = 30
     # Number of seconds for data recording for each episode.
@@ -162,7 +167,7 @@ class DatasetRecordConfig:
     # Number of seconds for resetting the environment after each episode.
     reset_time_s: int | float = 60
     # Number of episodes to record.
-    num_episodes: int = 50
+    num_episodes: int = 10
     # Encode frames in the dataset into video
     video: bool = True
     # Upload dataset to Hugging Face hub (default False to avoid auth errors).
@@ -196,10 +201,10 @@ class DatasetRecordConfig:
 
 @dataclass
 class RecordConfig:
-    robot: RobotConfig
-    dataset: DatasetRecordConfig
+    robot: RobotConfig = field(default_factory=lambda: XarmFollowerConfig())
+    dataset: DatasetRecordConfig = field(default_factory=DatasetRecordConfig)
     # Whether to control the robot with a teleoperator
-    teleop: TeleoperatorConfig | None = None
+    teleop: TeleoperatorConfig | None = field(default_factory=lambda: GelloLeaderConfig())
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
     # Display all cameras on screen
@@ -215,7 +220,7 @@ class RecordConfig:
     # Resume recording on an existing dataset.
     resume: bool = False
     # Load initial-state contour overlays from initial_states_overlay.py output.
-    select: bool = False
+    select: bool = True
     # Directory containing initial_states_overlay.py output (masks, contours, etc.).
     initial_states_dir: str | Path | None = "visual_match/initial_states"
     # Object name matching the segmentation prompt used in initial_states_overlay.py.
@@ -224,9 +229,19 @@ class RecordConfig:
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
         policy_path = parser.get_path_arg("policy")
+        # When launched as `lerobot-record` with no --policy.path, use the project default checkpoint.
+        # Skip under pytest so tests can construct RecordConfig without a real policy on disk.
+        if (
+            policy_path is None
+            and self.policy is None
+            and "pytest" not in sys.modules
+        ):
+            policy_path = _DEFAULT_RECORD_POLICY_CHECKPOINT
 
         if policy_path:
-            cli_overrides = parser.get_cli_overrides("policy")
+            cli_overrides = list(parser.get_cli_overrides("policy") or [])
+            if not any("pretrained_path" in o for o in cli_overrides):
+                cli_overrides.append(f"--pretrained_path={_DEFAULT_POLICY_PRETRAINED_HUB}")
 
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
@@ -348,6 +363,7 @@ def record_loop(
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
+            print(observation_frame["observation.state"])
             action_values = predict_action(
                 observation=observation_frame,
                 policy=policy,
@@ -358,7 +374,7 @@ def record_loop(
                 task=single_task,
                 robot_type=robot.robot_type,
             )
-
+            print(action_values)
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
@@ -904,6 +920,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         )
                         if events["stop_recording"]:
                             break
+                        if isinstance(robot, XarmFollower):
+                            logging.info("RIGHT ARROW: moving xArm to deployment initial pose before recording")
+                            robot.go_to_deployment_initial_pose()
                         events["right_arrow"] = False
                         events["exit_early"] = False
                         state = "RECORDING"
@@ -931,6 +950,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                             break
 
                         if events["right_arrow"]:
+                            if isinstance(robot, XarmFollower):
+                                logging.info(
+                                    "RIGHT ARROW: moving xArm to deployment initial pose before recording"
+                                )
+                                robot.go_to_deployment_initial_pose()
                             events["right_arrow"] = False
                             events["exit_early"] = False
                             state = "RECORDING"
@@ -976,11 +1000,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                     else:
                         # Save episode: RIGHT arrow pressed OR episode_time_s reached
+                        saved_with_right_arrow = events["right_arrow"]
                         events["right_arrow"] = False
                         events["exit_early"] = False
                         dataset.save_episode()
                         recorded_episodes += 1
                         print(f">>> Episode saved ({recorded_episodes}/{cfg.dataset.num_episodes})")
+                        if saved_with_right_arrow and isinstance(robot, XarmFollower):
+                            logging.info(
+                                "RIGHT ARROW: moving xArm to deployment initial pose after save"
+                            )
+                            robot.go_to_deployment_initial_pose()
                         state = "WARMUP"
     finally:
         print("\n>>> Stop recording")

@@ -73,6 +73,9 @@ class XarmFollower(Robot):
         # Computed on the first send_action call so the robot stays put
         # until the operator actually moves the GELLO.
         self._action_offset: np.ndarray | None = None
+        # Target pose for lerobot-record RIGHT ARROW resets (rad + normalized gripper).
+        self._deployment_reset_joints_rad: np.ndarray | None = None
+        self._deployment_reset_gripper_norm: float | None = None
 
     @property
     def _joint_names(self) -> list[str]:
@@ -340,6 +343,31 @@ class XarmFollower(Robot):
         self._prev_command = self._current_joints.copy()
         self._target_gripper = None
 
+        if self.config.deployment_reset_joint_deg is not None:
+            deg = np.array(self.config.deployment_reset_joint_deg, dtype=float)
+            if deg.size != self.config.dof:
+                raise ValueError(
+                    f"deployment_reset_joint_deg must have length {self.config.dof}, got {deg.size}"
+                )
+            self._deployment_reset_joints_rad = np.deg2rad(deg)
+        else:
+            self._deployment_reset_joints_rad = self._current_joints.copy()
+
+        if self._gripper_enabled:
+            if self.config.deployment_reset_gripper_mm is not None:
+                mm = self.config.deployment_reset_gripper_mm
+                span = self.config.gripper_close_mm - self.config.gripper_open_mm
+                if abs(span) > 1e-6:
+                    self._deployment_reset_gripper_norm = float(
+                        max(0.0, min(1.0, (mm - self.config.gripper_open_mm) / span))
+                    )
+                else:
+                    self._deployment_reset_gripper_norm = 0.0
+            else:
+                self._deployment_reset_gripper_norm = self._get_gripper_pos_normalized()
+        else:
+            self._deployment_reset_gripper_norm = None
+
         # Start background control thread
         self._running = True
         self._command_thread = threading.Thread(target=self._control_loop, daemon=True)
@@ -420,6 +448,36 @@ class XarmFollower(Robot):
                     self._target_gripper = 0.0
 
         return action
+
+    def go_to_deployment_initial_pose(self, timeout_s: float = 120.0, position_tol_rad: float = 0.12) -> None:
+        """
+        Move toward the deployment "initial" pose (see config ``deployment_reset_*``
+        or the pose captured at ``connect()``). Blocks until joints are within
+        ``position_tol_rad`` (L2 norm) or ``timeout_s`` elapses.
+        """
+        if not self.is_connected or self._deployment_reset_joints_rad is None:
+            return
+
+        target = self._deployment_reset_joints_rad
+        with self._target_lock:
+            self._target_joints = target.copy()
+            if self._gripper_enabled and self._deployment_reset_gripper_norm is not None:
+                self._target_gripper = self._deployment_reset_gripper_norm
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            with self._state_lock:
+                cur = self._current_joints
+            if cur is not None and np.linalg.norm(cur - target) <= position_tol_rad:
+                with self._target_lock:
+                    self._prev_command = cur.copy()
+                return
+            time.sleep(0.05)
+
+        logger.warning(
+            "go_to_deployment_initial_pose: timed out before reaching target "
+            f"(timeout_s={timeout_s}, tol={position_tol_rad})"
+        )
 
     def disconnect(self) -> None:
         self._running = False

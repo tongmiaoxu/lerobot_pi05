@@ -22,6 +22,7 @@ API key: Set GEMINI_API_KEY in .env (pip install python-dotenv), or as env var, 
 """
 import argparse
 import os
+import threading
 from pathlib import Path
 
 try:
@@ -44,14 +45,33 @@ def _init_client(api_key: str | None = None):
     return genai.Client(api_key=key)
 
 
-def _extract_image(response, output_path: Path) -> Path:
-    """Save the *last* generated image from a Gemini response.
+def _to_pil(img) -> Image.Image:
+    """Convert a genai Image or PIL Image to a guaranteed PIL.Image.Image."""
+    import io
+    if isinstance(img, Image.Image):
+        return img
+    # google-genai Image (Pydantic model) — try known byte attributes
+    for attr in ("image_bytes", "_image_bytes", "data"):
+        raw = getattr(img, attr, None)
+        if isinstance(raw, bytes) and raw:
+            pil_img = Image.open(io.BytesIO(raw))
+            pil_img.load()
+            return pil_img
+    # Pydantic model_dump fallback
+    if hasattr(img, "model_dump"):
+        d = img.model_dump()
+        for key in ("image_bytes", "data"):
+            raw = d.get(key)
+            if isinstance(raw, bytes) and raw:
+                pil_img = Image.open(io.BytesIO(raw))
+                pil_img.load()
+                return pil_img
+    raise TypeError(f"Cannot convert {type(img).__name__} to PIL Image")
 
-    Gemini image-generation models may echo back input images as earlier
-    parts before appending the actual generated image at the end.  By
-    taking the last image part we avoid saving an echoed input.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+def _extract_pil_image(response) -> Image.Image:
+    """Extract the last generated PIL Image from a Gemini response (no file I/O)."""
+    import io
 
     parts = getattr(response, "parts", None)
     if parts is None and response.candidates:
@@ -63,20 +83,128 @@ def _extract_image(response, output_path: Path) -> Path:
     img_count = 0
     for part in parts:
         if part.inline_data is not None:
-            img = part.as_image()
-            if img is not None:
+            raw = getattr(part.inline_data, "data", None)
+            if isinstance(raw, bytes) and raw:
                 img_count += 1
-                last_img = img
+                pil = Image.open(io.BytesIO(raw))
+                pil.load()
+                last_img = pil
+            else:
+                genai_img = part.as_image()
+                if genai_img is not None:
+                    img_count += 1
+                    last_img = _to_pil(genai_img)
         if part.text:
-            print(f"Model response: {part.text}")
-
-    print(f"  Response contained {img_count} image(s), using the last one.")
+            print(f"  Gemini: {part.text}")
 
     if last_img is None:
-        raise RuntimeError("No image was generated in the response")
+        raise RuntimeError(
+            f"No image generated (got {img_count} image parts)"
+        )
+    return last_img
 
-    last_img.save(str(output_path))
-    return output_path
+
+def generate_fewshot_from_images(
+    example_pairs: list[tuple[Image.Image, Image.Image]],
+    query_image: Image.Image,
+    *,
+    cam_name: str = "wrist",
+    prompt: str | None = None,
+    # model: str = "gemini-3-pro-image-preview",
+    model: str = "gemini-3-pro-image-preview",
+    api_key: str | None = None,
+    temperature: float | None = None,
+    seed: int | None = None,
+) -> Image.Image:
+    """In-memory few-shot: takes PIL Images, returns PIL Image (no file I/O).
+
+    Used by GeminiTranslator for real-time sim→real style transfer.
+    """
+    from google.genai import types
+
+    client = _init_client(api_key)
+
+    if prompt is None:
+        prompt = _PROMPTS.get(cam_name, _PROMPTS["wrist"])
+
+    contents: list = [prompt]
+    for i, (gs_img, real_img) in enumerate(example_pairs, 1):
+        contents.append(f"\nexample {i} — render:")
+        contents.append(gs_img)
+        contents.append(f"\nexample {i} — real photo:")
+        contents.append(real_img)
+
+    contents.append(_QUERY_LABELS.get(cam_name, _QUERY_LABELS["wrist"]))
+    contents.append(query_image)
+
+    cfg = dict(response_modalities=["TEXT", "IMAGE"])
+    if temperature is not None:
+        cfg["temperature"] = temperature
+    if seed is not None:
+        cfg["seed"] = seed
+
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(**cfg),
+    )
+    return _extract_pil_image(response)
+
+
+class GeminiTranslator:
+    """Pre-loaded Gemini few-shot translator for sim→real style transfer.
+
+    Loads example pairs at init, then translates numpy images on demand.
+    Usage from deploy_act_policy_mujoco.py:
+        translator = GeminiTranslator()
+        real_np = translator.translate(composite_np, "stationary")
+    """
+
+    def __init__(
+        self,
+        stationary_pairs: int = 1,
+        wrist_pairs: int = 3,
+        model: str = "gemini-3-pro-image-preview",
+        temperature: float = 0,
+        seed: int = 42,
+        api_key: str | None = None,
+        stationary_dir: str = "calibration_pairs_stationary",
+        wrist_dir: str = "calibration_pairs_wrist",
+    ):
+        self._model = model
+        self._temperature = temperature
+        self._seed = seed
+        self._api_key = api_key
+
+        self._pairs: dict[str, list[tuple[Image.Image, Image.Image]]] = {}
+        for cam_name, n_pairs, base_dir in [
+            ("stationary", stationary_pairs, stationary_dir),
+            ("wrist", wrist_pairs, wrist_dir),
+        ]:
+            pairs = load_calibration_pairs_pil(cam_name, n_pairs, base_dir)
+            self._pairs[cam_name] = pairs
+            print(f"  [GeminiTranslator] Loaded {len(pairs)} example pair(s) for {cam_name}")
+
+    def translate(self, image_np, cam_name: str):
+        """Translate a numpy RGB uint8 image via Gemini few-shot.
+
+        Returns numpy RGB uint8 image of the same size.
+        """
+        import numpy as np
+        h, w = image_np.shape[:2]
+        query = Image.fromarray(image_np)
+        result = generate_fewshot_from_images(
+            self._pairs[cam_name],
+            query,
+            cam_name=cam_name,
+            model=self._model,
+            temperature=self._temperature,
+            seed=self._seed,
+            api_key=self._api_key,
+        )
+        result = _to_pil(result)
+        result = result.convert("RGB").resize((w, h), Image.LANCZOS)
+        return np.array(result)
 
 
 def _get_font(size: int = 18):
@@ -194,54 +322,24 @@ _QUERY_LABELS = {
     "wrist": "\n new render:(generate its real photo)",
 }
 
+# Few-shot example frame indices per camera (GeminiTranslator + CLI must match).
+EXAMPLE_FRAME_INDICES = {
+    "stationary": [0, 2, 4],
+    "wrist": [1, 300, 500],
+}
 
-def generate_fewshot(
-    pairs: list[tuple[Path, Path]],
-    query_image: str | Path,
-    output_path: str | Path,
-    *,
-    cam_name: str = "wrist",
-    prompt: str | None = None,
-    model: str = "gemini-2.5-flash-image",
-    api_key: str | None = None,
-    temperature: float | None = None,
-    seed: int | None = None,
-) -> Path:
-    """
-    Few-shot mode: provide (rendered, real) example pairs, then a query
-    rendered image. Gemini learns the render->real mapping and generates
-    the predicted real capture for the query.
-    """
-    from google.genai import types
 
-    client = _init_client(api_key)
-
-    if prompt is None:
-        prompt = _PROMPTS.get(cam_name, _PROMPTS["wrist"])
-
-    contents: list = [prompt]
-    for i, (gs_path, real_path) in enumerate(pairs, 1):
-        contents.append(f"\nexample {i} — render:")
-        contents.append(Image.open(gs_path).convert("RGB"))
-        contents.append(f"\nexample {i} — real photo:")
-        contents.append(Image.open(real_path).convert("RGB"))
-
-    contents.append(_QUERY_LABELS.get(cam_name, _QUERY_LABELS["wrist"]))
-    print(f"contents: {contents}")
-    contents.append(Image.open(query_image).convert("RGB"))
-
-    cfg = dict(response_modalities=["TEXT", "IMAGE"])
-    if temperature is not None:
-        cfg["temperature"] = temperature
-    if seed is not None:
-        cfg["seed"] = seed
-
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(**cfg),
-    )
-    return _extract_image(response, Path(output_path))
+def load_calibration_pairs_pil(
+    cam_name: str, n_pairs: int, base_dir: str | Path
+) -> list[tuple[Image.Image, Image.Image]]:
+    base = Path(base_dir)
+    indices = EXAMPLE_FRAME_INDICES.get(cam_name, list(range(n_pairs)))[:n_pairs]
+    pairs = []
+    for i in indices:
+        gs = base / "gs_renders" / f"frame_{i:04d}.png"
+        real = base / "real_captures" / f"frame_{i:04d}.png"
+        pairs.append((Image.open(gs).convert("RGB"), Image.open(real).convert("RGB")))
+    return pairs
 
 
 def main():
@@ -263,9 +361,20 @@ Examples:
     parser.add_argument(
         "-n", "--num-pairs",
         type=int,
-        required=True,
-        help="Number of example pairs per camera. Uses frames 0..N-1 as "
-             "examples and frame N as query.",
+        default=None,
+        help="Number of example pairs per camera (overridden by --stationary-n or --wrist-n if set). Uses frames 0..N-1 as examples and frame N as query.",
+    )
+    parser.add_argument(
+        "--n1",
+        type=int,
+        default=None,
+        help="Number of example pairs for stationary camera (n1).",
+    )
+    parser.add_argument(
+        "--n2",
+        type=int,
+        default=None,
+        help="Number of example pairs for wrist camera (n2).",
     )
     parser.add_argument(
         "--stationary",
@@ -348,7 +457,6 @@ Examples:
     )
     args = parser.parse_args()
 
-    n = args.num_pairs
     out_dir = args.output or Path("visual_match/gemini")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -357,23 +465,38 @@ Examples:
         "wrist": args.wrist_seed if args.wrist_seed is not None else args.seed,
     }
 
-    use_both = not args.stationary and not args.wrist
+    # If n1 or n2 are set, they imply stationary/wrist selection
+    stationary_selected = args.stationary or (args.n1 is not None)
+    wrist_selected = args.wrist or (args.n2 is not None)
+    use_both = (not stationary_selected and not wrist_selected) or (stationary_selected and wrist_selected)
     cam_configs = []
-    if use_both or args.stationary:
+    if use_both or stationary_selected:
         cam_configs.append(("stationary", args.stationary_dir))
-    if use_both or args.wrist:
+    if use_both or wrist_selected:
         cam_configs.append(("wrist", args.wrist_dir))
+
+    cam_n = {
+        "stationary": args.n1 if args.n1 is not None else (args.num_pairs if args.num_pairs is not None else 1),
+        "wrist": args.n2 if args.n2 is not None else (args.num_pairs if args.num_pairs is not None else 1),
+    }
 
     cam_pairs: dict[str, list[tuple[Path, Path]]] = {}
     cam_queries: dict[str, Path] = {}
     for cam_name, cam_dir in cam_configs:
+        n_cam = cam_n[cam_name]
         gs_dir = cam_dir / "gs_renders"
         real_dir = cam_dir / "real_captures"
+        example_indices = EXAMPLE_FRAME_INDICES.get(cam_name, list(range(n_cam)))[:n_cam]
         pairs = [
             (gs_dir / f"frame_{i:04d}.png", real_dir / f"frame_{i:04d}.png")
-            for i in range(n)
+            for i in example_indices
         ]
-        query_path = gs_dir / f"frame_{n:04d}.png"
+        query_idx = (
+            300
+            if cam_name in ("stationary", "wrist")
+            else (max(example_indices) + 1 if example_indices else n_cam)
+        )
+        query_path = gs_dir / f"frame_{query_idx:04d}.png"
         for gs_p, real_p in pairs:
             if not gs_p.exists():
                 parser.error(f"Not found: {gs_p}")
@@ -403,20 +526,17 @@ Examples:
             print(f"{'#' * 60}")
 
             cam_results = []
-            for cam_name, cam_dir in cam_configs:
-                seed = seeds[cam_name]
-                if multi_run:
-                    suffix = f"_t{temp}_seed{seed}"
-                else:
-                    suffix = ""
-                pred_path = out_dir / f"predicted_{cam_name}{suffix}.png"
+            thread_results = {}
+            threads = []
 
-                print(f"\n  [{cam_name}] temp={temp}, seed={seed}, query={cam_queries[cam_name]}")
+            def run_cam(cam_name, cam_dir, temp, seed, pred_path):
                 try:
-                    generate_fewshot(
-                        cam_pairs[cam_name],
-                        cam_queries[cam_name],
-                        pred_path,
+                    n_cam = cam_n[cam_name]
+                    pil_pairs = load_calibration_pairs_pil(cam_name, n_cam, cam_dir)
+                    query = Image.open(cam_queries[cam_name]).convert("RGB")
+                    result = generate_fewshot_from_images(
+                        pil_pairs,
+                        query,
                         cam_name=cam_name,
                         prompt=args.fewshot_prompt,
                         model=args.model,
@@ -424,17 +544,53 @@ Examples:
                         temperature=temp,
                         seed=seed,
                     )
+                    result = _to_pil(result).convert("RGB")
+                    pred_path.parent.mkdir(parents=True, exist_ok=True)
+                    result.save(str(pred_path))
                     print(f"  Saved: {pred_path}")
-                    cam_results.append({
+                    thread_results[cam_name] = {
                         "name": cam_name,
                         "pairs": cam_pairs[cam_name],
                         "query": cam_queries[cam_name],
                         "predicted": pred_path,
                         "seed": seed,
                         "temperature": temp,
-                    })
+                    }
                 except RuntimeError as e:
                     print(f"  [{cam_name}] FAILED (temp={temp}, seed={seed}): {e}")
+
+            # If both cameras, run in parallel (even if --stationary/--wrist not set, but n1 and n2 are)
+            if len(cam_configs) == 2:
+                for cam_name, cam_dir in cam_configs:
+                    seed = seeds[cam_name]
+                    if multi_run:
+                        suffix = f"_t{temp}_seed{seed}"
+                    else:
+                        suffix = ""
+                    pred_path = out_dir / f"predicted_{cam_name}{suffix}.png"
+                    print(f"\n  [{cam_name}] temp={temp}, seed={seed}, query={cam_queries[cam_name]}")
+                    t = threading.Thread(target=run_cam, args=(cam_name, cam_dir, temp, seed, pred_path))
+                    threads.append(t)
+                    t.start()
+                for t in threads:
+                    t.join()
+                for cam_name in [c[0] for c in cam_configs]:
+                    if cam_name in thread_results:
+                        cam_results.append(thread_results[cam_name])
+            else:
+                # Single camera, run sequentially
+                for cam_name, cam_dir in cam_configs:
+                    seed = seeds[cam_name]
+                    if multi_run:
+                        suffix = f"_t{temp}_seed{seed}"
+                    else:
+                        suffix = ""
+                    pred_path = out_dir / f"predicted_{cam_name}{suffix}.png"
+                    print(f"\n  [{cam_name}] temp={temp}, seed={seed}, query={cam_queries[cam_name]}")
+                    run_cam(cam_name, cam_dir, temp, seed, pred_path)
+                for cam_name in [c[0] for c in cam_configs]:
+                    if cam_name in thread_results:
+                        cam_results.append(thread_results[cam_name])
 
             if cam_results:
                 seed_tag = "_".join(f"{r['name'][0]}{r['seed']}" for r in cam_results)

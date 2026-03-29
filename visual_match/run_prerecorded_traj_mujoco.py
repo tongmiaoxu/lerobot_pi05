@@ -297,11 +297,13 @@ def main():
             color_calib = None
             if args.color_calib_path:
                 calib_path = args.color_calib_path if Path(args.color_calib_path).is_absolute() else str(_PROJECT_ROOT / args.color_calib_path)
-                if os.path.exists(calib_path):
-                    try:
-                        color_calib = load_color_mapping(calib_path)
-                    except Exception as e:
-                        print(f"[WARN] Failed to load color calibration: {e}")
+            else:
+                calib_path = Path(__file__).parent.parent / "calibration_pairs_stationary" / "calibrated" / "color_mapping.yaml"
+            if os.path.exists(calib_path):
+                try:
+                    color_calib = load_color_mapping(calib_path)
+                except Exception as e:
+                    print(f"[WARN] Failed to load color calibration: {e}")
             viz_cfg = {"viz_w": RENDER_W, "viz_h": RENDER_H, "viz_near": 0.1, "viz_far": 10.0}
             gaussian_data = {
                 "scene_data": scene_data,
@@ -373,7 +375,7 @@ def main():
                     if cam_cfg["config"].get("type", "stationary") == "stationary":
                         set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
                 real_obs = build_observation_from_mujoco(
-                    model, data, renderer, gripper_mj_range,
+                    model, data, renderer,
                     seg_renderer=seg_renderer,
                     robot_geom_ids=robot_geom_ids,
                     gaussian_data=gaussian_data,
@@ -381,7 +383,7 @@ def main():
                     frame_idx=frame_idx,
                 )
                 composite_obs = build_observation_from_mujoco(
-                    model, data, renderer, gripper_mj_range,
+                    model, data, renderer,
                     seg_renderer=seg_renderer,
                     robot_geom_ids=robot_geom_ids,
                     gaussian_data=gaussian_data,

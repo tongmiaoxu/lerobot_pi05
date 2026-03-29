@@ -101,3 +101,12 @@ class XarmFollowerConfig(RobotConfig):
     # Default: loaded from visual_match/configs/stationary_cam.json and wrist_cam.json
     # (cam_high, cam_wrist). To disable: --robot.cameras='{}'
     cameras: dict[str, CameraConfig] = field(default_factory=_default_xarm_cameras)
+
+    # When using lerobot-record with the arrow-key state machine, each RIGHT ARROW
+    # (start episode / save episode) can move the arm to this pose first.
+    # If ``deployment_reset_joint_deg`` is None, the joint angles read at ``connect()``
+    # are used (place the arm in your desired start pose before launching record).
+    deployment_reset_joint_deg: list[float] | None = None
+    # Optional gripper target in mm when resetting (open/close range as in gripper_*_mm).
+    # If None, the gripper position at ``connect()`` is used.
+    deployment_reset_gripper_mm: float | None = None

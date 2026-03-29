@@ -400,7 +400,7 @@ def parse_args():
     p.add_argument("--dataset-path", type=str, default="data",
                    help="Path to dataset directory (local) or repo_id (Hub)")
     p.add_argument("--dataset-root", type=str, default=None)
-    p.add_argument("--episode", type=int, default=0)
+    p.add_argument("--episode", type=int, default=1)
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--scene-path", type=str, default="pointclouds/xarm7_black.npz",
                    help="Path to Gaussian Splatting scene file")
@@ -408,6 +408,8 @@ def parse_args():
                    help="Alpha for blending (0=fully real, 1=fully robot)")
     p.add_argument("--color-calibrate", action="store_true",
                    help="Apply color calibration to composite renderings")
+    p.add_argument("--no_stack", action="store_true",
+                   help="Disable alpha blending plot overlay and window.")
     p.add_argument("--save-calibration-pairs", action="store_true",
                    help="Save frames 0,5,10,15,20 to calibration_pairs_*/ for color calibration")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
@@ -756,7 +758,7 @@ def main():
     FK_OVERLAY_PAD = 10  # padding from bottom-left corner
     FK_RENDER_SCALE = 2  # render at 2x resolution for crisp output
 
-    if ee_site is not None:
+    if not args.no_stack and ee_site is not None:
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -986,7 +988,7 @@ def main():
                 }
 
             # Save calibration pairs for wrist color calibration
-            SAVE_CALIB_FRAMES = [0, 1, 2, 3, 4]
+            SAVE_CALIB_FRAMES = [0, 100, 200, 300, 400,500]
             if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES:
                 # Save stationary camera images
                 if "stationary" in cam_renders:
@@ -1029,7 +1031,7 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             # Overlay FK plot on alpha window (bottom-left)
-            if realtime_plot_enabled and fig_fk is not None and len(trans_errors) > 1:
+            if not args.no_stack and realtime_plot_enabled and fig_fk is not None and len(trans_errors) > 1:
                 try:
                     plot_img = _fig_to_bgr_overlay(fig_fk, FK_OVERLAY_W, FK_OVERLAY_H)
                     alpha_frame = cam_renders["stationary"]["alpha"]

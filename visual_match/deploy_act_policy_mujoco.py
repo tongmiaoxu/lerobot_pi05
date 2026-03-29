@@ -17,6 +17,9 @@ Usage:
 
     # Use real-world dataset images as policy input (instead of MuJoCo rendering):
     python visual_match/deploy_act_policy_mujoco.py --obs --dataset-path data --episode 0
+
+    # Same as --obs but fixed to episode 0 of the eval dataset (default: data_eval):
+    python visual_match/deploy_act_policy_mujoco.py --obs-eval
 """
 
 import sys
@@ -27,10 +30,12 @@ import argparse
 from pathlib import Path
 import time
 import json
+import threading
 
 # Add src to path for lerobot imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
 # Auto-detect display (for cv2.imshow, mujoco.viewer)
 def _detect_display():
@@ -108,6 +113,40 @@ CAMERA_CONFIG = {
         "config": _wrist_cfg,
     },
 }
+
+
+def apply_gemini_parallel(translator, observation: dict) -> dict:
+    """Few-shot Gemini per camera in parallel; same examples as query_gemini (translator holds pairs)."""
+    out = dict(observation)
+    lock = threading.Lock()
+    errs: list[tuple[str, RuntimeError]] = []
+
+    def work(cam_key: str, obs_key: str, img: np.ndarray):
+        try:
+            translated = translator.translate(np.ascontiguousarray(img), cam_key)
+            with lock:
+                out[obs_key] = translated
+        except RuntimeError as e:
+            with lock:
+                errs.append((cam_key, e))
+
+    threads = []
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
+        if obs_key not in out:
+            continue
+        img = out[obs_key]
+        if not isinstance(img, np.ndarray):
+            continue
+        t = threading.Thread(target=work, args=(cam_key, obs_key, img))
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+    for cam_key, e in errs:
+        print(f"  [WARN] Gemini failed for {cam_key}: {e}")
+    return out
+
 
 # ============================================================================
 # Color calibration functions
@@ -250,7 +289,6 @@ def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
 
 
 def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco.Renderer,
-                                  gripper_mj_range: tuple,
                                   seg_renderer: mujoco.Renderer,
                                   robot_geom_ids: set,
                                   gaussian_data: dict | None,
@@ -261,7 +299,14 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
     Uses 2 cameras: cam_high (stationary) and cam_wrist, both with composite rendering.
     When obs_frames is provided (--obs mode), use real dataset images instead of rendered.
     """
-    state = mujoco_qpos_to_lerobot_state(data.qpos, gripper_mj_range)
+    ld_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "left_driver_joint")
+    if ld_id < 0:
+        raise RuntimeError("MuJoCo model has no joint 'left_driver_joint' (gripper driver).")
+    g_adr = int(model.jnt_qposadr[ld_id])
+    g_rad = (float(model.jnt_range[ld_id, 0]), float(model.jnt_range[ld_id, 1]))
+    state = mujoco_qpos_to_lerobot_state(
+        data.qpos, g_rad, gripper_qpos_adr=g_adr
+    )
     observation = {OBS_STATE: state}
 
     # Use real-world dataset images when --obs
@@ -273,7 +318,6 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
                 idx = frame_idx % len(frames)
                 observation[obs_key] = frames[idx].copy()
             else:
-                # Fallback: render if no real frames
                 renderer.update_scene(data, camera=cam_cfg["mujoco_cam"])
                 observation[obs_key] = renderer.render()
         return observation
@@ -288,7 +332,6 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
         mujoco_cam = cam_cfg["mujoco_cam"]
         obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
-
         if use_composite:
             rgb_image = render_composite_view(
                 model, data, renderer, seg_renderer, robot_geom_ids,
@@ -297,9 +340,7 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
         else:
             renderer.update_scene(data, camera=mujoco_cam)
             rgb_image = renderer.render()
-
         observation[obs_key] = rgb_image
-
     return observation
 
 
@@ -601,13 +642,13 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/act_xarm_training/checkpoints/last/pretrained_model",
+        default="outputs/pi05_xarm_training/checkpoints/last/pretrained_model",
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        default="Pick up the cube",
+        default="Pick up the green mug",
         help="Task prompt/instruction for the policy"
     )
     parser.add_argument(
@@ -634,19 +675,31 @@ def main():
         help="Path to Gaussian Splatting scene file for composite rendering"
     )
     parser.add_argument(
-        "--color-calibrate", action="store_true",
+        "--color-calibrate", action="store_true",default=True,
         help="Path to color calibration YAML file (optional)"
     )
-    parser.add_argument(
+    obs_mode = parser.add_mutually_exclusive_group()
+    obs_mode.add_argument(
         "--obs",
         action="store_true",
         help="Use real-world dataset images as policy input (instead of MuJoCo/composite rendering)"
+    )
+    obs_mode.add_argument(
+        "--obs-eval",
+        action="store_true",
+        help="Like --obs but use episode 0 from the eval dataset (default path: data_eval; see --obs-eval-path)"
     )
     parser.add_argument(
         "--dataset-path",
         type=str,
         default="data",
-        help="Path to dataset directory (required when --obs)"
+        help="Path to dataset directory for --obs and for Real display when not using --obs-eval"
+    )
+    parser.add_argument(
+        "--obs-eval-path",
+        type=str,
+        default="data_eval",
+        help="Dataset path for --obs-eval (default: data_eval)"
     )
     parser.add_argument(
         "--dataset-root",
@@ -657,7 +710,7 @@ def main():
     parser.add_argument(
         "--episode",
         type=int,
-        default=0,
+        default=1,
         help="Episode index for real observations (default: 0)"
     )
     parser.add_argument(
@@ -688,6 +741,13 @@ def main():
         type=str,
         default="data_sim_eval",
         help="Directory to save sim evaluation data (videos, states, grid image). Default: data_sim_eval"
+    )
+    parser.add_argument(
+        "--gemini",
+        action="store_true",
+        help="Use Gemini few-shot sim→real translation instead of color_mapping.yaml calibration. "
+             "Only queries the API when a new policy prediction is needed (every n_action_steps frames). "
+             "Uses 1 example pair for stationary, 3 for wrist.",
     )
 
     args = parser.parse_args()
@@ -730,6 +790,10 @@ def main():
 
     if args.obs:
         print("[INFO] --obs: using real-world dataset images as policy input")
+    elif args.obs_eval:
+        print(
+            f"[INFO] --obs-eval: using episode 0 images from {args.obs_eval_path!r} as policy input"
+        )
 
     # Load policy
     policy, config_dict = load_policy(args.policy_path)
@@ -820,7 +884,7 @@ def main():
                 args.scene_path, w2c_init, camera_intrinsics["stationary"]
             )
             color_calib = None
-            if args.color_calibrate:
+            if args.color_calibrate and not args.gemini:
                 default_calib = Path(__file__).parent.parent / "calibration_pairs_stationary" / "calibrated" / "color_mapping.yaml"
                 try:
                     color_calib = load_color_mapping(default_calib)
@@ -843,16 +907,45 @@ def main():
     else:
         print(f"[WARN] Scene file not found: {args.scene_path}")
 
-    # Load real-world dataset frames for display (and for policy when --obs)
+    # Gemini sim→real translator (replaces color calibration when --gemini)
+    gemini_translator = None
+    if args.gemini:
+        from query_gemini import GeminiTranslator
+        print("[INFO] Initializing Gemini translator (examples = query_gemini.EXAMPLE_FRAME_INDICES)...")
+        gemini_translator = GeminiTranslator(
+            stationary_pairs=1,
+            wrist_pairs=3,
+        )
+        n_act = getattr(policy.config, 'n_action_steps', None)
+        if n_act and n_act > 1:
+            est_calls = args.max_steps // n_act + 1
+            print(f"[INFO] Gemini ready: 2 parallel API calls per query, every ~{n_act} steps "
+                  f"(~{est_calls} query rounds/episode).")
+        else:
+            print("[INFO] Gemini ready: 2 parallel API calls each prediction step.")
+
+    # Load real-world dataset frames for display (and for policy when --obs / --obs-eval)
     obs_frames = None
+    if args.obs_eval:
+        obs_load_path = args.obs_eval_path
+        obs_load_episode = 0
+    else:
+        obs_load_path = args.dataset_path
+        obs_load_episode = args.episode
     try:
-        episode_data = load_episode(args.dataset_path, args.episode, dataset_root=args.dataset_root)
+        episode_data = load_episode(
+            obs_load_path, obs_load_episode, dataset_root=args.dataset_root
+        )
         obs_frames = load_dataset_frames(episode_data)
         num_obs_frames = max(len(obs_frames.get(k, [])) for k in CAMERA_CONFIG) or 1
-        print(f"[INFO] Loaded real dataset images: {num_obs_frames} frames from episode {args.episode}")
+        print(
+            f"[INFO] Loaded real dataset images: {num_obs_frames} frames from "
+            f"{obs_load_path!r} episode {obs_load_episode}"
+        )
     except Exception as e:
-        if args.obs:
-            print(f"[ERROR] Failed to load dataset for --obs: {e}")
+        if args.obs or args.obs_eval:
+            flag = "--obs-eval" if args.obs_eval else "--obs"
+            print(f"[ERROR] Failed to load dataset for {flag}: {e}")
             import traceback
             traceback.print_exc()
             sys.exit(1)
@@ -877,9 +970,21 @@ def main():
             cv2.resizeWindow(win_comp, WINDOW_W, WINDOW_H)
             cv2.moveWindow(win_real, X_START + i * X_STEP, Y_START)
             cv2.moveWindow(win_comp, X_START + i * X_STEP, Y_START + Y_STEP)
+            if args.gemini:
+                win_gem = f"Gemini: {cam_short}"
+                cv2.namedWindow(win_gem, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(win_gem, WINDOW_W, WINDOW_H)
+                cv2.moveWindow(win_gem, X_START + i * X_STEP, Y_START + 2 * Y_STEP)
 
-    print(f"[INFO] Starting policy evaluation ({num_eval_episodes} episodes, max {args.max_steps} steps each)"
-          + (" [real obs]" if args.obs else ""))
+    _obs_tag = ""
+    if args.obs:
+        _obs_tag = " [real obs]"
+    elif args.obs_eval:
+        _obs_tag = " [obs-eval]"
+    print(
+        f"[INFO] Starting policy evaluation ({num_eval_episodes} episodes, max {args.max_steps} steps each)"
+        f"{_obs_tag}"
+    )
 
     step_dt = 1.0 / args.fps
 
@@ -927,7 +1032,7 @@ def main():
                 set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
         if not args.headless:
             composite_obs = build_observation_from_mujoco(
-                model, data, renderer, gripper_mj_range,
+                model, data, renderer,
                 seg_renderer=seg_renderer, robot_geom_ids=robot_geom_ids,
                 gaussian_data=gaussian_data, obs_frames=None, frame_idx=0,
             )
@@ -943,7 +1048,7 @@ def main():
             display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
             if obs_frames is not None:
                 real_obs = build_observation_from_mujoco(
-                    model, data, renderer, gripper_mj_range,
+                    model, data, renderer,
                     seg_renderer=seg_renderer, robot_geom_ids=robot_geom_ids,
                     gaussian_data=gaussian_data, obs_frames=obs_frames, frame_idx=0,
                 )
@@ -1073,6 +1178,7 @@ def main():
             episode_actions = []
             episode_states = []
             episode_frames = {cam_key: [] for cam_key in CAMERA_CONFIG}
+            last_gemini_display_obs = None
             step = 0
             episode_discarded = False
 
@@ -1091,16 +1197,26 @@ def main():
                     if cam_cfg["config"].get("type", "stationary") == "stationary":
                         set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
+                # ACT action chunking: the policy only needs a new observation
+                # when its action queue is depleted. Skip expensive Gemini API
+                # calls on intermediate steps where we just pop from the queue.
+                needs_prediction = (
+                    not hasattr(policy, '_action_queue')
+                    or len(policy._action_queue) == 0
+                )
+
                 real_obs = build_observation_from_mujoco(
-                    model, data, renderer, gripper_mj_range,
+                    model, data, renderer,
                     seg_renderer=seg_renderer,
                     robot_geom_ids=robot_geom_ids,
                     gaussian_data=gaussian_data,
                     obs_frames=obs_frames,
                     frame_idx=step,
                 )
+
+                # Always build composite without Gemini (fast, for display + video)
                 composite_obs = build_observation_from_mujoco(
-                    model, data, renderer, gripper_mj_range,
+                    model, data, renderer,
                     seg_renderer=seg_renderer,
                     robot_geom_ids=robot_geom_ids,
                     gaussian_data=gaussian_data,
@@ -1108,28 +1224,49 @@ def main():
                     frame_idx=step,
                 )
 
+                # Policy input: real obs, Gemini-translated composite (parallel API, same
+                # few-shot examples as query_gemini), or raw composite if no Gemini / queue step.
+                if args.obs or args.obs_eval:
+                    observation = real_obs
+                elif gemini_translator is not None and needs_prediction:
+                    observation = apply_gemini_parallel(gemini_translator, composite_obs)
+                    last_gemini_display_obs = {
+                        k: observation[k].copy()
+                        for k in observation
+                        if "image" in k.lower()
+                        and isinstance(observation[k], np.ndarray)
+                    }
+                    n_act = getattr(policy.config, 'n_action_steps', '?')
+                    print(f"  [Gemini] Step {step}: parallel API calls on live composite "
+                          f"(next query in ~{n_act} steps)")
+                else:
+                    observation = composite_obs
+
                 if not args.headless:
                     display_camera_images(real_obs, policy_config=policy.config, window_name_prefix="Real")
                     display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
+                    if gemini_translator is not None and last_gemini_display_obs:
+                        display_camera_images(
+                            last_gemini_display_obs,
+                            policy_config=policy.config,
+                            window_name_prefix="Gemini",
+                        )
 
-                if args.obs:
-                    observation = real_obs
-                else:
-                    observation = composite_obs
                 if hasattr(policy.config, 'language_features') and policy.config.language_features:
                     observation["observation.language"] = args.prompt
 
-                # Capture frames for video recording (the images the policy actually sees)
+                # Record composite frames (fresh every step, shows actual sim state)
                 for _cam_key, _cam_cfg in CAMERA_CONFIG.items():
                     _obs_key = f"observation.images.{_cam_cfg['dataset_cam']}"
-                    if _obs_key in observation:
-                        episode_frames[_cam_key].append(observation[_obs_key].copy())
+                    if _obs_key in composite_obs:
+                        episode_frames[_cam_key].append(composite_obs[_obs_key].copy())
 
-                episode_states.append(observation[OBS_STATE].copy()
-                                      if isinstance(observation[OBS_STATE], np.ndarray)
-                                      else observation[OBS_STATE])
+                episode_states.append(composite_obs[OBS_STATE].copy()
+                                      if isinstance(composite_obs[OBS_STATE], np.ndarray)
+                                      else composite_obs[OBS_STATE])
 
                 with torch.inference_mode():
+                    # print(observation["observation.state"])
                     action = predict_action(
                         observation,
                         policy,
@@ -1140,7 +1277,7 @@ def main():
                         task=args.prompt,
                         robot_type="xarm_follower",
                     )
-
+                print(action)
                 episode_actions.append(action.cpu().numpy().copy())
 
                 ctrl = convert_action_to_mujoco(action, gripper_mj_range)
