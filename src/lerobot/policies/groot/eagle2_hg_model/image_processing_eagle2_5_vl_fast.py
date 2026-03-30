@@ -440,10 +440,17 @@ class Eagle25VLImageProcessorFast(BaseImageProcessorFast):
         do_convert_rgb = kwargs.pop("do_convert_rgb")
         input_data_format = kwargs.pop("input_data_format")
         device = kwargs.pop("device")
-        # Prepare input images
-        # transformers >= 4.53.0: uses _prepare_image_like_inputs instead of _prepare_input_images
+        # Prepare input images.
+        # Newer transformers use _prepare_image_like_inputs; 4.53.x only has _prepare_input_images (same kwargs).
+        prepare = getattr(self, "_prepare_image_like_inputs", None) or getattr(
+            self, "_prepare_input_images", None
+        )
+        if prepare is None:
+            raise AttributeError(
+                "BaseImageProcessorFast must define _prepare_image_like_inputs or _prepare_input_images"
+            )
         if images is not None:
-            images = self._prepare_image_like_inputs(
+            images = prepare(
                 images=images,
                 do_convert_rgb=do_convert_rgb,
                 input_data_format=input_data_format,
@@ -451,7 +458,7 @@ class Eagle25VLImageProcessorFast(BaseImageProcessorFast):
             )
 
         if videos is not None:
-            videos = self._prepare_image_like_inputs(
+            videos = prepare(
                 images=videos,
                 do_convert_rgb=do_convert_rgb,
                 input_data_format=input_data_format,

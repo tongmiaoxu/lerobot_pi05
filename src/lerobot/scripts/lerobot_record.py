@@ -148,8 +148,8 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + diffusion eval workflow).
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/pi05_xarm_training/checkpoints/last/pretrained_model"
-_DEFAULT_POLICY_PRETRAINED_HUB = "lerobot/pi05_base"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/groot_xarm_training/checkpoints/last/pretrained_model"
+_DEFAULT_POLICY_PRETRAINED_HUB = "nvidia/GR00T-N1.5-3B"
 
 
 @dataclass

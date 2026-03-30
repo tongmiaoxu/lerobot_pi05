@@ -52,6 +52,30 @@ DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_mo
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
 
 
+def _eagle_attn_implementation() -> str:
+    """Use FlashAttention2 when installed; otherwise PyTorch SDPA (no extra package)."""
+    try:
+        import flash_attn  # noqa: F401
+
+        return "flash_attention_2"
+    except ImportError:
+        return "sdpa"
+
+
+def _apply_attn_implementation_to_eagle_config(config) -> None:
+    impl = _eagle_attn_implementation()
+    if impl == "sdpa":
+        print(
+            "[GROOT] flash_attn not installed; using PyTorch SDPA for attention "
+            "(install flash-attn for speed: https://github.com/Dao-AILab/flash-attention)."
+        )
+    config._attn_implementation = impl
+    if getattr(config, "vision_config", None) is not None:
+        config.vision_config._attn_implementation = impl
+    if getattr(config, "text_config", None) is not None:
+        config.text_config._attn_implementation = impl
+
+
 class EagleBackbone(nn.Module):
     def __init__(
         self,
@@ -82,6 +106,7 @@ class EagleBackbone(nn.Module):
             print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
 
         config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
+        _apply_attn_implementation_to_eagle_config(config)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
         if project_to_dim is not None:

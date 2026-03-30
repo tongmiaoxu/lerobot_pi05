@@ -642,13 +642,13 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/pi05_xarm_training/checkpoints/last/pretrained_model",
+        default="outputs/act_xarm_training/checkpoints/last/pretrained_model",
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        default="Pick up the green mug",
+        default="Pick up the mug",
         help="Task prompt/instruction for the policy"
     )
     parser.add_argument(

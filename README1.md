@@ -37,7 +37,7 @@ lerobot-record \
     --teleop.type=gello_leader \
     --teleop.port=/dev/ttyUSB0 \
     --dataset.repo_id=tongmiao/xarm_pick_mug \
-    --dataset.single_task="Pick up the cube" \
+    --dataset.single_task="Pick up the mug" \
     --dataset.num_episodes=20 \
     --dataset.fps=30 \
     --dataset.root=data \
@@ -89,7 +89,7 @@ python visual_match/compare_recorded_vs_mujoco.py --cma
 ```
 
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py --no-mujoco-view
+python visual_match/compare_recorded_vs_mujoco.py --no-mujoco-view --no_stack
 ```
 
 ### load model in mujoco
@@ -157,6 +157,25 @@ lerobot-train \
   --wandb.project=xarm_pick_mug_lerobot0.4.3
 ```
 ```bash
+lerobot-train \
+  --policy.type=groot \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --policy.base_model_path=nvidia/GR00T-N1.5-3B \
+  --dataset.repo_id=tongmiao/xarm_pick_mug \
+  --dataset.root=data \
+  --output_dir=./outputs/groot_xarm_training \
+  --batch_size=1 \
+  --steps=20000 \
+  --save_freq=5000 \
+  --num_workers=8 \
+  --wandb.enable=true \
+  --wandb.project=xarm_pick_mug_lerobot0.4.3 \
+  --dataset.image_transforms.enable=true \
+  --policy.tune_projector=false
+```
+
+```bash
 accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_mug \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=xarm_pick_mug_lerobot0.4.3
 ```
 
@@ -167,9 +186,9 @@ lerobot-record \
   --robot.ip=192.168.1.228 \
   --teleop.type=gello_leader \
   --teleop.port=/dev/ttyUSB0 \
-  --policy.path=outputs/act_xarm_training/checkpoints/last/pretrained_model \
+  --policy.path=outputs/pi05_xarm_training/checkpoints/last/pretrained_model \
   --dataset.repo_id=tongmiao/eval_xarm_pick_mug \
-  --dataset.single_task="Pick up the cube" \
+  --dataset.single_task="Pick up the mug" \
   --dataset.num_episodes=10 \
   --dataset.fps=30 \
   --dataset.root=data_eval \
@@ -177,10 +196,7 @@ lerobot-record \
   --policy.pretrained_path=lerobot/pi05_base \
   --select=true
 ```
-### Policy rollout in Simulation for xarm (--obs means replace obs with real world images)
-```bash
-python visual_match/deploy_act_policy_mujoco.py --obs
-```
+
 ### Adjust obj position in mujoco (or --stiker)
 ```bash
 python visual_match/sticker_alpha_calibration.py --cube 
@@ -219,9 +235,9 @@ python visual_match/calibrate_color_wrist.py
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --color-calibrate
 ```
-**deployment**:(use --select to select windows for different distributions)
+**deployment**:(use --select to select windows for different distributions) (--obs means replace obs with real world images;--obs_eval means replace with real world eval images)
 ```bash
-python visual_match/deploy_act_policy_mujoco.py --color-calibrate --select
+python visual_match/deploy_act_policy_mujoco.py --select --gemini
 ```
 
 
@@ -236,9 +252,8 @@ reboot
 ```
 
 ```bash
-python tools/query_gemini.py     --pairs         calibration_pairs_wrist2/gs_renders/frame_0001.png         calibration_pairs_wrist2/real_captures/frame_0001.png         calibration_pairs_wrist2/gs_renders/frame_0002.png         calibration_pairs_wrist2/real_captures/frame_0002.png     --query calibration_pairs_wrist/gs_renders/frame_0003.png     -o predicted_real_frame_0003.png
-Few-shot mode: 2 example pair(s), query=calibration_pairs_wrist/gs_renders/frame_0003.png
-  Response contained 1 image(s), using the last one.
-Saved: predicted_real_frame_0003.png
-  Overlay saved: predicted_real_frame_0003_overlay.png
+python tools/query_gemini.py -n 1 --stationary
+```
+```bash
+python tools/query_gemini.py -n 3 --wrist
 ```
