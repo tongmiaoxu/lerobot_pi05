@@ -695,6 +695,35 @@ def build_dataset_frame(
     return frame
 
 
+def copy_observation_frame_with_resized_images(
+    frame: dict[str, Any],
+    out_height: int,
+    out_width: int,
+) -> dict[str, Any]:
+    """Shallow copy of *frame* with camera images resized to (out_height, out_width).
+
+    Only keys starting with ``observation.images.`` whose values are ``(H, W, 3)`` arrays are resized
+    (``cv2.resize``, INTER_AREA). State and other keys are passed through by reference.
+
+    Use this so the recorded dataset can stay at native camera resolution (e.g. 480×640) while the
+    policy receives a smaller resolution (e.g. 224×224) matching training.
+    """
+    import cv2
+
+    out: dict[str, Any] = {}
+    for k, v in frame.items():
+        if (
+            k.startswith(f"{OBS_STR}.images.")
+            and isinstance(v, np.ndarray)
+            and v.ndim == 3
+            and v.shape[2] == 3
+        ):
+            out[k] = cv2.resize(v, (out_width, out_height), interpolation=cv2.INTER_AREA)
+        else:
+            out[k] = v
+    return out
+
+
 def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFeature]:
     """Convert dataset features to policy features.
 

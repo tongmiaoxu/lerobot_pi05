@@ -69,7 +69,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
 from typing import Any
-
+from math import inf
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
@@ -82,7 +82,12 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import INFO_PATH, build_dataset_frame, combine_feature_dicts
+from lerobot.datasets.utils import (
+    INFO_PATH,
+    build_dataset_frame,
+    combine_feature_dicts,
+    copy_observation_frame_with_resized_images,
+)
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -148,8 +153,10 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + diffusion eval workflow).
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/groot_xarm_training/checkpoints/last/pretrained_model"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/diffusion_xarm_training/checkpoints/048000/pretrained_model"
 _DEFAULT_POLICY_PRETRAINED_HUB = "nvidia/GR00T-N1.5-3B"
+# _DEFAULT_RECORD_POLICY_CHECKPOINT = None
+# _DEFAULT_POLICY_PRETRAINED_HUB = None
 
 
 @dataclass
@@ -163,7 +170,7 @@ class DatasetRecordConfig:
     # Limit the frames per second.
     fps: int = 30
     # Number of seconds for data recording for each episode.
-    episode_time_s: int | float = 60
+    episode_time_s: int | int = inf
     # Number of seconds for resetting the environment after each episode.
     reset_time_s: int | float = 60
     # Number of episodes to record.
@@ -193,10 +200,19 @@ class DatasetRecordConfig:
     vcodec: str = "libsvtav1"
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # If both are set, resize images only for policy inference; LeRobotDataset still stores native camera
+    # resolution (e.g. 480×640) from robot.observation_features.
+    policy_input_resize_height: int | None = 224
+    policy_input_resize_width: int | None = 224
 
     def __post_init__(self):
         if self.single_task is None:
             raise ValueError("You need to provide a task as argument in `single_task`.")
+        h, w = self.policy_input_resize_height, self.policy_input_resize_width
+        if (h is None) ^ (w is None):
+            raise ValueError(
+                "Set both `policy_input_resize_height` and `policy_input_resize_width`, or leave both None."
+            )
 
 
 @dataclass
@@ -308,6 +324,7 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    policy_input_resize: tuple[int, int] | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -364,8 +381,14 @@ def record_loop(
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
             print(observation_frame["observation.state"])
+            obs_for_policy = observation_frame
+            if policy_input_resize is not None:
+                rh, rw = policy_input_resize
+                obs_for_policy = copy_observation_frame_with_resized_images(
+                    observation_frame, rh, rw
+                )
             action_values = predict_action(
-                observation=observation_frame,
+                observation=obs_for_policy,
                 policy=policy,
                 device=get_safe_torch_device(policy.config.device),
                 preprocessor=preprocessor,
@@ -859,7 +882,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         list_of_contours = None
         selected_contours = None
         selected_episode_indices = None
-        if cfg.select:
+        if cfg.select and cfg.policy is not None:
             list_of_contours = load_initial_state_contours(
                 initial_states_dir=cfg.initial_states_dir,
                 object_name=cfg.object_name,
@@ -944,6 +967,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                             control_time_s=float("inf"),
                             single_task=cfg.dataset.single_task,
                             display_data=cfg.display_data,
+                            policy_input_resize=None,
                         )
 
                         if events["stop_recording"]:
@@ -968,6 +992,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     print(f"  (auto-save after {cfg.dataset.episode_time_s}s)")
                     print(f"{'='*50}")
 
+                    _policy_resize = None
+                    if (
+                        cfg.dataset.policy_input_resize_height is not None
+                        and cfg.dataset.policy_input_resize_width is not None
+                    ):
+                        _policy_resize = (
+                            cfg.dataset.policy_input_resize_height,
+                            cfg.dataset.policy_input_resize_width,
+                        )
                     record_loop(
                         robot=robot,
                         events=events,
@@ -984,6 +1017,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         display_compressed_images=display_compressed_images,
+                        policy_input_resize=_policy_resize,
                     )
 
                     if events["stop_recording"]:

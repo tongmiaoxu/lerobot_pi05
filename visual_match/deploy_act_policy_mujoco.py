@@ -20,6 +20,9 @@ Usage:
 
     # Same as --obs but fixed to episode 0 of the eval dataset (default: data_eval):
     python visual_match/deploy_act_policy_mujoco.py --obs-eval
+
+    # Faster sim: skip replay load and "Real:" windows unless --obs / --obs-eval (those keep Real):
+    python visual_match/deploy_act_policy_mujoco.py --no_obs --fps 30
 """
 
 import sys
@@ -89,6 +92,7 @@ from lerobot_mujoco_utils import (
     lerobot_state_to_mujoco_ctrl,
     mujoco_qpos_to_lerobot_state,
 )
+from lerobot.datasets.utils import copy_observation_frame_with_resized_images
 from lerobot.datasets.video_utils import decode_video_frames
 
 # Arrow key codes for cv2.waitKeyEx (platform-dependent)
@@ -642,7 +646,7 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/act_xarm_training/checkpoints/last/pretrained_model",
+        default="outputs/diffusion_xarm_training/checkpoints/060000/pretrained_model",
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
@@ -712,6 +716,32 @@ def main():
         type=int,
         default=1,
         help="Episode index for real observations (default: 0)"
+    )
+    parser.add_argument(
+        "--policy-no-resize",
+        action="store_true",
+        help="Feed full render resolution to the policy (e.g. 640×480). Default: resize to policy-input-h/w.",
+    )
+    parser.add_argument(
+        "--policy-input-h",
+        type=int,
+        default=224,
+        help="Image height for policy input when resizing (default 224). Ignored with --policy-no-resize.",
+    )
+    parser.add_argument(
+        "--policy-input-w",
+        type=int,
+        default=224,
+        help="Image width for policy input when resizing (default 224). Ignored with --policy-no-resize.",
+    )
+    parser.add_argument(
+        "--no_obs",
+        action="store_true",
+        help=(
+            "Do not load real-world replay videos or show Real camera windows (composite-only). "
+            "Ignored for --obs and --obs-eval: those modes always load dataset frames and show "
+            "Real windows when not --headless. Skips expensive per-step replay when not needed."
+        ),
     )
     parser.add_argument(
         "--num_eval_episodes",
@@ -924,35 +954,47 @@ def main():
         else:
             print("[INFO] Gemini ready: 2 parallel API calls each prediction step.")
 
-    # Load real-world dataset frames for display (and for policy when --obs / --obs-eval)
+    # Load real-world dataset frames for display (and for policy when --obs / --obs-eval).
+    # With --no_obs, skip loading unless policy needs real images.
     obs_frames = None
-    if args.obs_eval:
-        obs_load_path = args.obs_eval_path
-        obs_load_episode = 0
-    else:
-        obs_load_path = args.dataset_path
-        obs_load_episode = args.episode
-    try:
-        episode_data = load_episode(
-            obs_load_path, obs_load_episode, dataset_root=args.dataset_root
-        )
-        obs_frames = load_dataset_frames(episode_data)
-        num_obs_frames = max(len(obs_frames.get(k, [])) for k in CAMERA_CONFIG) or 1
+    need_dataset_frames = args.obs or args.obs_eval or not args.no_obs
+    if need_dataset_frames:
+        if args.obs_eval:
+            obs_load_path = args.obs_eval_path
+            obs_load_episode = 0
+        else:
+            obs_load_path = args.dataset_path
+            obs_load_episode = args.episode
+        try:
+            episode_data = load_episode(
+                obs_load_path, obs_load_episode, dataset_root=args.dataset_root
+            )
+            obs_frames = load_dataset_frames(episode_data)
+            num_obs_frames = max(len(obs_frames.get(k, [])) for k in CAMERA_CONFIG) or 1
+            print(
+                f"[INFO] Loaded real dataset images: {num_obs_frames} frames from "
+                f"{obs_load_path!r} episode {obs_load_episode}"
+            )
+        except Exception as e:
+            if args.obs or args.obs_eval:
+                flag = "--obs-eval" if args.obs_eval else "--obs"
+                print(f"[ERROR] Failed to load dataset for {flag}: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+            print(f"[WARN] Could not load dataset for Real windows display: {e}")
+    elif args.no_obs:
         print(
-            f"[INFO] Loaded real dataset images: {num_obs_frames} frames from "
-            f"{obs_load_path!r} episode {obs_load_episode}"
+            "[INFO] --no_obs: skipping real-world replay load and Real camera windows "
+            "(composite-only deployment at --fps)."
         )
-    except Exception as e:
-        if args.obs or args.obs_eval:
-            flag = "--obs-eval" if args.obs_eval else "--obs"
-            print(f"[ERROR] Failed to load dataset for {flag}: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
-        print(f"[WARN] Could not load dataset for Real windows display: {e}")
 
     # Initialize keyboard listener (ALOHA-style state machine)
     listener, events = init_keyboard_listener()
+
+    # OpenCV "Real:" dataset replay windows: off with --no_obs unless --obs / --obs-eval
+    # (those modes need to see real images next to composite).
+    show_real_windows = (not args.no_obs) or args.obs or args.obs_eval
 
     if not args.headless:
         WINDOW_W, WINDOW_H = 400, 300
@@ -964,11 +1006,12 @@ def main():
             cam_short = obs_key.split('.')[-1]
             win_real = f"Real: {cam_short}"
             win_comp = f"Composite: {cam_short}"
-            cv2.namedWindow(win_real, cv2.WINDOW_NORMAL)
+            if show_real_windows:
+                cv2.namedWindow(win_real, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(win_real, WINDOW_W, WINDOW_H)
+                cv2.moveWindow(win_real, X_START + i * X_STEP, Y_START)
             cv2.namedWindow(win_comp, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(win_real, WINDOW_W, WINDOW_H)
             cv2.resizeWindow(win_comp, WINDOW_W, WINDOW_H)
-            cv2.moveWindow(win_real, X_START + i * X_STEP, Y_START)
             cv2.moveWindow(win_comp, X_START + i * X_STEP, Y_START + Y_STEP)
             if args.gemini:
                 win_gem = f"Gemini: {cam_short}"
@@ -1046,7 +1089,7 @@ def main():
                     cv2.drawContours(img, warmup_contour, -1, (0, 255, 0), 2)
                     composite_obs[cam_high_key] = img
             display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
-            if obs_frames is not None:
+            if obs_frames is not None and show_real_windows:
                 real_obs = build_observation_from_mujoco(
                     model, data, renderer,
                     seg_renderer=seg_renderer, robot_geom_ids=robot_geom_ids,
@@ -1205,14 +1248,20 @@ def main():
                     or len(policy._action_queue) == 0
                 )
 
-                real_obs = build_observation_from_mujoco(
-                    model, data, renderer,
-                    seg_renderer=seg_renderer,
-                    robot_geom_ids=robot_geom_ids,
-                    gaussian_data=gaussian_data,
-                    obs_frames=obs_frames,
-                    frame_idx=step,
+                need_real_obs = (
+                    args.obs or args.obs_eval
+                    or (obs_frames is not None and show_real_windows)
                 )
+                real_obs = None
+                if need_real_obs:
+                    real_obs = build_observation_from_mujoco(
+                        model, data, renderer,
+                        seg_renderer=seg_renderer,
+                        robot_geom_ids=robot_geom_ids,
+                        gaussian_data=gaussian_data,
+                        obs_frames=obs_frames,
+                        frame_idx=step,
+                    )
 
                 # Always build composite without Gemini (fast, for display + video)
                 composite_obs = build_observation_from_mujoco(
@@ -1243,7 +1292,8 @@ def main():
                     observation = composite_obs
 
                 if not args.headless:
-                    display_camera_images(real_obs, policy_config=policy.config, window_name_prefix="Real")
+                    if real_obs is not None and show_real_windows:
+                        display_camera_images(real_obs, policy_config=policy.config, window_name_prefix="Real")
                     display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
                     if gemini_translator is not None and last_gemini_display_obs:
                         display_camera_images(
@@ -1265,10 +1315,20 @@ def main():
                                       if isinstance(composite_obs[OBS_STATE], np.ndarray)
                                       else composite_obs[OBS_STATE])
 
+                obs_for_policy = observation
+                if (
+                    not args.policy_no_resize
+                    and args.policy_input_h > 0
+                    and args.policy_input_w > 0
+                ):
+                    obs_for_policy = copy_observation_frame_with_resized_images(
+                        observation, args.policy_input_h, args.policy_input_w
+                    )
+
                 with torch.inference_mode():
-                    # print(observation["observation.state"])
+                    print(observation["observation.state"])
                     action = predict_action(
-                        observation,
+                        obs_for_policy,
                         policy,
                         device,
                         preprocessor,
@@ -1277,7 +1337,7 @@ def main():
                         task=args.prompt,
                         robot_type="xarm_follower",
                     )
-                print(action)
+                # print(action)
                 episode_actions.append(action.cpu().numpy().copy())
 
                 ctrl = convert_action_to_mujoco(action, gripper_mj_range)

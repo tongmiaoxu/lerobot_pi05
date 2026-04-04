@@ -56,7 +56,7 @@ python -m lerobot.record \
   --dataset.single_task="Grab and handover the red cube to the other arm"
 ```
 """
-
+from math import inf
 import logging
 import time
 from dataclasses import asdict, dataclass

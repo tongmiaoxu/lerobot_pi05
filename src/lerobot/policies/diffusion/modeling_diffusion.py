@@ -138,14 +138,13 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float] | None]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.diffusion.compute_loss(batch)
-        # no output_dict so returning None
-        return loss, None
+        loss, log_dict = self.diffusion.compute_loss(batch)
+        return loss, log_dict
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -302,7 +301,7 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
         """
         This function expects `batch` to have (at least):
         {
@@ -315,6 +314,10 @@ class DiffusionModel(nn.Module):
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
         }
+
+        Returns:
+            Scalar MSE diffusion loss (for backprop) and a dict with ``l1_loss``: mean L1 between ground-truth
+            actions and one-step predicted trajectory (logging only; not added to the loss).
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
@@ -365,7 +368,28 @@ class DiffusionModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
-        return loss.mean()
+        train_loss = loss.mean()
+
+        # Logging-only L1 on action error (same masking as ACT); not used for backprop.
+        with torch.no_grad():
+            if self.config.prediction_type == "epsilon":
+                # x_t = sqrt(alpha_bar) * x0 + sqrt(1 - alpha_bar) * eps  => recover x0_hat from eps_hat
+                acp = self.noise_scheduler.alphas_cumprod[timesteps].to(
+                    device=trajectory.device, dtype=trajectory.dtype
+                )
+                acp = acp.view(-1, 1, 1)
+                sqrt_acp = acp.sqrt().clamp(min=1e-8)
+                sqrt_om_acp = (1.0 - acp).sqrt()
+                pred_traj = (noisy_trajectory - sqrt_om_acp * pred) / sqrt_acp
+            elif self.config.prediction_type == "sample":
+                pred_traj = pred
+            else:
+                raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
+
+            pad = batch["action_is_pad"].unsqueeze(-1)
+            l1 = (F.l1_loss(trajectory, pred_traj, reduction="none") * ~pad).mean()
+
+        return train_loss, {"l1_loss": l1.item()}
 
 
 class SpatialSoftmax(nn.Module):
