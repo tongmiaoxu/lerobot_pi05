@@ -114,9 +114,9 @@ lerobot-train \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --batch_size=8 \
   --steps=80000 \
-  --save_freq=20000 \
+  --save_freq=5000 \
   --wandb.enable=true \
-  --wandb.project=xarm_pick_mug_lerobot0.4.3 \
+  --wandb.project=pick_mug \
   --dataset.image_transforms.enable=true
 ```
 ```bash
@@ -129,13 +129,15 @@ lerobot-train \
   --output_dir=./outputs/diffusion_xarm_training \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --wandb.enable=true \
-  --wandb.project=xarm_pick_mug_lerobot0.4.3  \
+  --wandb.project=pick_mug  \
   --dataset.image_transforms.enable=true \
-  --policy.horizon=64 \
-  --policy.n_action_steps=50 \
-  --batch_size=64 \
-  --save_freq=2000
-  --steps=8000
+  --policy.horizon=32 \
+  --policy.n_action_steps=25 \
+  --batch_size=128 \
+  --save_freq=8000 \
+  --steps=80000 \
+  --config_path=outputs/diffusion_xarm_training/checkpoints/010000/pretrained_model/train_config.json \
+  --resume=true
 ```
 ```bash
 lerobot-train \
@@ -154,7 +156,8 @@ lerobot-train \
   --steps=30000 \
   --save_freq=10000 \
   --wandb.enable=true \
-  --wandb.project=xarm_pick_mug_lerobot0.4.3
+  --dataset.image_transforms.enable=true \
+  --wandb.project=pick_mug
 ```
 ```bash
 lerobot-train \
@@ -170,13 +173,13 @@ lerobot-train \
   --save_freq=5000 \
   --num_workers=8 \
   --wandb.enable=true \
-  --wandb.project=xarm_pick_mug_lerobot0.4.3 \
+  --wandb.project=pick_mug \
   --dataset.image_transforms.enable=true \
   --policy.tune_projector=false
 ```
 
 ```bash
-accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_mug \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=xarm_pick_mug_lerobot0.4.3
+accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_mug \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=pick_mug
 ```
 
 ### Policy Deployment for xarm
@@ -235,7 +238,7 @@ python visual_match/calibrate_color_wrist.py
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --color-calibrate
 ```
-**deployment**:(use --select to select windows for different distributions) (--obs means replace obs with real world images;--obs_eval means replace with real world eval images)
+**deployment**:(use --select to select windows for different distributions) (--obs means replace obs with real world images;--obs_eval means replace with real world eval images)(-no_obs means deploy faster)
 ```bash
 python visual_match/deploy_act_policy_mujoco.py --select --gemini
 ```
