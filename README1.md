@@ -149,16 +149,18 @@ lerobot-train \
   --policy.gradient_checkpointing=true \
   --policy.dtype=bfloat16 \
   --policy.train_expert_only=true \
+  --policy.scheduler_warmup_steps=1000 \
+  --policy.scheduler_decay_steps=50000 \
   --dataset.repo_id=tongmiao/xarm_pick_mug \
   --dataset.root=data \
+  --dataset.use_imagenet_stats=false \
+  --dataset.image_transforms.enable=true \
   --output_dir=./outputs/pi05_xarm_training \
   --batch_size=16 \
-  --steps=30000 \
+  --steps=50000 \
   --save_freq=10000 \
   --wandb.enable=true \
-  --dataset.image_transforms.enable=true \
   --wandb.project=pick_mug
-```
 ```bash
 lerobot-train \
   --policy.type=groot \

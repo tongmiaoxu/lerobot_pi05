@@ -1098,6 +1098,16 @@ class PI05Policy(PreTrainedPolicy):
                 # Some checkpoints might have this, but current model expects different structure
                 logging.warning(f"Vision embedding key might need handling: {key}")
 
+            # Handle tied weights: PaliGemma saves lm_head.weight only (weight tying with embed_tokens).
+            # We need to also inject it as embed_tokens.weight so load_state_dict finds it.
+            if key in (
+                "model.paligemma_with_expert.paligemma.lm_head.weight",
+                "paligemma_with_expert.paligemma.lm_head.weight",
+            ):
+                fixed_state_dict[
+                    "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+                ] = value.clone()
+
             fixed_state_dict[new_key] = value
 
         return fixed_state_dict
