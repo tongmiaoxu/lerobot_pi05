@@ -30,7 +30,7 @@ def lerobot_state_to_mujoco_ctrl(
     ctrl[:, :7] = np.deg2rad(state[:, :7])
     grip_frac = np.clip(state[:, 7] / GRIPPER_OPEN_MM, 0.0, 1.0)
     mj_hi, mj_lo = gripper_mj_range
-    ctrl[:, 7] = mj_lo + grip_frac*0.7 * (mj_hi - mj_lo)
+    ctrl[:, 7] = mj_lo + grip_frac* (mj_hi - mj_lo)
     return ctrl[0] if scalar else ctrl
 
 
