@@ -10,11 +10,6 @@ xArm observation.state format (8-dim): [joint1..7 in degrees, gripper in mm (0=c
 composite rendering pipeline.
 
 Usage:
-    python visual_match/deploy_act_policy_mujoco.py \
-        --policy-path outputs/train/act_pick_cuber/checkpoints/080000/pretrained_model \
-        --prompt "Pick up the cube" \
-        --fps 30
-
     # Use real-world dataset images as policy input (instead of MuJoCo rendering):
     python visual_match/deploy_act_policy_mujoco.py --obs --dataset-path data --episode 0
 
@@ -646,7 +641,7 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/diffusion_xarm_training/checkpoints/060000/pretrained_model",
+        default="outputs/pi05_xarm_training/checkpoints/last/pretrained_model",
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
@@ -1294,7 +1289,6 @@ def main():
                 if not args.headless:
                     if real_obs is not None and show_real_windows:
                         display_camera_images(real_obs, policy_config=policy.config, window_name_prefix="Real")
-                    display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
                     if gemini_translator is not None and last_gemini_display_obs:
                         display_camera_images(
                             last_gemini_display_obs,
@@ -1324,6 +1318,10 @@ def main():
                     obs_for_policy = copy_observation_frame_with_resized_images(
                         observation, args.policy_input_h, args.policy_input_w
                     )
+
+                # Display resized policy input so the window reflects what the policy actually sees
+                if not args.headless:
+                    display_camera_images(obs_for_policy, policy_config=policy.config, window_name_prefix="Composite")
 
                 with torch.inference_mode():
                     print(observation["observation.state"])
