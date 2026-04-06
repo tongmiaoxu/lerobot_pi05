@@ -96,6 +96,7 @@ class GrootConfig(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
+    scheduler_decay_steps: int = 10000  # Set to match --steps; default matches original GR00T
     use_bf16: bool = True
 
     # Dataset parameters
@@ -180,8 +181,8 @@ class GrootConfig(PreTrainedConfig):
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
         """Return scheduler configuration."""
         return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default
-            num_decay_steps=10000,  # Adjust based on training steps
+            num_warmup_steps=int(self.scheduler_decay_steps * self.warmup_ratio),
+            num_decay_steps=self.scheduler_decay_steps,
             peak_lr=self.optimizer_lr,
             decay_lr=self.optimizer_lr * 0.1,
         )
