@@ -161,23 +161,29 @@ lerobot-train \
   --save_freq=10000 \
   --wandb.enable=true \
   --wandb.project=pick_mug
+```
+
 ```bash
 lerobot-train \
   --policy.type=groot \
   --policy.device=cuda \
   --policy.push_to_hub=false \
   --policy.base_model_path=nvidia/GR00T-N1.5-3B \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=50 \
+  --policy.scheduler_decay_steps=90000 \
+  --policy.tune_projector=true \
   --dataset.repo_id=tongmiao/xarm_pick_mug \
   --dataset.root=data \
-  --output_dir=./outputs/groot_xarm_training \
-  --batch_size=1 \
-  --steps=20000 \
-  --save_freq=5000 \
-  --num_workers=8 \
-  --wandb.enable=true \
-  --wandb.project=pick_mug \
+  --dataset.use_imagenet_stats=false \
   --dataset.image_transforms.enable=true \
-  --policy.tune_projector=false
+  --output_dir=./outputs/groot_xarm_training \
+  --batch_size=16 \
+  --steps=100000 \
+  --save_freq=20000 \
+  --num_workers=4 \
+  --wandb.enable=true \
+  --wandb.project=pick_mug
 ```
 
 ```bash
