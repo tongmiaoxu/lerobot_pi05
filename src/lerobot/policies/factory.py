@@ -83,6 +83,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
         return DiffusionPolicy
+    elif name == "diffusion_dinov2":
+        from lerobot.policies.diffusion_dinov2.modeling_diffusion_dinov2 import DiffusionDINOv2Policy
+
+        return DiffusionDINOv2Policy
     elif name == "act":
         from lerobot.policies.act.modeling_act import ACTPolicy
 
@@ -161,6 +165,9 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return TDMPCConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
+    elif policy_type == "diffusion_dinov2":
+        from lerobot.policies.diffusion_dinov2.configuration_diffusion_dinov2 import DiffusionDINOv2Config
+        return DiffusionDINOv2Config(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
     elif policy_type == "vqbet":
@@ -244,22 +251,32 @@ def make_pre_post_processors(
     if pretrained_path:
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
-            # GROOT handles normalization in groot_pack_inputs_v3 step
-            # Need to override both stats AND normalize_min_max since saved config might be empty
+            # GROOT handles normalization in groot_pack_inputs_v3 step.
+            # Stats are saved in the checkpoint safetensors and loaded via load_state_dict.
+            # Only override stats from dataset_stats if they are actually available (non-None).
+            # During deployment with a fresh eval dataset, dataset_stats is None — in that case
+            # we must NOT override, so the checkpoint's own saved stats are used instead.
+            dataset_stats = kwargs.get("dataset_stats")
             preprocessor_overrides = {}
             postprocessor_overrides = {}
-            preprocessor_overrides["groot_pack_inputs_v3"] = {
-                "stats": kwargs.get("dataset_stats"),
-                "normalize_min_max": True,
-            }
 
-            # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
+            if dataset_stats is not None:
+                preprocessor_overrides["groot_pack_inputs_v3"] = {
+                    "stats": dataset_stats,
+                    "normalize_min_max": True,
+                }
+
+            # Always ensure postprocessing slices to env action dim.
+            # Only override stats if dataset_stats is available.
             env_action_dim = policy_cfg.output_features[ACTION].shape[0]
-            postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = {
-                "stats": kwargs.get("dataset_stats"),
+            unnorm_override = {
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,
             }
+            if dataset_stats is not None:
+                unnorm_override["stats"] = dataset_stats
+            postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = unnorm_override
+
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
@@ -294,6 +311,15 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, DiffusionConfig):
+        from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+
+        processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif policy_cfg.type == "diffusion_dinov2":
+        # Lazy import — avoids pulling in `transformers` unless DINOv2 is actually used
         from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
         processors = make_diffusion_pre_post_processors(

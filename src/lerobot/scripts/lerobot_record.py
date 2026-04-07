@@ -152,11 +152,9 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
-# Defaults for `lerobot-record` with no CLI args (xArm + GELLO + diffusion eval workflow).
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/diffusion_xarm_training/checkpoints/048000/pretrained_model"
-_DEFAULT_POLICY_PRETRAINED_HUB = "nvidia/GR00T-N1.5-3B"
-# _DEFAULT_RECORD_POLICY_CHECKPOINT = None
-# _DEFAULT_POLICY_PRETRAINED_HUB = None
+# Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
+# Set to None to require --policy.path to be passed explicitly on the CLI.
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_xarm_training_224/checkpoints/last/pretrained_model"
 
 
 @dataclass
@@ -256,9 +254,6 @@ class RecordConfig:
 
         if policy_path:
             cli_overrides = list(parser.get_cli_overrides("policy") or [])
-            if not any("pretrained_path" in o for o in cli_overrides):
-                cli_overrides.append(f"--pretrained_path={_DEFAULT_POLICY_PRETRAINED_HUB}")
-
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
@@ -380,7 +375,7 @@ def record_loop(
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
-            print(observation_frame["observation.state"])
+            # print(observation_frame["observation.state"])
             obs_for_policy = observation_frame
             if policy_input_resize is not None:
                 rh, rw = policy_input_resize
@@ -397,7 +392,7 @@ def record_loop(
                 task=single_task,
                 robot_type=robot.robot_type,
             )
-            print(action_values)
+            # print(action_values)
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
@@ -430,6 +425,7 @@ def record_loop(
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
         # Send action to robot
+        print(robot_action_to_send)
         _sent_action = robot.send_action(robot_action_to_send)
 
         # Write to dataset
