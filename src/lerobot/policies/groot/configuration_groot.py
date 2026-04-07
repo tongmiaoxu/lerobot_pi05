@@ -99,26 +99,6 @@ class GrootConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 10000  # Set to match --steps; default matches original GR00T
     use_bf16: bool = True
 
-    # Dataset parameters
-    # Video backend to use for training ('decord' or 'torchvision_av')
-    video_backend: str = "decord"
-
-    # Whether to balance dataset weights in mixture datasets
-    balance_dataset_weights: bool = True
-
-    # Whether to sample trajectories weighted by their length
-    balance_trajectory_weights: bool = True
-
-    # Optional dataset paths for delegating training to Isaac-GR00T runner
-    dataset_paths: list[str] | None = None
-    output_dir: str = "./tmp/gr00t"
-    save_steps: int = 1000
-    max_steps: int = 10000
-    batch_size: int = 32
-    dataloader_num_workers: int = 8
-    report_to: str = "wandb"
-    resume: bool = False
-
     def __post_init__(self):
         super().__post_init__()
 
