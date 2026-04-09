@@ -109,35 +109,40 @@ python visual_match/initial_states_overlay.py
 
 ```bash
 python scripts/train_task.py \
-  --task-id=pick_mug \
+  --task-id=place_mug \
   --policy-type=act \
   --policy.device=cuda \
   --policy.push_to_hub=false \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
-  --batch_size=8 \
-  --steps=80000 \
-  --save_freq=5000 \
+  --batch_size=32 \
+  --steps=90000 \
+  --save_freq=30000 \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=50 \
   --dataset.image_transforms.enable=true
 ```
 ```bash
 python scripts/train_task.py \
-  --task-id=pick_mug \
+  --task-id=place_mug \
   --policy-type=diffusion \
   --policy.device=cuda \
   --policy.push_to_hub=false \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --dataset.image_transforms.enable=true \
-  --policy.horizon=32 \
-  --policy.n_action_steps=25 \
+  --policy.horizon=56 \
+  --policy.n_action_steps=50 \
   --batch_size=128 \
   --save_freq=8000 \
   --steps=80000 \
   --config_path=outputs/diffusion_xarm_training/checkpoints/010000/pretrained_model/train_config.json \
   --resume=true
 ```
+(diffusion n_obs_steps = 2;n_action_steps <= horizon - n_obs_steps + 1; horizon divisible by 8)
+
+
 ```bash
 python scripts/train_task.py \
-  --task-id=pick_mug \
+  --task-id=place_mug \
   --policy-type=pi05 \
   --policy.device=cuda \
   --policy.pretrained_path=lerobot/pi05_base \
@@ -164,14 +169,15 @@ python scripts/train_task.py \
   --policy.base_model_path=nvidia/GR00T-N1.5-3B \
   --policy.chunk_size=50 \
   --policy.n_action_steps=50 \
-  --policy.scheduler_decay_steps=90000 \
+  --policy.scheduler_decay_steps=100000 \
   --policy.tune_projector=true \
   --dataset.use_imagenet_stats=false \
   --dataset.image_transforms.enable=true \
   --batch_size=16 \
   --steps=100000 \
   --save_freq=20000 \
-  --num_workers=4
+  --num_workers=4 \
+  --dataset.video_backend=pyav
 ```
 
 ```bash
@@ -253,4 +259,9 @@ python tools/query_gemini.py -n 1 --stationary
 ```
 ```bash
 python tools/query_gemini.py -n 3 --wrist
+```
+
+###Downsample dataset images
+```bash
+python scripts/prepare_lerobot_dataset_224.py /path/to/your_dataset_name
 ```
