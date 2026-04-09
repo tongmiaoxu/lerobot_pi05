@@ -1,21 +1,19 @@
 """
-Extract the first frame of the stationary camera (cam_high) from every episode
-in data_1, segment target objects using Grounding-DINO + SAM2, then produce
-clear initial-state distribution / overlay visualisations that show where each
-object appears across episodes without blurring.
+Extract the first frame of the stationary camera (cam_high) from every episode,
+segment target objects using Grounding-DINO + SAM2, and save initial-state
+visualisations directly under the dataset root.
 
-Uses ffmpeg (subprocess) to decode AV1-encoded video files.
-SAM2 checkpoint loaded from  <repo-root>/weights/sam2/sam2.1_hiera_large.pt
+Uses ffmpeg (subprocess) to decode dataset videos.
+SAM2 checkpoint loaded from <repo-root>/weights/sam2/sam2.1_hiera_large.pt
 
-Outputs (saved to visual_match/initial_states/):
-  - individual_frames/ep_XXX.png              – raw first frame per episode
+Outputs (saved under DATA_DIR):
+  - _initial_state_frames/ep_XXX.png          – cached first frame per episode
   - <object>/individual_masks/ep_XXX_mask.png – binary object mask per episode
-  - <object>/individual_masked/ep_XXX_masked.png – object cutout (transparent bg)
-  - <object>/occupancy_heatmap.png   – per-pixel count heatmap (jet colourmap)
-  - <object>/contours_overlay.png    – all contours on median background
-  - <object>/pixel_masks_overlay.png – original-pixel transparent overlay
-  - <object>/object_centroids.png    – centroid scatter + spread ellipse
-  - <object>/all_episodes_grid.png   – grid montage of every first frame
+  - <object>/contours_overlay.png             – all contours on median background
+  - <object>/pixel_masks_overlay.png          – original-pixel transparent overlay
+  - <object>/object_centroids.png             – centroid scatter + spread ellipse
+  - <object>/all_episodes_grid.png            – grid montage of every first frame
+  - pixel_masks_overlay.png                   – combined overlay across all objects
 """
 
 import json
@@ -33,10 +31,9 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 
-# ── paths (defined early so helpers can reference ROOT) ──────────────────────
 ROOT = Path(__file__).resolve().parent.parent          # lerobot_pi05
-
-
+TEXT_PROMPTS = ["plate,mug"]   # Comma-separated entries are split into separate objects
+DATA_DIR = ROOT / "data_place_mug copy"
 # ── segmentation helpers (merged from sam2_segmentation.py) ──────────────────
 _SEGMENT_MODELS = None
 
@@ -123,6 +120,21 @@ def _make_colormap(n):
         colours[i] = rgb
     return colours
 
+
+def _expand_text_prompts(prompt_list):
+    """Split comma-separated prompt entries into unique individual object prompts."""
+    expanded = []
+    for prompt in prompt_list:
+        for part in prompt.split(","):
+            token = part.strip()
+            if token and token not in expanded:
+                expanded.append(token)
+    return expanded
+
+
+def _sanitize_object_name(name: str) -> str:
+    return name.strip().replace("/", "_").replace(" ", "_")
+
 def _filter_mask_by_neighbor_centroids(mask, neighbor_centroids):
     """If a mask has multiple disconnected components, keep only the one
     whose centroid is closest to the mean of *neighbor_centroids*.
@@ -176,14 +188,11 @@ def _filter_mask_by_neighbor_centroids(mask, neighbor_centroids):
 
 
 # ── config ───────────────────────────────────────────────────────────────────
-TEXT_PROMPTS = ["mug"]   # Grounding-DINO text prompts for objects
 
-# ── dataset paths ────────────────────────────────────────────────────────────
-DATA_DIR = ROOT / "data"
 META_DIR = DATA_DIR / "meta"
 VIDEO_DIR = DATA_DIR / "videos" / "observation.images.cam_high"
-OUT_DIR = Path(__file__).resolve().parent / "initial_states"
-FRAMES_DIR = OUT_DIR / "individual_frames"
+OUT_DIR = DATA_DIR
+FRAMES_DIR = OUT_DIR / "_initial_state_frames"
 FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -266,7 +275,7 @@ for ep_idx, vid_path, offset in episode_info:
 
     frames.append(frame_rgb)
     ep_indices.append(ep_idx)
-    print(f"  Episode {ep_idx:3d}  ✓")
+    # print(f"  Episode {ep_idx:3d}  ✓")
 
 print(f"Extracted {len(frames)} / {total_episodes} first frames")
 if len(frames) == 0:
@@ -274,90 +283,61 @@ if len(frames) == 0:
 
 
 # ── STEP 2 & 3: segment + visualise for EACH object ─────────────────────────
-# We run the full segmentation + visualisation pipeline per object prompt,
-# saving outputs into per-object subdirectories.
+# We run the segmentation + visualisation pipeline per object, saving outputs
+# into per-object subdirectories under the dataset root.
 
 # Compute median background once (shared across objects)
 stack = np.stack(frames).astype(np.float64)
 median_bg = np.median(stack, axis=0).astype(np.uint8)
-Image.fromarray(median_bg).save(OUT_DIR / "median_background.png")
 
 n = len(frames)
 cmap = _make_colormap(n)
+object_prompts = _expand_text_prompts(TEXT_PROMPTS)
+object_masks_by_name = {}
 
-for TEXT_PROMPT in TEXT_PROMPTS:
+for text_prompt in object_prompts:
     print(f"\n{'='*60}")
-    print(f"  Processing object: '{TEXT_PROMPT}'")
+    print(f"  Processing object: '{text_prompt}'")
     print(f"{'='*60}")
 
-    # Per-object output dirs
-    obj_dir = OUT_DIR / TEXT_PROMPT
+    object_name = _sanitize_object_name(text_prompt)
+    obj_dir = OUT_DIR / object_name
     obj_masks_dir = obj_dir / "individual_masks"
-    obj_masked_dir = obj_dir / "individual_masked"
-    for d in [obj_masks_dir, obj_masked_dir]:
-        d.mkdir(parents=True, exist_ok=True)
+    obj_masks_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Segment the object in every first frame ─────────────────────────────
-    print(f"\n── Segmenting '{TEXT_PROMPT}' in each frame ──")
+    print(f"\n── Segmenting '{text_prompt}' in each frame ──")
     masks = []           # list of (H, W) bool arrays (or None)
     centroids = []       # list of (cx, cy) for valid masks
 
     for i, (frame_rgb, ep_idx) in enumerate(zip(frames, ep_indices)):
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        mask = _segment_object_mask(frame_bgr, text_prompt=TEXT_PROMPT)
+        mask = _segment_object_mask(frame_bgr, text_prompt=text_prompt)
 
         if mask is not None and mask.any():
-            # Filter spurious components using nearby episode centroids
             lo = max(0, i - 3)
             neighbor_cents = centroids[lo:i]
             mask = _filter_mask_by_neighbor_centroids(mask, neighbor_cents)
 
             masks.append(mask)
-            # save binary mask
             mask_img = (mask.astype(np.uint8) * 255)
             Image.fromarray(mask_img).save(obj_masks_dir / f"ep_{ep_idx:03d}_mask.png")
-            # save masked cutout (RGBA)
-            rgba = np.zeros((*frame_rgb.shape[:2], 4), dtype=np.uint8)
-            rgba[..., :3] = frame_rgb
-            rgba[..., 3] = mask.astype(np.uint8) * 255
-            Image.fromarray(rgba).save(obj_masked_dir / f"ep_{ep_idx:03d}_masked.png")
-            # centroid
             ys, xs = np.where(mask)
             cx, cy = xs.mean(), ys.mean()
             centroids.append((cx, cy))
-            print(f"  Episode {ep_idx:3d}  mask pixels={mask.sum():7d}  centroid=({cx:.0f},{cy:.0f})")
         else:
             masks.append(None)
             centroids.append(None)
             print(f"  Episode {ep_idx:3d}  [no mask found]")
 
     valid = sum(1 for m in masks if m is not None)
-    print(f"Segmented {valid} / {len(frames)} episodes for '{TEXT_PROMPT}'")
+    print(f"Segmented {valid} / {len(frames)} episodes for '{text_prompt}'")
 
     if valid == 0:
-        print(f"  [SKIP] No masks found for '{TEXT_PROMPT}' – skipping visualisations")
+        print(f"  [SKIP] No masks found for '{text_prompt}' – skipping visualisations")
         continue
 
-    # ── Visualisations ──────────────────────────────────────────────────────
-
-    # --- Occupancy heatmap ---------------------------------------------------
-    occupancy = np.zeros((vid_h, vid_w), dtype=np.float64)
-    for m in masks:
-        if m is not None:
-            occupancy += m.astype(np.float64)
-
-    occ_norm = (occupancy / max(occupancy.max(), 1) * 255).astype(np.uint8)
-    heatmap_bgr = cv2.applyColorMap(occ_norm, cv2.COLORMAP_JET)
-    heat_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
-    blend = median_bg.copy()
-    occ_mask = occupancy > 0
-    alpha_heat = 0.65
-    blend[occ_mask] = (
-        alpha_heat * heat_rgb[occ_mask].astype(np.float64)
-        + (1 - alpha_heat) * median_bg[occ_mask].astype(np.float64)
-    ).astype(np.uint8)
-    Image.fromarray(blend).save(obj_dir / "occupancy_heatmap.png")
-    print(f"  Saved {TEXT_PROMPT}/occupancy_heatmap.png")
+    object_masks_by_name[object_name] = masks
 
     # --- Contours overlay ----------------------------------------------------
     contours_img_bgr = cv2.cvtColor(median_bg.copy(), cv2.COLOR_RGB2BGR)
@@ -371,12 +351,12 @@ for TEXT_PROMPT in TEXT_PROMPTS:
         cv2.drawContours(contours_img_bgr, contours, -1, colour_bgr, 2)
     contours_rgb = cv2.cvtColor(contours_img_bgr, cv2.COLOR_BGR2RGB)
     Image.fromarray(contours_rgb).save(obj_dir / "contours_overlay.png")
-    print(f"  Saved {TEXT_PROMPT}/contours_overlay.png")
+    print(f"  Saved {object_name}/contours_overlay.png")
 
     # --- Transparent original-pixel masks overlay ----------------------------
     pixel_overlay = median_bg.astype(np.float64).copy()
     alpha_per_ep = min(0.5, 20 / max(valid, 1))
-    for i, (m, frame_rgb) in enumerate(zip(masks, frames)):
+    for m, frame_rgb in zip(masks, frames):
         if m is None:
             continue
         pixel_overlay[m] = (
@@ -385,9 +365,9 @@ for TEXT_PROMPT in TEXT_PROMPTS:
         )
     pixel_overlay = np.clip(pixel_overlay, 0, 255).astype(np.uint8)
     Image.fromarray(pixel_overlay).save(obj_dir / "pixel_masks_overlay.png")
-    print(f"  Saved {TEXT_PROMPT}/pixel_masks_overlay.png")
+    print(f"  Saved {object_name}/pixel_masks_overlay.png")
 
-    # --- Centroid scatter + spread ellipse ------------------------------------
+    # --- Centroid scatter + spread ellipse ----------------------------------
     centroid_img_bgr = cv2.cvtColor(median_bg.copy(), cv2.COLOR_RGB2BGR)
     valid_centroids = [c for c in centroids if c is not None]
     for i, c in enumerate(centroids):
@@ -412,7 +392,7 @@ for TEXT_PROMPT in TEXT_PROMPTS:
         )
     centroid_rgb = cv2.cvtColor(centroid_img_bgr, cv2.COLOR_BGR2RGB)
     Image.fromarray(centroid_rgb).save(obj_dir / "object_centroids.png")
-    print(f"  Saved {TEXT_PROMPT}/object_centroids.png")
+    print(f"  Saved {object_name}/object_centroids.png")
 
     # --- Grid montage --------------------------------------------------------
     cols = math.ceil(math.sqrt(n))
@@ -434,6 +414,48 @@ for TEXT_PROMPT in TEXT_PROMPTS:
         grid[r * thumb_h:(r + 1) * thumb_h, c * thumb_w:(c + 1) * thumb_w] = thumb
 
     Image.fromarray(grid).save(obj_dir / "all_episodes_grid.png")
-    print(f"  Saved {TEXT_PROMPT}/all_episodes_grid.png")
+    print(f"  Saved {object_name}/all_episodes_grid.png")
+
+# --- Combined overlay across all requested objects ---------------------------
+combined_overlay = median_bg.astype(np.float64).copy()
+num_object_masks = sum(
+    1 for masks in object_masks_by_name.values() for mask in masks if mask is not None
+)
+alpha_per_mask = min(0.35, 20 / max(num_object_masks, 1))
+for masks in object_masks_by_name.values():
+    for mask, frame_rgb in zip(masks, frames):
+        if mask is None:
+            continue
+        combined_overlay[mask] = (
+            (1 - alpha_per_mask) * combined_overlay[mask]
+            + alpha_per_mask * frame_rgb[mask].astype(np.float64)
+        )
+combined_overlay = np.clip(combined_overlay, 0, 255).astype(np.uint8)
+Image.fromarray(combined_overlay).save(OUT_DIR / "pixel_masks_overlay.png")
+print(f"Saved combined overlay → {OUT_DIR / 'pixel_masks_overlay.png'}")
+
+# --- Combined grid montage across all requested objects ----------------------
+cols = math.ceil(math.sqrt(n))
+rows = math.ceil(n / cols)
+h, w = frames[0].shape[:2]
+thumb_w, thumb_h = w // 2, h // 2
+
+combined_grid = np.zeros((rows * thumb_h, cols * thumb_w, 3), dtype=np.uint8)
+for idx, fr in enumerate(frames):
+    r, c = divmod(idx, cols)
+    thumb = cv2.resize(fr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+    for masks in object_masks_by_name.values():
+        mask = masks[idx]
+        if mask is None:
+            continue
+        m_small = cv2.resize(
+            mask.astype(np.uint8), (thumb_w, thumb_h), interpolation=cv2.INTER_NEAREST
+        )
+        cnts, _ = cv2.findContours(m_small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(thumb, cnts, -1, (0, 255, 0), 1)
+    combined_grid[r * thumb_h:(r + 1) * thumb_h, c * thumb_w:(c + 1) * thumb_w] = thumb
+
+Image.fromarray(combined_grid).save(OUT_DIR / "all_episodes_grid.png")
+print(f"Saved combined grid → {OUT_DIR / 'all_episodes_grid.png'}")
 
 print(f"\nAll outputs in: {OUT_DIR}")

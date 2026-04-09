@@ -155,10 +155,21 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
 # Set to None to require --policy.path to be passed explicitly on the CLI.
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/groot_xarm_training/checkpoints/080000/pretrained_model"
-_DEFAULT_RECORD_POLICY_CHECKPOINT = None
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_place_mug/checkpoints/last/pretrained_model"
+# _DEFAULT_RECORD_POLICY_CHECKPOINT = None
 _DEFAULT_RECORD_TASK_ID = "place_mug"
-_NUM_EPISODES = 6
+_NUM_EPISODES = 10
+
+
+def _extract_checkpoint_name(policy_path: str | Path | None) -> str | None:
+    if policy_path is None:
+        return None
+    parts = Path(policy_path).parts
+    if "checkpoints" in parts:
+        idx = parts.index("checkpoints")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
 
 @dataclass
 class DatasetRecordConfig:
@@ -238,10 +249,10 @@ class RecordConfig:
     resume: bool = False
     # Load initial-state contour overlays from initial_states_overlay.py output.
     select: bool = True
-    # Directory containing initial_states_overlay.py output (masks, contours, etc.).
-    initial_states_dir: str | Path | None = "visual_match/initial_states"
-    # Object name matching the segmentation prompt used in initial_states_overlay.py.
-    object_name: str = "mug"
+    # Dataset root containing initial_states_overlay.py output (e.g. data_place_mug/).
+    initial_states_dir: str | Path | None = None
+    # Object name(s) matching the segmentation prompt used in initial_states_overlay.py.
+    object_name: str | None = None
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -269,7 +280,17 @@ class RecordConfig:
                 task_profile.eval_dataset_repo_id if has_policy else task_profile.dataset_repo_id
             )
         if self.dataset.root is None:
-            self.dataset.root = task_profile.eval_dataset_root if has_policy else task_profile.dataset_root
+            if has_policy:
+                checkpoint_name = _extract_checkpoint_name(self.policy.pretrained_path)
+                self.dataset.root = task_profile.eval_root_for_policy(
+                    self.policy.type, checkpoint_name
+                )
+            else:
+                self.dataset.root = task_profile.dataset_root
+        if self.initial_states_dir is None:
+            self.initial_states_dir = task_profile.dataset_root
+        if self.object_name is None:
+            self.object_name = task_profile.selection_object_name
 
         if self.dataset.single_task is None:
             raise ValueError("You need to provide a task as argument in `dataset.single_task`.")
@@ -506,6 +527,20 @@ def record_loop(
         loop_step += 1
 
 
+def _selection_object_names(object_name: str) -> list[str]:
+    return [name.strip().replace("/", "_").replace(" ", "_") for name in object_name.split(",") if name.strip()]
+
+
+def _selection_grid_path(initial_states_dir: str | Path, object_name: str) -> Path:
+    names = _selection_object_names(object_name)
+    base = Path(initial_states_dir)
+    if len(names) > 1:
+        combined = base / "all_episodes_grid.png"
+        if combined.exists():
+            return combined
+    return base / names[0] / "all_episodes_grid.png"
+
+
 def load_initial_state_contours(
     initial_states_dir: str | Path | None = None,
     object_name: str = "mug",
@@ -518,9 +553,9 @@ def load_initial_state_contours(
     whose mask file is missing or empty yield an empty list.
 
     Args:
-        initial_states_dir: Directory produced by initial_states_overlay.py.
-        object_name: Sub-directory name matching the TEXT_PROMPT used during
-            segmentation (default ``"mug"``).
+        initial_states_dir: Dataset root produced by initial_states_overlay.py.
+        object_name: One or more comma-separated object names matching the
+            segmentation prompts (default ``"mug"``).
 
     Returns:
         list_of_contours – list (one entry per episode, sorted by episode
@@ -532,37 +567,46 @@ def load_initial_state_contours(
     if initial_states_dir is None:
         raise ValueError(
             "--initial_states_dir is required when --select=true. "
-            "Point it to the visual_match/initial_states/ directory."
+            "Point it to the dataset root (e.g. data_place_mug)."
         )
-    masks_dir = Path(initial_states_dir) / object_name / "individual_masks"
-    if not masks_dir.exists():
-        raise FileNotFoundError(
-            f"Mask directory not found: {masks_dir}\n"
-            "Run initial_states_overlay.py first to generate masks."
-        )
+    object_dirs = []
+    for name in _selection_object_names(object_name):
+        masks_dir = Path(initial_states_dir) / name / "individual_masks"
+        if not masks_dir.exists():
+            raise FileNotFoundError(
+                f"Mask directory not found: {masks_dir}\n"
+                "Run initial_states_overlay.py first to generate masks."
+            )
+        object_dirs.append((name, masks_dir))
 
-    mask_files = sorted(masks_dir.glob("ep_*_mask.png"))
-    if not mask_files:
-        raise FileNotFoundError(f"No mask files found in: {masks_dir}")
+    first_mask_files = sorted(object_dirs[0][1].glob("ep_*_mask.png"))
+    if not first_mask_files:
+        raise FileNotFoundError(f"No mask files found in: {object_dirs[0][1]}")
 
     list_of_contours = []
-    for mask_path in mask_files:
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            list_of_contours.append([])
-            continue
-        _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(
-            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        list_of_contours.append(list(contours))
+    ep_ids = []
+    for mask_path in first_mask_files:
+        ep_id = int(mask_path.stem.replace("ep_", "").replace("_mask", ""))
+        ep_ids.append(ep_id)
+        combined_contours = []
+        valid_all = True
+        for _, masks_dir in object_dirs:
+            object_mask_path = masks_dir / mask_path.name
+            mask = cv2.imread(str(object_mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                valid_all = False
+                break
+            _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if len(contours) == 0:
+                valid_all = False
+                break
+            combined_contours.extend(list(contours))
+        list_of_contours.append(combined_contours if valid_all else [])
 
-    ep_ids = [
-        int(p.stem.replace("ep_", "").replace("_mask", "")) for p in mask_files
-    ]
     logging.info(
         f"Loaded contours for {len(list_of_contours)} episodes "
-        f"(eps {min(ep_ids)}–{max(ep_ids)}) from {masks_dir}"
+        f"(eps {min(ep_ids)}–{max(ep_ids)}) from {', '.join(str(d[1]) for d in object_dirs)}"
     )
     return list_of_contours
 
@@ -590,9 +634,9 @@ def select_contours_ui(
     if initial_states_dir is None:
         raise ValueError(
             "--initial_states_dir is required when --select=true. "
-            "Point it to the visual_match/initial_states/ directory."
+            "Point it to the dataset root (e.g. data_place_mug)."
         )
-    grid_path = Path(initial_states_dir) / object_name / "all_episodes_grid.png"
+    grid_path = _selection_grid_path(initial_states_dir, object_name)
     if not grid_path.exists():
         raise FileNotFoundError(
             f"Grid image not found: {grid_path}\n"
@@ -705,7 +749,7 @@ def save_selection_grid(
     if initial_states_dir is None:
         logging.warning("initial_states_dir is None, skipping selection grid save")
         return
-    grid_path = Path(initial_states_dir) / object_name / "all_episodes_grid.png"
+    grid_path = _selection_grid_path(initial_states_dir, object_name)
     if not grid_path.exists():
         logging.warning(f"Grid image not found, skipping selection grid: {grid_path}")
         return

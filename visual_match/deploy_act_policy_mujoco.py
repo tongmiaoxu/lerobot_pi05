@@ -89,6 +89,7 @@ from lerobot_mujoco_utils import (
 )
 from lerobot.datasets.utils import copy_observation_frame_with_resized_images
 from lerobot.datasets.video_utils import decode_video_frames
+from lerobot.tasks import get_task_profile
 
 # Arrow key codes for cv2.waitKeyEx (platform-dependent)
 _KEY_LEFT  = (65361, 81, 2)
@@ -96,6 +97,18 @@ _KEY_RIGHT = (65363, 83, 3)
 _KEY_UP    = (65362, 82, 0)
 _KEY_DOWN  = (65364, 84, 1)
 MUG_STEP_INIT_M = 0.005  # 5 mm initial step for mug adjustment
+_DEFAULT_DEPLOY_TASK_ID = "place_mug"  # Keep in sync with lerobot-record defaults.
+
+
+def _extract_checkpoint_name(policy_path: str | Path | None) -> str | None:
+    if policy_path is None:
+        return None
+    parts = Path(policy_path).parts
+    if "checkpoints" in parts:
+        idx = parts.index("checkpoints")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
 
 # Camera configuration (same as compare_recorded_vs_mujoco)
 _stationary_cfg = load_camera_config("stationary_cam")
@@ -384,6 +397,20 @@ def render_composite_view(model: MjModel, data: MjData,
     return fg_rgb
 
 
+def _selection_object_names(object_name: str) -> list[str]:
+    return [name.strip().replace("/", "_").replace(" ", "_") for name in object_name.split(",") if name.strip()]
+
+
+def _selection_grid_path(initial_states_dir: str | Path, object_name: str) -> Path:
+    names = _selection_object_names(object_name)
+    base = Path(initial_states_dir)
+    if len(names) > 1:
+        combined = base / "all_episodes_grid.png"
+        if combined.exists():
+            return combined
+    return base / names[0] / "all_episodes_grid.png"
+
+
 def load_initial_state_contours(
     initial_states_dir: str | Path | None = None,
     object_name: str = "mug",
@@ -396,45 +423,54 @@ def load_initial_state_contours(
     whose mask file is missing or empty yield an empty list.
 
     Args:
-        initial_states_dir: Directory produced by initial_states_overlay.py.
-            Defaults to ``visual_match/initial_states/``.
-        object_name: Sub-directory name matching the TEXT_PROMPT used during
-            segmentation (default ``"mug"``).
+        initial_states_dir: Dataset root produced by initial_states_overlay.py.
+        object_name: One or more comma-separated object names matching the
+            segmentation prompts (default ``"mug"``).
 
     Returns:
         list_of_contours – list (one entry per episode, sorted by episode
         index) of ``list[np.ndarray]`` contour arrays.
     """
     if initial_states_dir is None:
-        initial_states_dir = Path(__file__).parent / "initial_states"
-    masks_dir = Path(initial_states_dir) / object_name / "individual_masks"
-    if not masks_dir.exists():
-        raise FileNotFoundError(
-            f"Mask directory not found: {masks_dir}\n"
-            "Run initial_states_overlay.py first to generate masks."
-        )
+        raise ValueError("--initial-states-dir is required when --select is used.")
 
-    mask_files = sorted(masks_dir.glob("ep_*_mask.png"))
-    if not mask_files:
-        raise FileNotFoundError(f"No mask files found in: {masks_dir}")
+    object_dirs = []
+    for name in _selection_object_names(object_name):
+        masks_dir = Path(initial_states_dir) / name / "individual_masks"
+        if not masks_dir.exists():
+            raise FileNotFoundError(
+                f"Mask directory not found: {masks_dir}\n"
+                "Run initial_states_overlay.py first to generate masks."
+            )
+        object_dirs.append((name, masks_dir))
+
+    first_mask_files = sorted(object_dirs[0][1].glob("ep_*_mask.png"))
+    if not first_mask_files:
+        raise FileNotFoundError(f"No mask files found in: {object_dirs[0][1]}")
 
     list_of_contours = []
-    for mask_path in mask_files:
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            list_of_contours.append([])
-            continue
-        _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(
-            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        list_of_contours.append(list(contours))
+    ep_ids = []
+    for mask_path in first_mask_files:
+        ep_id = int(mask_path.stem.replace("ep_", "").replace("_mask", ""))
+        ep_ids.append(ep_id)
+        combined_contours = []
+        valid_all = True
+        for _, masks_dir in object_dirs:
+            object_mask_path = masks_dir / mask_path.name
+            mask = cv2.imread(str(object_mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                valid_all = False
+                break
+            _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if len(contours) == 0:
+                valid_all = False
+                break
+            combined_contours.extend(list(contours))
+        list_of_contours.append(combined_contours if valid_all else [])
 
-    ep_ids = [
-        int(p.stem.replace("ep_", "").replace("_mask", "")) for p in mask_files
-    ]
     print(f"[INFO] Loaded contours for {len(list_of_contours)} episodes "
-          f"(eps {min(ep_ids)}–{max(ep_ids)}) from {masks_dir}")
+          f"(eps {min(ep_ids)}–{max(ep_ids)}) from {', '.join(str(d[1]) for d in object_dirs)}")
     return list_of_contours
 
 
@@ -455,7 +491,7 @@ def select_contours_ui(
         list_of_contours: Output of :func:`load_initial_state_contours`.
         num_eval_episodes: How many episodes the user should pick.
         initial_states_dir: Root output directory of initial_states_overlay.py.
-        object_name: Sub-directory name (default ``"mug"``).
+        object_name: One or more comma-separated object names.
 
     Returns:
         (selected_contours, selected_indices) where *selected_contours* is a
@@ -464,8 +500,8 @@ def select_contours_ui(
         sorted in ascending episode order.
     """
     if initial_states_dir is None:
-        initial_states_dir = Path(__file__).parent / "initial_states"
-    grid_path = Path(initial_states_dir) / object_name / "all_episodes_grid.png"
+        raise ValueError("--initial-states-dir is required when --select is used.")
+    grid_path = _selection_grid_path(initial_states_dir, object_name)
     if not grid_path.exists():
         raise FileNotFoundError(
             f"Grid image not found: {grid_path}\n"
@@ -576,8 +612,9 @@ def save_selection_grid(
 ) -> None:
     """Save all_episodes_grid.png with user-selected cells highlighted in green."""
     if initial_states_dir is None:
-        initial_states_dir = Path(__file__).parent / "initial_states"
-    grid_path = Path(initial_states_dir) / object_name / "all_episodes_grid.png"
+        print("[WARN] initial_states_dir is None, skipping selection grid save")
+        return
+    grid_path = _selection_grid_path(initial_states_dir, object_name)
     if not grid_path.exists():
         print(f"[WARN] Grid image not found, skipping selection grid: {grid_path}")
         return
@@ -753,19 +790,19 @@ def main():
         "--initial-states-dir",
         type=str,
         default=None,
-        help="Path to initial_states directory (default: visual_match/initial_states/)"
+        help="Path to the dataset root containing <object>/individual_masks and <object>/all_episodes_grid.png"
     )
     parser.add_argument(
         "--object-name",
         type=str,
-        default="mug",
-        help="Object name matching the segmentation prompt (default: mug)"
+        default=None,
+        help="Object name(s) matching the segmentation prompt, e.g. 'mug' or 'mug, saucer'"
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="data_sim_eval",
-        help="Directory to save sim evaluation data (videos, states, grid image). Default: data_sim_eval"
+        default=None,
+        help="Directory to save sim evaluation data. Default is derived from task, policy type, and checkpoint."
     )
     parser.add_argument(
         "--gemini",
@@ -777,6 +814,20 @@ def main():
 
     args = parser.parse_args()
     num_eval_episodes = args.num_eval_episodes
+    task_profile = get_task_profile(_DEFAULT_DEPLOY_TASK_ID)
+    if args.initial_states_dir is None:
+        args.initial_states_dir = task_profile.dataset_root
+    if args.object_name is None:
+        args.object_name = task_profile.selection_object_name
+
+    # Load policy early so task-aware default output paths can depend on policy type/checkpoint.
+    policy, config_dict = load_policy(args.policy_path)
+    device = get_safe_torch_device(policy.config.device)
+    policy = policy.to(device)
+
+    if args.output_dir is None:
+        checkpoint_name = _extract_checkpoint_name(args.policy_path)
+        args.output_dir = task_profile.sim_eval_root_for_policy(policy.config.type, checkpoint_name)
 
     # Create output directory for sim evaluation data
     output_dir = Path(args.output_dir)
@@ -819,11 +870,6 @@ def main():
         print(
             f"[INFO] --obs-eval: using episode 0 images from {args.obs_eval_path!r} as policy input"
         )
-
-    # Load policy
-    policy, config_dict = load_policy(args.policy_path)
-    device = get_safe_torch_device(policy.config.device)
-    policy = policy.to(device)
 
     print(f"[INFO] Policy action parameters:")
     if hasattr(policy.config, 'horizon'):
