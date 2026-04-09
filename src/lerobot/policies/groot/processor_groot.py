@@ -95,13 +95,11 @@ def make_groot_pre_post_processors(
         Tuple of (preprocessor, postprocessor) pipelines
     """
 
-    # Get horizon/dimension parameters from config
-    # These should match the config used for the pretrained model
-    # Default values match most GR00T configs (state_horizon=1, action_horizon=16)
+    # Get horizon/dimension parameters from config.
+    # Keep the processor aligned with the requested policy chunk size so training and
+    # deployment use the same number of future action steps.
     state_horizon = 1
-    # CRITICAL: Pretrained GR00T models use action_horizon=16 max!
-    # The model architecture hardcodes this limit
-    action_horizon = min(config.chunk_size, 16)
+    action_horizon = config.chunk_size
     max_state_dim = config.max_state_dim
     max_action_dim = config.max_action_dim
 

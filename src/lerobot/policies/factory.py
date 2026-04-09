@@ -257,14 +257,20 @@ def make_pre_post_processors(
             # During deployment with a fresh eval dataset, dataset_stats is None — in that case
             # we must NOT override, so the checkpoint's own saved stats are used instead.
             dataset_stats = kwargs.get("dataset_stats")
-            preprocessor_overrides = {}
+            preprocessor_overrides = {
+                "groot_pack_inputs_v3": {
+                    "action_horizon": policy_cfg.chunk_size,
+                }
+            }
             postprocessor_overrides = {}
 
             if dataset_stats is not None:
-                preprocessor_overrides["groot_pack_inputs_v3"] = {
-                    "stats": dataset_stats,
-                    "normalize_min_max": True,
-                }
+                preprocessor_overrides["groot_pack_inputs_v3"].update(
+                    {
+                        "stats": dataset_stats,
+                        "normalize_min_max": True,
+                    }
+                )
 
             # Always ensure postprocessing slices to env action dim.
             # Only override stats if dataset_stats is available.

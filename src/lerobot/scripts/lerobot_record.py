@@ -156,8 +156,9 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
 # Set to None to require --policy.path to be passed explicitly on the CLI.
 _DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/groot_xarm_training/checkpoints/080000/pretrained_model"
-_DEFAULT_RECORD_TASK_ID = "pick_mug"
-_NUM_EPISODES = 10
+_DEFAULT_RECORD_POLICY_CHECKPOINT = None
+_DEFAULT_RECORD_TASK_ID = "place_mug"
+_NUM_EPISODES = 6
 
 @dataclass
 class DatasetRecordConfig:
@@ -956,6 +957,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             # State machine: WARMUP <-> RECORDING (ALOHA-style)
             state = "WARMUP"
+            move_to_initial_pose_on_right_arrow = (
+                isinstance(robot, XarmFollower) and _DEFAULT_RECORD_POLICY_CHECKPOINT is not None
+            )
 
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
 
@@ -985,7 +989,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         )
                         if events["stop_recording"]:
                             break
-                        if isinstance(robot, XarmFollower):
+                        if move_to_initial_pose_on_right_arrow:
                             logging.info("RIGHT ARROW: moving xArm to deployment initial pose before recording")
                             robot.go_to_deployment_initial_pose()
                         events["right_arrow"] = False
@@ -1016,7 +1020,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                             break
 
                         if events["right_arrow"]:
-                            if isinstance(robot, XarmFollower):
+                            if move_to_initial_pose_on_right_arrow:
                                 logging.info(
                                     "RIGHT ARROW: moving xArm to deployment initial pose before recording"
                                 )
@@ -1082,7 +1086,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         dataset.save_episode()
                         recorded_episodes += 1
                         print(f">>> Episode saved ({recorded_episodes}/{cfg.dataset.num_episodes})")
-                        if saved_with_right_arrow and isinstance(robot, XarmFollower):
+                        if saved_with_right_arrow and move_to_initial_pose_on_right_arrow:
                             logging.info(
                                 "RIGHT ARROW: moving xArm to deployment initial pose after save"
                             )

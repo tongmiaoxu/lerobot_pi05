@@ -234,6 +234,11 @@ class GR00TN15(PreTrainedModel):
     ):
         assert isinstance(config.backbone_cfg, dict)
         assert isinstance(config.action_head_cfg, dict)
+        config.action_head_cfg = dict(config.action_head_cfg)
+        if getattr(config, "action_horizon", None) is not None:
+            config.action_head_cfg["action_horizon"] = config.action_horizon
+        if getattr(config, "action_dim", None) is not None:
+            config.action_head_cfg["action_dim"] = config.action_dim
 
         super().__init__(config)
         self.local_model_path = local_model_path

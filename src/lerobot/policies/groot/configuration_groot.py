@@ -175,7 +175,7 @@ class GrootConfig(PreTrainedConfig):
     @property
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
-        return list(range(min(self.chunk_size, 16)))
+        return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:

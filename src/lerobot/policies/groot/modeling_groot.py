@@ -73,18 +73,39 @@ class GrootPolicy(PreTrainedPolicy):
         # Handle Flash Attention compatibility issues
         self._handle_flash_attention_compatibility()
 
+        action_horizon = self.config.chunk_size
         model = GR00TN15.from_pretrained(
             pretrained_model_name_or_path=self.config.base_model_path,
             tune_llm=self.config.tune_llm,
             tune_visual=self.config.tune_visual,
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
+            action_horizon=action_horizon,
         )
 
+        self._set_groot_action_horizon(model, action_horizon)
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
         model.config.compute_dtype = model.compute_dtype
 
         return model
+
+    def _set_groot_action_horizon(self, model: GR00TN15, action_horizon: int) -> None:
+        if action_horizon <= 0:
+            raise ValueError(f"action_horizon must be positive, got {action_horizon}")
+
+        position_embedding = getattr(model.action_head, "position_embedding", None)
+        if position_embedding is not None and action_horizon > position_embedding.num_embeddings:
+            raise ValueError(
+                f"Requested action_horizon={action_horizon} exceeds "
+                f"position_embedding capacity {position_embedding.num_embeddings}."
+            )
+
+        model.action_horizon = action_horizon
+        model.config.action_horizon = action_horizon
+        if getattr(model.config, "action_head_cfg", None) is not None:
+            model.config.action_head_cfg["action_horizon"] = action_horizon
+        model.action_head.action_horizon = action_horizon
+        model.action_head.config.action_horizon = action_horizon
 
     def reset(self):
         """Reset policy state when environment resets."""

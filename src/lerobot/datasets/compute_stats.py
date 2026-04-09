@@ -461,6 +461,11 @@ def get_feature_stats(
 
     original_shape = array.shape
     reshaped, sample_count = _prepare_array_for_stats(array, axis)
+    # Use float64 for statistics to avoid integer overflow, especially for sampled
+    # uint8 image pixels where `batch**2` would otherwise wrap around before the
+    # variance/std computation in `RunningQuantileStats`.
+    if reshaped.dtype != np.float64:
+        reshaped = reshaped.astype(np.float64, copy=False)
 
     if reshaped.shape[0] < 2:
         stats = _compute_basic_stats(reshaped, sample_count, quantile_list)
