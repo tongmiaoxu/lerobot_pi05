@@ -135,6 +135,7 @@ from lerobot.teleoperators.aloha_leader import (  # noqa: F401
 )
 from lerobot.teleoperators.gello_leader import GelloLeader, GelloLeaderConfig  # noqa: F401
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
+from lerobot.tasks import get_task_profile
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
@@ -154,17 +155,19 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
 # Set to None to require --policy.path to be passed explicitly on the CLI.
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_xarm_training_224/checkpoints/last/pretrained_model"
-
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/groot_xarm_training/checkpoints/080000/pretrained_model"
+_DEFAULT_RECORD_TASK_ID = "pick_mug"
+_NUM_EPISODES = 10
 
 @dataclass
 class DatasetRecordConfig:
+    task_id: str = _DEFAULT_RECORD_TASK_ID
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
-    repo_id: str = "tongmiao/eval_xarm_pick_mug"
+    repo_id: str | None = None
     # A short but accurate description of the task performed during the recording (e.g. "Pick the Lego block and drop it in the box on the right.")
-    single_task: str = "Pick up the mug"
+    single_task: str | None = None
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
-    root: str | Path | None = "data_eval"
+    root: str | Path | None = None
     # Limit the frames per second.
     fps: int = 30
     # Number of seconds for data recording for each episode.
@@ -172,7 +175,7 @@ class DatasetRecordConfig:
     # Number of seconds for resetting the environment after each episode.
     reset_time_s: int | float = 60
     # Number of episodes to record.
-    num_episodes: int = 10
+    num_episodes: int = _NUM_EPISODES
     # Encode frames in the dataset into video
     video: bool = True
     # Upload dataset to Hugging Face hub (default False to avoid auth errors).
@@ -204,8 +207,7 @@ class DatasetRecordConfig:
     policy_input_resize_width: int | None = 224
 
     def __post_init__(self):
-        if self.single_task is None:
-            raise ValueError("You need to provide a task as argument in `single_task`.")
+        get_task_profile(self.task_id)
         h, w = self.policy_input_resize_height, self.policy_input_resize_width
         if (h is None) ^ (w is None):
             raise ValueError(
@@ -256,6 +258,20 @@ class RecordConfig:
             cli_overrides = list(parser.get_cli_overrides("policy") or [])
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
+
+        task_profile = get_task_profile(self.dataset.task_id)
+        has_policy = self.policy is not None
+        if self.dataset.single_task is None:
+            self.dataset.single_task = task_profile.single_task
+        if self.dataset.repo_id is None:
+            self.dataset.repo_id = (
+                task_profile.eval_dataset_repo_id if has_policy else task_profile.dataset_repo_id
+            )
+        if self.dataset.root is None:
+            self.dataset.root = task_profile.eval_dataset_root if has_policy else task_profile.dataset_root
+
+        if self.dataset.single_task is None:
+            raise ValueError("You need to provide a task as argument in `dataset.single_task`.")
 
         if self.teleop is None and self.policy is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
@@ -356,6 +372,8 @@ def record_loop(
         postprocessor.reset()
 
     timestamp = 0
+    loop_step = 0
+    last_policy_query_t = None
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -382,6 +400,8 @@ def record_loop(
                 obs_for_policy = copy_observation_frame_with_resized_images(
                     observation_frame, rh, rw
                 )
+            action_queue = getattr(policy, "_action_queue", None)
+            needs_policy_query = action_queue is None or len(action_queue) == 0
             action_values = predict_action(
                 observation=obs_for_policy,
                 policy=policy,
@@ -392,6 +412,32 @@ def record_loop(
                 task=single_task,
                 robot_type=robot.robot_type,
             )
+            if needs_policy_query:
+                query_t = time.perf_counter()
+                dt_since_last = (
+                    None if last_policy_query_t is None else query_t - last_policy_query_t
+                )
+                last_policy_query_t = query_t
+                steps_per_query = getattr(policy.config, "n_action_steps", "unknown")
+                chunk_size = getattr(policy.config, "chunk_size", "unknown")
+                queue_after_query = getattr(policy, "_action_queue", None)
+                queued_remaining = (
+                    "unknown" if queue_after_query is None else len(queue_after_query)
+                )
+                dt_msg = (
+                    "first query"
+                    if dt_since_last is None
+                    else f"{dt_since_last:.3f}s since previous query"
+                )
+                print(
+                    "[policy-query] "
+                    f"episode_t={query_t - start_episode_t:.3f}s "
+                    f"loop_step={loop_step} "
+                    f"n_action_steps={steps_per_query} "
+                    f"chunk_size={chunk_size} "
+                    f"queue_remaining_after_pop={queued_remaining} "
+                    f"({dt_msg})"
+                )
             # print(action_values)
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
@@ -425,7 +471,6 @@ def record_loop(
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
         # Send action to robot
-        print(robot_action_to_send)
         _sent_action = robot.send_action(robot_action_to_send)
 
         # Write to dataset
@@ -457,6 +502,7 @@ def record_loop(
         precise_sleep(max(1 / fps - dt_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
+        loop_step += 1
 
 
 def load_initial_state_contours(

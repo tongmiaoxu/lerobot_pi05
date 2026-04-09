@@ -28,23 +28,25 @@ python visual_match/load_calibration_to_config.py 311322300308 213622251153
 
 ### Command (xArm + GELLO data collection)
 
+Minimal workflow:
+
+1. In `src/lerobot/scripts/lerobot_record.py`, set:
+   - `_DEFAULT_RECORD_TASK_ID = "pick_mug"` / `"place_mug"` / `"hang_mug"`
+   - `_DEFAULT_RECORD_POLICY_CHECKPOINT = None` for teleop collection, or a checkpoint path for deployment
+2. Run:
+
+Supported task ids:
+
+- `pick_mug` -> `Pick up the mug`
+- `place_mug` -> `Pick and place the mug on the saucer`
+- `hang_mug` -> `Hang the mug on the rack`
+
 ```bash
-# Cameras auto-loaded from visual_match/configs/ (stationary_cam.json -> cam_high, wrist_cam.json -> cam_wrist)
-# To disable: --robot.cameras='{}'
-lerobot-record \
-    --robot.type=xarm_follower \
-    --robot.ip=192.168.1.228 \
-    --teleop.type=gello_leader \
-    --teleop.port=/dev/ttyUSB0 \
-    --dataset.repo_id=tongmiao/xarm_pick_mug \
-    --dataset.single_task="Pick up the mug" \
-    --dataset.num_episodes=20 \
-    --dataset.fps=30 \
-    --dataset.root=data \
-    --resume=true
+lerobot-record
 ```
 Other useful parameters:
 ```bash
+    --dataset.num_episodes=20 \
     --resume=true \
     --dataset.push_to_hub=false \
     --display_data=true
@@ -103,33 +105,27 @@ python visual_match/initial_states_overlay.py
 ```
 
 ### Policy Training for xarm
+`python scripts/train_task.py` auto-fills `dataset.repo_id`, `dataset.root`, `output_dir`, `wandb.enable`, and `wandb.project` from `--task-id`.
+
 ```bash
-lerobot-train \
-  --policy.type=act \
+python scripts/train_task.py \
+  --task-id=pick_mug \
+  --policy-type=act \
   --policy.device=cuda \
   --policy.push_to_hub=false \
-  --dataset.repo_id=tongmiao/xarm_pick_mug \
-  --dataset.root=data \
-  --output_dir=./outputs/act_xarm_training \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --batch_size=8 \
   --steps=80000 \
   --save_freq=5000 \
-  --wandb.enable=true \
-  --wandb.project=pick_mug \
   --dataset.image_transforms.enable=true
 ```
 ```bash
-lerobot-train \
-  --policy.type=diffusion \
+python scripts/train_task.py \
+  --task-id=pick_mug \
+  --policy-type=diffusion \
   --policy.device=cuda \
   --policy.push_to_hub=false \
-  --dataset.repo_id=tongmiao/xarm_pick_mug \
-  --dataset.root=data \
-  --output_dir=./outputs/diffusion_xarm_training \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
-  --wandb.enable=true \
-  --wandb.project=pick_mug  \
   --dataset.image_transforms.enable=true \
   --policy.horizon=32 \
   --policy.n_action_steps=25 \
@@ -140,8 +136,9 @@ lerobot-train \
   --resume=true
 ```
 ```bash
-lerobot-train \
-  --policy.type=pi05 \
+python scripts/train_task.py \
+  --task-id=pick_mug \
+  --policy-type=pi05 \
   --policy.device=cuda \
   --policy.pretrained_path=lerobot/pi05_base \
   --policy.push_to_hub=false \
@@ -151,21 +148,17 @@ lerobot-train \
   --policy.train_expert_only=true \
   --policy.scheduler_warmup_steps=1000 \
   --policy.scheduler_decay_steps=50000 \
-  --dataset.repo_id=tongmiao/xarm_pick_mug \
-  --dataset.root=data \
   --dataset.use_imagenet_stats=false \
   --dataset.image_transforms.enable=true \
-  --output_dir=./outputs/pi05_xarm_training \
   --batch_size=16 \
   --steps=50000 \
-  --save_freq=10000 \
-  --wandb.enable=true \
-  --wandb.project=pick_mug
+  --save_freq=10000
 ```
 
 ```bash
-lerobot-train \
-  --policy.type=groot \
+python scripts/train_task.py \
+  --task-id=pick_mug \
+  --policy-type=groot \
   --policy.device=cuda \
   --policy.push_to_hub=false \
   --policy.base_model_path=nvidia/GR00T-N1.5-3B \
@@ -173,40 +166,33 @@ lerobot-train \
   --policy.n_action_steps=50 \
   --policy.scheduler_decay_steps=90000 \
   --policy.tune_projector=true \
-  --dataset.repo_id=tongmiao/xarm_pick_mug \
-  --dataset.root=data \
   --dataset.use_imagenet_stats=false \
   --dataset.image_transforms.enable=true \
-  --output_dir=./outputs/groot_xarm_training \
   --batch_size=16 \
   --steps=100000 \
   --save_freq=20000 \
-  --num_workers=4 \
-  --wandb.enable=true \
-  --wandb.project=pick_mug
+  --num_workers=4
 ```
 
 ```bash
-accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=tongmiao/xarm_pick_mug \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=pick_mug
+accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 $(which lerobot-train) \ --policy.type=pi05 \ --policy.device=cuda \ --policy.pretrained_path=lerobot/pi05_base \ --policy.push_to_hub=false \ --policy.compile_model=false \ --policy.gradient_checkpointing=true \ --policy.dtype=bfloat16 \ --policy.train_expert_only=true \ --dataset.repo_id=xarm_pick_mug \ --dataset.root=data \ --output_dir=./outputs/pi05_xarm_training \ --batch_size=8 \ --steps=3000 \ --wandb.enable=true \ --wandb.project=pick_mug
 ```
 
-### Policy Deployment for xarm
-```bash
-lerobot-record \
-  --robot.type=xarm_follower \
-  --robot.ip=192.168.1.228 \
-  --teleop.type=gello_leader \
-  --teleop.port=/dev/ttyUSB0 \
-  --policy.path=outputs/pi05_xarm_training/checkpoints/last/pretrained_model \
-  --dataset.repo_id=tongmiao/eval_xarm_pick_mug \
-  --dataset.single_task="Pick up the mug" \
-  --dataset.num_episodes=10 \
-  --dataset.fps=30 \
-  --dataset.root=data_eval \
-  --dataset.push_to_hub=false \
-  --policy.pretrained_path=lerobot/pi05_base \
-  --select=true
-```
+
+
+Defaults in `src/lerobot/scripts/lerobot_record.py`:
+
+- Robot defaults: `xarm_follower` at `192.168.1.228`
+- Teleop defaults: `gello_leader` at `/dev/ttyUSB0`
+- Dataset defaults: `fps=30`, `push_to_hub=false`, `num_episodes=10`
+- Teleop-only recording + `--dataset.task_id=pick_mug`: saves to `data` with repo id `xarm_pick_mug`
+- Teleop-only recording + `--dataset.task_id=place_mug`: saves to `data_place_mug` with repo id `place_mug`
+- Teleop-only recording + `--dataset.task_id=hang_mug`: saves to `data_hang_mug` with repo id `hang_mug`
+- Deployment / evaluation + `--dataset.task_id=pick_mug`: saves to `data_eval` with repo id `eval_xarm_pick_mug`
+- Deployment / evaluation + `--dataset.task_id=place_mug`: saves to `data_eval_place_mug` with repo id `eval_place_mug`
+- Deployment / evaluation + `--dataset.task_id=hang_mug`: saves to `data_eval_hang_mug` with repo id `eval_hang_mug`
+
+You can still override `--dataset.single_task`, `--dataset.root`, or `--dataset.repo_id` when needed.
 
 ### Adjust obj position in mujoco (or --stiker)
 ```bash
