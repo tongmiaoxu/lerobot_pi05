@@ -14,8 +14,12 @@
     <mesh file="link3.stl"/>
     <mesh file="link4.stl"/>
     <mesh file="link5.stl"/>
-    <mesh file="link6.stl"/>
+    <mesh file="link6.stl" />
     <mesh file="link7.stl"/>
+    <mesh file="wrist_cam_base_back.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="wrist_cam_base_front.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="link6wrap.stl" scale="0.1 0.1 0.1"/>
+    <mesh file="link5wrap.stl" scale="0.1 0.1 0.1"/>
     <mesh file="end_tool.stl"/>
     <mesh file="base_link.stl"/>
     <mesh file="left_outer_knuckle.stl"/>
@@ -58,10 +62,10 @@
       <default class="collision">
         <geom type="mesh" group="3"/>
         <default class="pad_box1">
-          <geom type="box" friction="0.7" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.002 0.0095" rgba="0.0 0.1 0.7 1"/>
+          <geom type="box" friction="3.0 0.1 0.02" condim="4" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.005 0.014" rgba="0.0 0.1 0.7 1"/>
         </default>
         <default class="pad_box2">
-          <geom type="box" friction="0.6" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.002 0.0095" rgba="0.0 0.5 0.5 1"/>
+          <geom type="box" friction="3.0 0.1 0.02" condim="4" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.005 0.014" rgba="0.0 0.5 0.5 1"/>
         </default>
       </default>
       <site size="0.001" rgba="1 0 0 1" group="4"/>
@@ -69,7 +73,7 @@
   </default>
 
   <worldbody>
-    <body name="link_base" pos="0 0 .12" childclass="xarm7">
+    <body name="link_base" pos="0 0 0" childclass="xarm7">
       <inertial pos="-0.021131 -0.0016302 0.056488" quat="0.696843 0.20176 0.10388 0.680376" mass="0.88556"
         diaginertia="0.00382023 0.00335282 0.00167725"/>
       <geom mesh="link_base"/>
@@ -98,16 +102,24 @@
                   diaginertia="0.00534729 0.00499076 0.0013489"/>
                 <joint name="joint5" class="size2"/>
                 <geom mesh="link5"/>
+                <geom name="link5wrap" type="mesh" mesh="link5wrap" contype="0" conaffinity="0" rgba="0.647 0.663 0.706 1"/>
                 <body name="link6" quat="1 1 0 0">
                   <inertial pos="0.06469 0.03278 0.02141" quat="-0.217672 0.772419 0.16258 0.574069" mass="1.325"
                     diaginertia="0.00245421 0.00221646 0.00107273"/>
                   <joint name="joint6" range="-1.69297 3.14159" class="size3"/>
                   <geom mesh="link6"/>
+                  <geom name="link6wrap" type="mesh" mesh="link6wrap" contype="0" conaffinity="0" rgba="0.647 0.663 0.706 1"/>
                   <body name="link7" pos="0.076 0.097 0" quat="1 -1 0 0">
                     <inertial pos="0 -0.00677 -0.01098" quat="0.487612 0.512088 -0.512088 0.487612" mass="0.17"
                       diaginertia="0.000132176 9.3e-05 5.85236e-05"/>
                     <joint name="joint7" class="size3"/>
-                    <geom material="gray" mesh="end_tool"/>
+                    <geom material="gray" mesh="end_tool" rgba="0.647 0.663 0.706 1"/>
+                    <body name="wrist_cam_base_back" quat="0.5 -0.5 -0.5 0.5">
+                      <geom mesh="wrist_cam_base_back" rgba="0.2 0.2 0.2 1" mass="0.01"/>
+                    </body>
+                    <body name="wrist_cam_base_front" quat="0.5 -0.5 -0.5 0.5">
+                      <geom mesh="wrist_cam_base_front" rgba="0.2 0.2 0.2 1" mass="0.01"/>
+                    </body>
                     <body name="xarm_gripper_base_link" quat="0 0 0 1">
                       <inertial pos="-0.00065489 -0.0018497 0.048028" quat="0.997403 -0.0717512 -0.0061836 0.000477479"
                         mass="0.54156" diaginertia="0.000471093 0.000332307 0.000254799"/>
@@ -156,7 +168,7 @@
                       <!-- Wrist camera matching RealSense serial 213622251153.
                            Pose is overridden at runtime from calibration data. -->
                       <camera name="wrist_cam" pos="0 0 0.08" xyaxes="1 0 0 0 -1 0"
-                              fovy="63.8"/>
+                              fovy="62.74"/>
                     </body>
                   </body>
                 </body>
@@ -203,6 +215,7 @@
   <keyframe>
     <!-- <key name="home" qpos="0 -.247 0 .909 0 1.15644 0 0 0 0 0 0 0" ctrl="0 -.247 0 .909 0 1.15644 0 0"/> -->
     <!-- 13 robot DoFs + 7 cube freejoint (pos xyz + quat wxyz) -->
-    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0  0.5286 0.0086 0.0771 1 0 0 0" ctrl="0 0 0 1.57 0 1.57 0 0"/>
+    <!-- <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0  0.5286 0.0086 0.0771 1 0 0 0" ctrl="0 0 0 1.57 0 1.57 0 0"/> -->
+    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0 0.3834 -0.1284 -0.0389 0.7071 0 0 -0.7071" ctrl="0 0 0 1.57 0 1.57 0 0"/>
   </keyframe>
 </mujoco>

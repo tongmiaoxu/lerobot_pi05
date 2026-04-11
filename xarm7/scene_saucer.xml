@@ -19,7 +19,7 @@
     <material name="matte_pink" specular="0" shininess="1" reflectance="0"/>
 
     <!-- mug.stl is in mm; scale 0.001 converts to meters (was filling view at scale 1) -->
-    <mesh name="mug" file="mug.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="saucer" file="saucer.stl" scale="0.001 0.001 0.001"/>
   </asset>
 
   <worldbody>
@@ -41,11 +41,11 @@
          Dimensions below assume ~40mm outer radius, ~90mm tall mug.
          TUNE these to match your actual mug STL! -->
     <!-- <body name="mug" pos="0.5634 -0.1034 -0.038860" euler="0 0 1.5708"> -->
-    <body name="mug" pos="0.3834 -0.1284 -0.0389" euler="0 0 4.7124">
-      <freejoint name="mug_joint"/>
+    <body name="saucer" pos="0.3834 -0.1284 -0.0389" euler="0 0 4.7124">
+      <freejoint name="saucer_joint"/>
 
       <!-- Visual-only mesh (no collision) -->
-      <geom name="mug_visual" type="mesh" mesh="mug" rgba="0.882 0.878 0.510 1"
+      <geom name="saucer_visual" type="mesh" mesh="saucer" rgba="0.882 0.878 0.510 1"
             contype="0" conaffinity="0" mass="0"/>
 
       <!-- ── Hollow wall: 8 thin box segments at R=0.0375m (37.5mm mug radius) ── -->
