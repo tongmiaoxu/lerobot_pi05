@@ -21,6 +21,7 @@ if not _HAS_DISPLAY:
 import time
 import json
 import argparse
+import re
 import cv2
 import numpy as np
 import torch
@@ -114,14 +115,19 @@ except ImportError:
 
 # ===== FOREGROUND FUNCTIONS (MuJoCo) =====
 
-def get_robot_geom_ids(model, include_list=None):
+def get_robot_geom_ids(model, include_list=None, extra_geom_names=None):
     """
     Returns geom IDs belonging to the xArm robot (all mesh geoms, base cylinder).
-    Optionally include mug, sticker, table based on include_list.
+    Optionally include mug, sticker, table based on include_list, plus any
+    additional named geoms in extra_geom_names.
     Args:
         model: MuJoCo model
         include_list: [mug, sticker, table] (1=include, 0=exclude)
+        extra_geom_names: iterable of geom names to force-include
     """
+    def _is_collision_hull_geom(geom_name: str | None) -> bool:
+        return bool(geom_name and re.fullmatch(r".*_col_\d+", geom_name))
+
     # Default: exclude all
     if include_list is None:
         include_list = [1, 1, 1]
@@ -141,6 +147,8 @@ def get_robot_geom_ids(model, include_list=None):
         geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
         if geom_name in EXCLUDE_GEOMS:
             model.geom_rgba[geom_id, 3] = 0.0  # fully transparent
+            continue
+        if _is_collision_hull_geom(geom_name):
             continue
         if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH:
             robot_geom_ids.add(geom_id)
@@ -162,6 +170,11 @@ def get_robot_geom_ids(model, include_list=None):
         geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table")
         if geom_id != -1:
             robot_geom_ids.add(geom_id)
+    if extra_geom_names:
+        for geom_name in extra_geom_names:
+            geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+            if geom_id != -1:
+                robot_geom_ids.add(geom_id)
     return robot_geom_ids
 
 

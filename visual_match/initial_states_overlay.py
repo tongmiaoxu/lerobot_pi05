@@ -24,89 +24,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
-import torch
 from PIL import Image
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+from segmentation_utils import segment_object_mask
 
 
 ROOT = Path(__file__).resolve().parent.parent          # lerobot_pi05
-TEXT_PROMPTS = ["plate,mug"]   # Comma-separated entries are split into separate objects
-DATA_DIR = ROOT / "data_place_mug copy"
-# ── segmentation helpers (merged from sam2_segmentation.py) ──────────────────
-_SEGMENT_MODELS = None
-
-
-def _get_segment_models(device):
-    """Lazy-load Grounding-DINO + SAM2 models (cached across calls)."""
-    global _SEGMENT_MODELS
-    if _SEGMENT_MODELS is None or _SEGMENT_MODELS["device"] != device:
-        checkpoint = str(ROOT / "weights" / "sam2" / "sam2.1_hiera_large.pt")
-        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-        model_id = "IDEA-Research/grounding-dino-tiny"
-        processor = AutoProcessor.from_pretrained(model_id)
-        grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-            model_id
-        ).to(device)
-        image_predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
-        _SEGMENT_MODELS = {
-            "device": device,
-            "processor": processor,
-            "grounding_model": grounding_model,
-            "image_predictor": image_predictor,
-        }
-    return (
-        _SEGMENT_MODELS["processor"],
-        _SEGMENT_MODELS["grounding_model"],
-        _SEGMENT_MODELS["image_predictor"],
-    )
-
-
-def _segment_object_mask(image_bgr, text_prompt="plush toy"):
-    """Segment an object in a BGR image using Grounding-DINO + SAM2."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor, grounding_model, image_predictor = _get_segment_models(device)
-
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    image_pil = Image.fromarray(image_rgb)
-
-    inputs = processor(images=image_pil, text=[text_prompt], return_tensors="pt").to(
-        device
-    )
-    with torch.no_grad():
-        outputs = grounding_model(**inputs)
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        threshold=0.325,
-        text_threshold=0.3,
-        target_sizes=[image_pil.size[::-1]],
-    )
-
-    input_boxes = results[0]["boxes"].cpu().numpy()
-    if len(input_boxes) == 0:
-        return None
-
-    image_predictor.set_image(np.array(image_pil.convert("RGB")))
-    masks_list = []
-    for bx in input_boxes:
-        m, _, _ = image_predictor.predict(
-            point_coords=None,
-            point_labels=None,
-            box=bx[None, :],
-            multimask_output=False,
-        )
-        if m.ndim == 4:
-            m = m.squeeze(1)
-        m = m.squeeze(0)
-        masks_list.append(m.astype(bool))
-
-    if not masks_list:
-        return None
-
-    mask = np.logical_or.reduce(np.stack(masks_list, axis=0), axis=0)
-    return mask
+TEXT_PROMPTS = ["mug"]   # Comma-separated entries are split into separate objects
+DATA_DIR = ROOT / "data_hang_mug_copy"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -312,7 +237,7 @@ for text_prompt in object_prompts:
 
     for i, (frame_rgb, ep_idx) in enumerate(zip(frames, ep_indices)):
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        mask = _segment_object_mask(frame_bgr, text_prompt=text_prompt)
+        mask = segment_object_mask(frame_bgr, text_prompt=text_prompt)
 
         if mask is not None and mask.any():
             lo = max(0, i - 3)

@@ -173,7 +173,6 @@ outputs/
 # Dev folders
 *.stl
 *.urdf
-*.xml
 *.part
 data_eval/
 calibration_pairs_wrist/

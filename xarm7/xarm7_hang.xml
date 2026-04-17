@@ -159,8 +159,8 @@
                             mass="0.048304" diaginertia="1.88037e-05 1.7493e-05 3.56792e-06"/>
                           <joint name="left_finger_joint" axis="-1 0 0" class="follower"/>
                           <geom class="visual" material="black" mesh="left_finger"/>
-                          <geom class="pad_box1" name="left_finger_pad_1" pos="0 -0.024003 0.035"/>
-                          <geom class="pad_box2" name="left_finger_pad_2" pos="0 -0.024003 0.051"/>
+                          <geom class="pad_box1" name="left_finger_pad_1" pos="0 -0.024003 0.032"/>
+                          <geom class="pad_box2" name="left_finger_pad_2" pos="0 -0.024003 0.050"/>
                           <geom class="pad_visual1" name="left_finger_pad_vis_1" pos="0 -0.024003 0.035"/>
                           <geom class="pad_visual2" name="left_finger_pad_vis_2" pos="0 -0.024003 0.051"/>
                         </body>
@@ -183,8 +183,8 @@
                           <geom class="visual" material="black" mesh="right_finger"/>
                           <geom class="pad_box1" name="right_finger_pad_1" pos="0 0.024003 0.032"/>
                           <geom class="pad_box2" name="right_finger_pad_2" pos="0 0.024003 0.050"/>
-                          <geom class="pad_visual1" name="right_finger_pad_vis_1" pos="0 0.024003 0.032"/>
-                          <geom class="pad_visual2" name="right_finger_pad_vis_2" pos="0 0.024003 0.050"/>
+                          <geom class="pad_visual1" name="right_finger_pad_vis_1" pos="0 0.024003 0.035"/>
+                          <geom class="pad_visual2" name="right_finger_pad_vis_2" pos="0 0.024003 0.051"/>
                         </body>
                       </body>
                       <body name="right_inner_knuckle" pos="0 -0.02 0.074098">
@@ -244,6 +244,6 @@
   <keyframe>
     <!-- <key name="home" qpos="0 -.247 0 .909 0 1.15644 0.4284 -0.1984 -0.0439 -0.7373 0.0000 -0.0000 -0.6756" ctrl="0 -.247 0 .909 0 1.15644 0 0"/> -->
     <!-- 13 robot DoFs + 7 cube freejoint (pos xyz + quat wxyz) -->
-    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0 0.4434 -0.1434 -0.0439 0.7133 0.0000 0.0000 -0.7009" ctrl="0 0 0 1.57 0 1.57 0 0"/>
+    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0 0.4284 -0.1984 -0.0439 0.7253 0.0000 0.0000 0.6884" ctrl="0 0 0 1.57 0 1.57 0 0"/>
   </keyframe>
 </mujoco>

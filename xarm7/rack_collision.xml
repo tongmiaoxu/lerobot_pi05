@@ -1,0 +1,21 @@
+<!-- Rack visual + CoACD convex-decomposition collision geoms (15 parts).
+     Include inside <body name="rack"> in any scene file. -->
+<mujoco>
+  <geom name="rack_visual" type="mesh" mesh="rack" rgba="0.8 0.047 0.129 1"
+        contype="0" conaffinity="0" mass="0"/>
+  <geom name="rack_col_0"  type="mesh" mesh="rack_hull_0"  class="rack_collision"/>
+  <geom name="rack_col_1"  type="mesh" mesh="rack_hull_1"  class="rack_collision"/>
+  <geom name="rack_col_2"  type="mesh" mesh="rack_hull_2"  class="rack_collision"/>
+  <geom name="rack_col_3"  type="mesh" mesh="rack_hull_3"  class="rack_collision"/>
+  <geom name="rack_col_4"  type="mesh" mesh="rack_hull_4"  class="rack_collision"/>
+  <geom name="rack_col_5"  type="mesh" mesh="rack_hull_5"  class="rack_collision"/>
+  <geom name="rack_col_6"  type="mesh" mesh="rack_hull_6"  class="rack_collision"/>
+  <geom name="rack_col_7"  type="mesh" mesh="rack_hull_7"  class="rack_collision"/>
+  <geom name="rack_col_8"  type="mesh" mesh="rack_hull_8"  class="rack_collision"/>
+  <geom name="rack_col_9"  type="mesh" mesh="rack_hull_9"  class="rack_collision"/>
+  <geom name="rack_col_10" type="mesh" mesh="rack_hull_10" class="rack_collision"/>
+  <geom name="rack_col_11" type="mesh" mesh="rack_hull_11" class="rack_collision"/>
+  <geom name="rack_col_12" type="mesh" mesh="rack_hull_12" class="rack_collision"/>
+  <geom name="rack_col_13" type="mesh" mesh="rack_hull_13" class="rack_collision"/>
+  <geom name="rack_col_14" type="mesh" mesh="rack_hull_14" class="rack_collision"/>
+</mujoco>

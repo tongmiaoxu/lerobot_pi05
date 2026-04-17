@@ -1,0 +1,43 @@
+<!-- Saucer visual + CoACD convex-decomposition collision geoms (37 parts).
+     Include inside <body name="saucer"> in any scene file. -->
+<mujoco>
+  <geom name="saucer_visual" type="mesh" mesh="saucer" rgba="0.882 0.878 0.510 1"
+        contype="0" conaffinity="0" mass="0"/>
+  <geom name="saucer_col_0" type="mesh" mesh="saucer_hull_0" class="saucer_collision"/>
+  <geom name="saucer_col_1" type="mesh" mesh="saucer_hull_1" class="saucer_collision"/>
+  <geom name="saucer_col_2" type="mesh" mesh="saucer_hull_2" class="saucer_collision"/>
+  <geom name="saucer_col_3" type="mesh" mesh="saucer_hull_3" class="saucer_collision"/>
+  <geom name="saucer_col_4" type="mesh" mesh="saucer_hull_4" class="saucer_collision"/>
+  <geom name="saucer_col_5" type="mesh" mesh="saucer_hull_5" class="saucer_collision"/>
+  <geom name="saucer_col_6" type="mesh" mesh="saucer_hull_6" class="saucer_collision"/>
+  <geom name="saucer_col_7" type="mesh" mesh="saucer_hull_7" class="saucer_collision"/>
+  <geom name="saucer_col_8" type="mesh" mesh="saucer_hull_8" class="saucer_collision"/>
+  <geom name="saucer_col_9" type="mesh" mesh="saucer_hull_9" class="saucer_collision"/>
+  <geom name="saucer_col_10" type="mesh" mesh="saucer_hull_10" class="saucer_collision"/>
+  <geom name="saucer_col_11" type="mesh" mesh="saucer_hull_11" class="saucer_collision"/>
+  <geom name="saucer_col_12" type="mesh" mesh="saucer_hull_12" class="saucer_collision"/>
+  <geom name="saucer_col_13" type="mesh" mesh="saucer_hull_13" class="saucer_collision"/>
+  <geom name="saucer_col_14" type="mesh" mesh="saucer_hull_14" class="saucer_collision"/>
+  <geom name="saucer_col_15" type="mesh" mesh="saucer_hull_15" class="saucer_collision"/>
+  <geom name="saucer_col_16" type="mesh" mesh="saucer_hull_16" class="saucer_collision"/>
+  <geom name="saucer_col_17" type="mesh" mesh="saucer_hull_17" class="saucer_collision"/>
+  <geom name="saucer_col_18" type="mesh" mesh="saucer_hull_18" class="saucer_collision"/>
+  <geom name="saucer_col_19" type="mesh" mesh="saucer_hull_19" class="saucer_collision"/>
+  <geom name="saucer_col_20" type="mesh" mesh="saucer_hull_20" class="saucer_collision"/>
+  <geom name="saucer_col_21" type="mesh" mesh="saucer_hull_21" class="saucer_collision"/>
+  <geom name="saucer_col_22" type="mesh" mesh="saucer_hull_22" class="saucer_collision"/>
+  <geom name="saucer_col_23" type="mesh" mesh="saucer_hull_23" class="saucer_collision"/>
+  <geom name="saucer_col_24" type="mesh" mesh="saucer_hull_24" class="saucer_collision"/>
+  <geom name="saucer_col_25" type="mesh" mesh="saucer_hull_25" class="saucer_collision"/>
+  <geom name="saucer_col_26" type="mesh" mesh="saucer_hull_26" class="saucer_collision"/>
+  <geom name="saucer_col_27" type="mesh" mesh="saucer_hull_27" class="saucer_collision"/>
+  <geom name="saucer_col_28" type="mesh" mesh="saucer_hull_28" class="saucer_collision"/>
+  <geom name="saucer_col_29" type="mesh" mesh="saucer_hull_29" class="saucer_collision"/>
+  <geom name="saucer_col_30" type="mesh" mesh="saucer_hull_30" class="saucer_collision"/>
+  <geom name="saucer_col_31" type="mesh" mesh="saucer_hull_31" class="saucer_collision"/>
+  <geom name="saucer_col_32" type="mesh" mesh="saucer_hull_32" class="saucer_collision"/>
+  <geom name="saucer_col_33" type="mesh" mesh="saucer_hull_33" class="saucer_collision"/>
+  <geom name="saucer_col_34" type="mesh" mesh="saucer_hull_34" class="saucer_collision"/>
+  <geom name="saucer_col_35" type="mesh" mesh="saucer_hull_35" class="saucer_collision"/>
+  <geom name="saucer_col_36" type="mesh" mesh="saucer_hull_36" class="saucer_collision"/>
+</mujoco>

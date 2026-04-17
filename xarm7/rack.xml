@@ -1,0 +1,30 @@
+<!-- Shared rack mesh assets and collision defaults.
+     Include at the <mujoco> level in any scene that uses the rack. -->
+<mujoco>
+  <default>
+    <default class="rack_collision">
+      <geom rgba="0.882 0.878 0.510 0.15" mass="0"
+            friction="2 0.05 0.01" condim="4" priority="1"
+            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
+    </default>
+  </default>
+
+  <asset>
+    <mesh name="rack" file="rack.STL" scale="0.0009 0.0009 0.0009"/>
+    <mesh name="rack_hull_0"  file="rack/rack_hull_0.stl"/>
+    <mesh name="rack_hull_1"  file="rack/rack_hull_1.stl"/>
+    <mesh name="rack_hull_2"  file="rack/rack_hull_2.stl"/>
+    <mesh name="rack_hull_3"  file="rack/rack_hull_3.stl"/>
+    <mesh name="rack_hull_4"  file="rack/rack_hull_4.stl"/>
+    <mesh name="rack_hull_5"  file="rack/rack_hull_5.stl"/>
+    <mesh name="rack_hull_6"  file="rack/rack_hull_6.stl"/>
+    <mesh name="rack_hull_7"  file="rack/rack_hull_7.stl"/>
+    <mesh name="rack_hull_8"  file="rack/rack_hull_8.stl"/>
+    <mesh name="rack_hull_9"  file="rack/rack_hull_9.stl"/>
+    <mesh name="rack_hull_10" file="rack/rack_hull_10.stl"/>
+    <mesh name="rack_hull_11" file="rack/rack_hull_11.stl"/>
+    <mesh name="rack_hull_12" file="rack/rack_hull_12.stl"/>
+    <mesh name="rack_hull_13" file="rack/rack_hull_13.stl"/>
+    <mesh name="rack_hull_14" file="rack/rack_hull_14.stl"/>
+  </asset>
+</mujoco>

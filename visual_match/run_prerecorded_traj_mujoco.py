@@ -74,6 +74,7 @@ from deploy_act_policy_mujoco import (
     build_observation_from_mujoco,
     load_color_mapping,
 )
+from lerobot.tasks import get_task_profile, get_task_profiles, resolve_task_scene_xml
 
 # Camera configuration (same as deploy_act_policy_mujoco)
 _stationary_cfg = load_camera_config("stationary_cam")
@@ -99,13 +100,18 @@ from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
 GRIPPER_CLOSE_MM = 0.0
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-XML_PATH = str(_PROJECT_ROOT / "xarm7" / "scene.xml")
 RENDER_W, RENDER_H = 640, 480
+_DEFAULT_RECORD_TASK_ID = "place_mug"  # Keep in sync with lerobot-record defaults.
+_DEFAULT_RECORD_TASK_PROFILE = get_task_profile(_DEFAULT_RECORD_TASK_ID)
+_DEFAULT_REPLAY_PARQUET = (
+    f"{_DEFAULT_RECORD_TASK_PROFILE.dataset_root_480640}/data/chunk-000/file-000.parquet"
+)
 
 
 @dataclasses.dataclass
 class Args:
-    parquet: str = "data/data/chunk-000/file-000.parquet"
+    task_id: str = _DEFAULT_RECORD_TASK_ID
+    parquet: str = _DEFAULT_REPLAY_PARQUET
     episode: int = 0
     fps: float = 30.0
     use_actions: bool = False
@@ -123,9 +129,15 @@ def parse_cli() -> Args:
         description="Replay xArm LeRobot dataset in MuJoCo."
     )
     p.add_argument(
+        "--task-id", type=str,
+        choices=sorted(get_task_profiles()),
+        default=_DEFAULT_RECORD_TASK_ID,
+        help="Task ID used to pick the MuJoCo scene XML. The default replay parquet follows this task.",
+    )
+    p.add_argument(
         "--parquet", type=str,
-        default="data/data/chunk-000/file-000.parquet",
-        help="Path to .parquet data file",
+        default=_DEFAULT_REPLAY_PARQUET,
+        help=f"Path to .parquet data file (default follows {_DEFAULT_RECORD_TASK_ID})",
     )
     p.add_argument("--episode", type=int, default=0)
     p.add_argument("--fps", type=float, default=30.0)
@@ -190,6 +202,7 @@ def load_episode_from_parquet(parquet_path: str, episode_idx: int):
 # ---------------------------------------------------------------------------
 def main():
     args = parse_cli()
+    task_profile = get_task_profile(args.task_id)
 
     parquet_path = args.parquet
     if not Path(parquet_path).is_absolute():
@@ -204,10 +217,12 @@ def main():
 
     # Load MuJoCo model
     xarm_dir = _PROJECT_ROOT / "xarm7"
+    scene_xml_path = resolve_task_scene_xml(args.task_id, xarm_dir)
+    print(f"[INFO] Using MuJoCo scene for task {args.task_id!r}: {scene_xml_path.name}")
     original_cwd = os.getcwd()
     try:
         os.chdir(str(xarm_dir))
-        model = MjModel.from_xml_path("scene.xml")
+        model = MjModel.from_xml_path(scene_xml_path.name)
     finally:
         os.chdir(original_cwd)
 
@@ -298,7 +313,7 @@ def main():
             if args.color_calib_path:
                 calib_path = args.color_calib_path if Path(args.color_calib_path).is_absolute() else str(_PROJECT_ROOT / args.color_calib_path)
             else:
-                calib_path = Path(__file__).parent.parent / "calibration_pairs_stationary" / "calibrated" / "color_mapping.yaml"
+                calib_path = task_profile.color_calibration_path("stationary")
             if os.path.exists(calib_path):
                 try:
                     color_calib = load_color_mapping(calib_path)
@@ -318,8 +333,11 @@ def main():
 
     obs_frames = None
     dataset_path = args.dataset_path
-    if dataset_path is None and "data" in parquet_path:
-        dataset_path = str(Path(parquet_path).parent.parent)
+    if dataset_path is None:
+        if args.parquet == _DEFAULT_REPLAY_PARQUET:
+            dataset_path = task_profile.dataset_root_480640
+        elif "data" in parquet_path:
+            dataset_path = str(Path(parquet_path).parent.parent)
     if dataset_path and not Path(dataset_path).is_absolute():
         dataset_path = str(_PROJECT_ROOT / dataset_path)
     if dataset_path and os.path.isdir(dataset_path):

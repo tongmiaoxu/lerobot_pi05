@@ -155,7 +155,7 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
 # Set to None to require --policy.path to be passed explicitly on the CLI.
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_place_mug/checkpoints/last/pretrained_model"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/pi05_place_mug/checkpoints/100000/pretrained_model"
 # _DEFAULT_RECORD_POLICY_CHECKPOINT = None
 _DEFAULT_RECORD_TASK_ID = "place_mug"
 _NUM_EPISODES = 10

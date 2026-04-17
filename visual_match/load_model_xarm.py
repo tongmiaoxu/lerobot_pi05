@@ -45,7 +45,7 @@ def load_model(
     """
     project_root = _SCRIPT_DIR.parent
     if model_path is None:
-        model_path = project_root / "xarm7" / "scene.xml"
+        model_path = project_root / "xarm7" / "scene_saucer.xml"
     model_path = Path(model_path)
 
     xarm_dir = model_path.parent

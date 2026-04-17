@@ -10,8 +10,8 @@ xArm observation.state format (8-dim): [joint1..7 in degrees, gripper in mm (0=c
 composite rendering pipeline.
 
 Usage:
-    # Use real-world dataset images as policy input (instead of MuJoCo rendering):
-    python visual_match/deploy_act_policy_mujoco.py --obs --dataset-path data --episode 0
+    # Uses the hardcoded default task profile for scene/object warmup defaults:
+    python visual_match/deploy_act_policy_mujoco.py
 
     # Same as --obs but fixed to episode 0 of the eval dataset (default: data_eval):
     python visual_match/deploy_act_policy_mujoco.py --obs-eval
@@ -34,6 +34,10 @@ import threading
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/pi05_place_mug/checkpoints/100000/pretrained_model"
+_DEFAULT_RECORD_TASK_ID = "place_mug"
+_NUM_EPISODES = 10
 
 # Auto-detect display (for cv2.imshow, mujoco.viewer)
 def _detect_display():
@@ -89,7 +93,7 @@ from lerobot_mujoco_utils import (
 )
 from lerobot.datasets.utils import copy_observation_frame_with_resized_images
 from lerobot.datasets.video_utils import decode_video_frames
-from lerobot.tasks import get_task_profile
+from lerobot.tasks import get_task_profile, resolve_task_scene_xml
 
 # Arrow key codes for cv2.waitKeyEx (platform-dependent)
 _KEY_LEFT  = (65361, 81, 2)
@@ -97,7 +101,8 @@ _KEY_RIGHT = (65363, 83, 3)
 _KEY_UP    = (65362, 82, 0)
 _KEY_DOWN  = (65364, 84, 1)
 MUG_STEP_INIT_M = 0.005  # 5 mm initial step for mug adjustment
-_DEFAULT_DEPLOY_TASK_ID = "place_mug"  # Keep in sync with lerobot-record defaults.
+MUG_ROT_STEP_RAD = np.deg2rad(5.0)
+
 
 
 def _extract_checkpoint_name(policy_path: str | Path | None) -> str | None:
@@ -347,7 +352,7 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
         if use_composite:
             rgb_image = render_composite_view(
                 model, data, renderer, seg_renderer, robot_geom_ids,
-                mujoco_cam, gaussian_data, camera_intrinsics.get(cam_key)
+                cam_key, mujoco_cam, gaussian_data, camera_intrinsics.get(cam_key)
             )
         else:
             renderer.update_scene(data, camera=mujoco_cam)
@@ -358,7 +363,7 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
 
 def render_composite_view(model: MjModel, data: MjData,
                           renderer: mujoco.Renderer, seg_renderer: mujoco.Renderer,
-                          robot_geom_ids: set, cam_name: str, gaussian_data: dict,
+                          robot_geom_ids: set, cam_key: str, cam_name: str, gaussian_data: dict,
                           intrinsics: np.ndarray | None) -> np.ndarray:
     """
     Render composite view: Gaussian Splatting background + MuJoCo robot foreground.
@@ -377,7 +382,6 @@ def render_composite_view(model: MjModel, data: MjData,
 
     robot_mask = np.isin(seg_labels, list(robot_geom_ids))
     mask_uint8 = (robot_mask.astype(np.uint8)) * 255
-
     if intrinsics is not None and gaussian_data.get('scene_data') is not None:
         try:
             camera_pose = get_mujoco_camera_pose(model, data, cam_name)
@@ -389,8 +393,11 @@ def render_composite_view(model: MjModel, data: MjData,
             bg_np = (bg_np * 255).astype(np.uint8)
             composite = bg_np.copy()
             composite[mask_uint8 > 0] = fg_rgb[mask_uint8 > 0]
-            if 'color_calib' in gaussian_data and gaussian_data['color_calib'] is not None:
-                composite = apply_color_transform(composite, gaussian_data['color_calib'])
+            color_calib = gaussian_data.get('color_calib_by_camera', {}).get(cam_key)
+            if color_calib is None:
+                color_calib = gaussian_data.get('color_calib')
+            if color_calib is not None:
+                composite = apply_color_transform(composite, color_calib)
             return composite
         except Exception as e:
             print(f"[WARN] Gaussian rendering failed for {cam_name}: {e}")
@@ -671,6 +678,62 @@ def convert_action_to_mujoco(action: torch.Tensor, gripper_mj_range: tuple) -> n
     return lerobot_state_to_mujoco_ctrl(action_np, gripper_mj_range)
 
 
+def _quat_normalize(quat: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat, dtype=np.float64)
+    norm = np.linalg.norm(quat)
+    if norm <= 0:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    return quat / norm
+
+
+def _quat_from_euler_xyz(euler: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = [float(v) for v in euler]
+    cr, sr = np.cos(roll / 2.0), np.sin(roll / 2.0)
+    cp, sp = np.cos(pitch / 2.0), np.sin(pitch / 2.0)
+    cy, sy = np.cos(yaw / 2.0), np.sin(yaw / 2.0)
+    quat = np.array(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ],
+        dtype=np.float64,
+    )
+    return _quat_normalize(quat)
+
+
+def _euler_xyz_from_quat(quat: np.ndarray) -> np.ndarray:
+    w, x, y, z = [float(v) for v in _quat_normalize(quat)]
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = np.copysign(np.pi / 2.0, sinp)
+    else:
+        pitch = np.arcsin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+    return np.array([roll, pitch, yaw], dtype=np.float64)
+
+
+def _fmt_xyz(vec: np.ndarray | None) -> str:
+    if vec is None:
+        return "n/a"
+    return f"[{vec[0]:.4f}, {vec[1]:.4f}, {vec[2]:.4f}]"
+
+
+def _fmt_euler_deg(euler: np.ndarray | None) -> str:
+    if euler is None:
+        return "n/a"
+    deg = np.degrees(euler)
+    return f"[{deg[0]:.1f}, {deg[1]:.1f}, {deg[2]:.1f}] deg"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Deploy ACT policy in MuJoCo xArm simulation"
@@ -678,14 +741,14 @@ def main():
     parser.add_argument(
         "--policy-path",
         type=str,
-        default="outputs/pi05_xarm_training/checkpoints/last/pretrained_model",
+        default=_DEFAULT_RECORD_POLICY_CHECKPOINT,
         help="Path to policy checkpoint directory"
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        default="Pick up the mug",
-        help="Task prompt/instruction for the policy"
+        default=None,
+        help="Task prompt/instruction for the policy. Defaults to the selected task's profile instruction.",
     )
     parser.add_argument(
         "--fps",
@@ -711,8 +774,9 @@ def main():
         help="Path to Gaussian Splatting scene file for composite rendering"
     )
     parser.add_argument(
-        "--color-calibrate", action="store_true",default=True,
-        help="Path to color calibration YAML file (optional)"
+        "--color-calibrate", action="store_true",
+        default=True,
+        help="Apply per-camera color calibration YAML files when available."
     )
     obs_mode = parser.add_mutually_exclusive_group()
     obs_mode.add_argument(
@@ -723,19 +787,19 @@ def main():
     obs_mode.add_argument(
         "--obs-eval",
         action="store_true",
-        help="Like --obs but use episode 0 from the eval dataset (default path: data_eval; see --obs-eval-path)"
+        help="Like --obs but use episode 0 from the selected task's eval dataset (see --obs-eval-path)"
     )
     parser.add_argument(
         "--dataset-path",
         type=str,
-        default="data",
-        help="Path to dataset directory for --obs and for Real display when not using --obs-eval"
+        default=None,
+        help="Path to dataset directory for --obs and for Real display when not using --obs-eval. Defaults to the selected task dataset root.",
     )
     parser.add_argument(
         "--obs-eval-path",
         type=str,
-        default="data_eval",
-        help="Dataset path for --obs-eval (default: data_eval)"
+        default=None,
+        help="Dataset path for --obs-eval. Defaults to the selected task eval dataset root.",
     )
     parser.add_argument(
         "--dataset-root",
@@ -778,12 +842,13 @@ def main():
     parser.add_argument(
         "--num_eval_episodes",
         type=int,
-        default=10,
-        help="Number of evaluation episodes to run (default: 10)"
+        default=_NUM_EPISODES,
+        help=f"Number of evaluation episodes to run (default: {_NUM_EPISODES})"
     )
     parser.add_argument(
         "--select",
         action="store_true",
+        default=True,
         help="Load initial-state contour overlays generated by initial_states_overlay.py"
     )
     parser.add_argument(
@@ -805,6 +870,11 @@ def main():
         help="Directory to save sim evaluation data. Default is derived from task, policy type, and checkpoint."
     )
     parser.add_argument(
+        "--no-save-sim-eval",
+        action="store_true",
+        help="Run evaluation but do not write sim outputs (episode npy/mp4, selected_states_grid.png, or output directory).",
+    )
+    parser.add_argument(
         "--gemini",
         action="store_true",
         help="Use Gemini few-shot sim→real translation instead of color_mapping.yaml calibration. "
@@ -814,7 +884,10 @@ def main():
 
     args = parser.parse_args()
     num_eval_episodes = args.num_eval_episodes
-    task_profile = get_task_profile(_DEFAULT_DEPLOY_TASK_ID)
+    task_profile = get_task_profile(_DEFAULT_RECORD_TASK_ID)
+    print(f"[INFO] Default task: {_DEFAULT_RECORD_TASK_ID}")
+    if args.prompt is None:
+        args.prompt = task_profile.single_task
     if args.initial_states_dir is None:
         args.initial_states_dir = task_profile.dataset_root
     if args.object_name is None:
@@ -825,14 +898,27 @@ def main():
     device = get_safe_torch_device(policy.config.device)
     policy = policy.to(device)
 
-    if args.output_dir is None:
+    if args.no_save_sim_eval:
+        checkpoint_name = _extract_checkpoint_name(args.policy_path)
+        args.output_dir = None
+    elif args.output_dir is None:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
         args.output_dir = task_profile.sim_eval_root_for_policy(policy.config.type, checkpoint_name)
+    else:
+        checkpoint_name = _extract_checkpoint_name(args.policy_path)
 
-    # Create output directory for sim evaluation data
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[INFO] Sim eval output directory: {output_dir.resolve()}")
+    if args.dataset_path is None:
+        args.dataset_path = task_profile.dataset_root
+    if args.obs_eval_path is None:
+        args.obs_eval_path = task_profile.eval_root_for_policy(policy.config.type, checkpoint_name)
+
+    # Output directory for sim evaluation data (None when --no-save-sim-eval)
+    output_dir = Path(args.output_dir) if args.output_dir is not None else None
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Sim eval output directory: {output_dir.resolve()}")
+    else:
+        print("[INFO] Sim eval disk output disabled (--no-save-sim-eval)")
 
     # Load initial-state contours and open selection UI when --select is used
     list_of_contours = None
@@ -856,13 +942,14 @@ def main():
             print(f"[ERROR] Selected {len(selected_contours)} contours but "
                   f"num_eval_episodes={num_eval_episodes}. Must be equal.")
             sys.exit(1)
-        save_selection_grid(
-            initial_states_dir=args.initial_states_dir,
-            object_name=args.object_name,
-            list_of_contours=list_of_contours,
-            selected_indices=selected_episode_indices,
-            output_path=output_dir / "selected_states_grid.png",
-        )
+        if output_dir is not None:
+            save_selection_grid(
+                initial_states_dir=args.initial_states_dir,
+                object_name=args.object_name,
+                list_of_contours=list_of_contours,
+                selected_indices=selected_episode_indices,
+                output_path=output_dir / "selected_states_grid.png",
+            )
 
     if args.obs:
         print("[INFO] --obs: using real-world dataset images as policy input")
@@ -896,10 +983,12 @@ def main():
     # Load MuJoCo xArm model
     project_root = Path(__file__).parent.parent
     xarm_dir = project_root / "xarm7"
+    scene_xml_path = resolve_task_scene_xml(_DEFAULT_RECORD_TASK_ID, xarm_dir)
+    print(f"[INFO] Using MuJoCo scene for task {_DEFAULT_RECORD_TASK_ID!r}: {scene_xml_path.name}")
     original_cwd = os.getcwd()
     try:
         os.chdir(str(xarm_dir))
-        model = MjModel.from_xml_path("scene.xml")
+        model = MjModel.from_xml_path(scene_xml_path.name)
     finally:
         os.chdir(original_cwd)
 
@@ -917,15 +1006,41 @@ def main():
     )
     print(f"[INFO] Gripper ctrl range: [{gripper_mj_range[0]}, {gripper_mj_range[1]}]")
 
-    # Mug freejoint address (for in-memory position adjustment during warmup)
+    adjustable_object_names = tuple(dict.fromkeys(task_profile.deploy_adjustable_object_names))
+
+    # Mug freejoint address (for in-memory position/orientation adjustment during warmup)
     mug_joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
     mug_qpos_addr = model.jnt_qposadr[mug_joint_id] if mug_joint_id >= 0 else -1
     if mug_qpos_addr >= 0:
         print(f"[INFO] Mug freejoint found (qpos addr={mug_qpos_addr})")
     else:
-        print("[WARN] mug_joint not found – mug position adjustment disabled")
+        print("[WARN] mug_joint not found – mug pose adjustment disabled")
+
+    adjustable_body_ids = {}
+    adjustable_body_default_pos = {}
+    for obj_name in adjustable_object_names:
+        if obj_name == "mug":
+            continue
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, obj_name)
+        if body_id < 0:
+            print(f"[WARN] Adjustable body '{obj_name}' not found in {scene_xml_path.name}")
+            continue
+        adjustable_body_ids[obj_name] = body_id
+        adjustable_body_default_pos[obj_name] = model.body_pos[body_id].copy()
 
     RENDER_W, RENDER_H = 640, 480
+
+    # Match MuJoCo vertical FOV to the calibrated camera intrinsics, mirroring
+    # compare_recorded_vs_mujoco so foreground masks align with the GS render.
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        K = cam_cfg["config"]["intrinsics"]
+        fy = K[1, 1]
+        correct_fovy = float(2.0 * np.degrees(np.arctan(RENDER_H / (2.0 * fy))))
+        mj_cam = cam_cfg["mujoco_cam"]
+        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, mj_cam)
+        if cam_id >= 0:
+            model.cam_fovy[cam_id] = correct_fovy
+
     renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer.enable_segmentation_rendering()
@@ -954,20 +1069,21 @@ def main():
             scene_data, scene_depth_data, _ = load_scene_data(
                 args.scene_path, w2c_init, camera_intrinsics["stationary"]
             )
-            color_calib = None
+            color_calib_by_camera = {}
             if args.color_calibrate and not args.gemini:
-                default_calib = Path(__file__).parent.parent / "calibration_pairs_stationary" / "calibrated" / "color_mapping.yaml"
-                try:
-                    color_calib = load_color_mapping(default_calib)
-                    print(f"[INFO] Loaded color calibration from: {default_calib}")
-                except Exception as e:
-                    print(f"[WARN] Failed to load color calibration: {e}")
+                for cam_key in CAMERA_CONFIG:
+                    default_calib = task_profile.color_calibration_path(cam_key)
+                    try:
+                        color_calib_by_camera[cam_key] = load_color_mapping(default_calib)
+                        print(f"[INFO] Loaded {cam_key} color calibration from: {default_calib}")
+                    except Exception as e:
+                        print(f"[WARN] Failed to load {cam_key} color calibration from {default_calib}: {e}")
             viz_cfg = {'viz_w': RENDER_W, 'viz_h': RENDER_H, 'viz_near': 0.1, 'viz_far': 10.0}
             gaussian_data = {
                 'scene_data': scene_data,
                 'scene_depth_data': scene_depth_data,
                 'viz_cfg': viz_cfg,
-                'color_calib': color_calib,
+                'color_calib_by_camera': color_calib_by_camera,
                 'camera_intrinsics': camera_intrinsics,
             }
             print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
@@ -1092,6 +1208,9 @@ def main():
     completed_episodes = 0
     episode_idx = 0
 
+    default_mug_pos = data.qpos[mug_qpos_addr:mug_qpos_addr + 3].copy() if mug_qpos_addr >= 0 else None
+    default_mug_quat = data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7].copy() if mug_qpos_addr >= 0 else None
+
     def _reset_sim():
         """Reset simulation to home keyframe and re-apply camera calibration."""
         try:
@@ -1099,12 +1218,68 @@ def main():
             mujoco.mj_resetDataKeyframe(model, data, home_id)
         except Exception:
             mujoco.mj_resetData(model, data)
+        for obj_name, body_id in adjustable_body_ids.items():
+            model.body_pos[body_id] = adjustable_body_default_pos[obj_name]
+        if mug_qpos_addr >= 0 and default_mug_pos is not None and default_mug_quat is not None:
+            data.qpos[mug_qpos_addr:mug_qpos_addr + 3] = default_mug_pos
+            data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7] = default_mug_quat
         mujoco.mj_forward(model, data)
         for cam_cfg in CAMERA_CONFIG.values():
             if cam_cfg["config"].get("type", "stationary") == "stationary":
                 set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
-    def _render_current_view(warmup_contour=None, alpha=0.4):
+    def _capture_adjustable_state() -> dict:
+        state = {
+            "body_positions": {
+                obj_name: model.body_pos[body_id].copy()
+                for obj_name, body_id in adjustable_body_ids.items()
+            }
+        }
+        if mug_qpos_addr >= 0:
+            mug_pos = data.qpos[mug_qpos_addr:mug_qpos_addr + 3].copy()
+            mug_quat = data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7].copy()
+            state["mug_pos"] = mug_pos
+            state["mug_quat"] = mug_quat
+            state["mug_euler"] = _euler_xyz_from_quat(mug_quat)
+        else:
+            state["mug_pos"] = None
+            state["mug_quat"] = None
+            state["mug_euler"] = None
+        return state
+
+    def _apply_adjustable_state(state: dict) -> None:
+        if mug_qpos_addr >= 0 and state["mug_pos"] is not None and state["mug_quat"] is not None:
+            data.qpos[mug_qpos_addr:mug_qpos_addr + 3] = state["mug_pos"]
+            data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7] = _quat_normalize(state["mug_quat"])
+        for obj_name, body_pos in state["body_positions"].items():
+            body_id = adjustable_body_ids.get(obj_name)
+            if body_id is not None:
+                model.body_pos[body_id] = body_pos
+        mujoco.mj_forward(model, data)
+
+    def _warmup_status(state: dict, current_obj: str | None) -> str:
+        if current_obj == "mug":
+            return f"mug pos={_fmt_xyz(state['mug_pos'])} euler={_fmt_euler_deg(state['mug_euler'])}"
+        if current_obj and current_obj in state["body_positions"]:
+            return f"{current_obj} pos={_fmt_xyz(state['body_positions'][current_obj])}"
+        return f"objects={', '.join(adjustable_object_names) or 'none'}"
+
+    def _select_warmup_object(key: int, current_obj: str | None) -> str | None:
+        key_to_obj = {
+            ord("m"): "mug",
+            ord("r"): "rack",
+            ord("p"): "saucer",
+            ord("t"): "sticker",
+            ord("b"): "table",
+        }
+        selected = key_to_obj.get(key, current_obj)
+        if selected == "mug" and mug_qpos_addr < 0:
+            return current_obj
+        if selected != "mug" and selected not in adjustable_body_ids:
+            return current_obj
+        return selected
+
+    def _render_current_view(warmup_contour=None, alpha=0.4, status_text: str | None = None, help_text: str | None = None):
         """Render and display cameras for the current sim state (used during warmup).
 
         If *warmup_contour* is provided, it is overlaid on the stationary camera
@@ -1129,6 +1304,16 @@ def main():
                     cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
                     cv2.drawContours(img, warmup_contour, -1, (0, 255, 0), 2)
                     composite_obs[cam_high_key] = img
+            if status_text or help_text:
+                for img_key, img in composite_obs.items():
+                    if "image" not in img_key.lower() or not isinstance(img, np.ndarray):
+                        continue
+                    y = 26
+                    if status_text:
+                        cv2.putText(img, status_text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        y += 22
+                    if help_text:
+                        cv2.putText(img, help_text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
             display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
             if obs_frames is not None and show_real_windows:
                 real_obs = build_observation_from_mujoco(
@@ -1156,7 +1341,13 @@ def main():
             events["rerecord_episode"] = False
             events["exit_early"] = False
 
-            can_adjust_mug = warmup_contour and mug_qpos_addr >= 0
+            can_adjust_scene = bool(adjustable_object_names) and not args.headless
+            warmup_state = _capture_adjustable_state()
+            current_warmup_obj = adjustable_object_names[0] if adjustable_object_names else None
+            warmup_help = (
+                "Arrows: XY | w/s: Z | j/l: yaw | i/k: pitch | [ ]: roll | "
+                "m/r/p/t: select | -/+: step"
+            )
 
             print(f"\n{'='*60}")
             print(f"  WARMUP - Episode {completed_episodes + 1}/{num_eval_episodes}  "
@@ -1165,20 +1356,22 @@ def main():
                 src_ep = selected_episode_indices[completed_episodes]
                 print(f"  Contour: selected_contours[{completed_episodes}]  "
                       f"(training ep {src_ep})")
-                if can_adjust_mug:
-                    print(f"  Arrows: move mug XY | w/s: Z | -/+: step size")
+            if can_adjust_scene:
+                print(f"  Adjustable objects: {', '.join(adjustable_object_names)}")
+                print(f"  {warmup_help}")
                 print(f"  ENTER: start evaluation | ESC: quit")
             elif listener is not None:
                 print(f"  Press RIGHT to start evaluation, ESC to quit")
             print(f"{'='*60}")
 
-            if warmup_contour:
-                # ── cv2-based warmup with contour overlay ──
+            if not args.headless:
+                # ── cv2-based warmup (with optional contour overlay) ──
                 mug_step = MUG_STEP_INIT_M
-                if can_adjust_mug:
-                    mug_pos = data.qpos[mug_qpos_addr:mug_qpos_addr + 3].copy()
-
-                _render_current_view(warmup_contour=warmup_contour)
+                _render_current_view(
+                    warmup_contour=warmup_contour,
+                    status_text=_warmup_status(warmup_state, current_warmup_obj),
+                    help_text=warmup_help if can_adjust_scene else None,
+                )
 
                 while not events["stop_recording"]:
                     key = cv2.waitKeyEx(50)
@@ -1191,22 +1384,56 @@ def main():
                         events["stop_recording"] = True
                         break
 
-                    if not can_adjust_mug:
+                    if not can_adjust_scene:
                         continue
 
+                    previous_obj = current_warmup_obj
+                    current_warmup_obj = _select_warmup_object(key, current_warmup_obj)
+                    if current_warmup_obj != previous_obj:
+                        print(f"[INFO] Selected object: {current_warmup_obj}")
+
                     moved = False
-                    if key in _KEY_LEFT:
-                        mug_pos[0] -= mug_step; moved = True
-                    elif key in _KEY_RIGHT:
-                        mug_pos[0] += mug_step; moved = True
-                    elif key in _KEY_UP:
-                        mug_pos[1] += mug_step; moved = True
-                    elif key in _KEY_DOWN:
-                        mug_pos[1] -= mug_step; moved = True
-                    elif key == ord('w'):
-                        mug_pos[2] += mug_step; moved = True
+                    rotated = False
+                    if key in _KEY_LEFT and current_warmup_obj == "mug" and warmup_state["mug_pos"] is not None:
+                        warmup_state["mug_pos"][0] -= mug_step; moved = True
+                    elif key in _KEY_RIGHT and current_warmup_obj == "mug" and warmup_state["mug_pos"] is not None:
+                        warmup_state["mug_pos"][0] += mug_step; moved = True
+                    elif key in _KEY_UP and current_warmup_obj == "mug" and warmup_state["mug_pos"] is not None:
+                        warmup_state["mug_pos"][1] += mug_step; moved = True
+                    elif key in _KEY_DOWN and current_warmup_obj == "mug" and warmup_state["mug_pos"] is not None:
+                        warmup_state["mug_pos"][1] -= mug_step; moved = True
+                    elif current_warmup_obj in warmup_state["body_positions"]:
+                        if key in _KEY_LEFT:
+                            warmup_state["body_positions"][current_warmup_obj][0] -= mug_step; moved = True
+                        elif key in _KEY_RIGHT:
+                            warmup_state["body_positions"][current_warmup_obj][0] += mug_step; moved = True
+                        elif key in _KEY_UP:
+                            warmup_state["body_positions"][current_warmup_obj][1] += mug_step; moved = True
+                        elif key in _KEY_DOWN:
+                            warmup_state["body_positions"][current_warmup_obj][1] -= mug_step; moved = True
+                    if key == ord('w'):
+                        if current_warmup_obj == "mug" and warmup_state["mug_pos"] is not None:
+                            warmup_state["mug_pos"][2] += mug_step; moved = True
+                        elif current_warmup_obj in warmup_state["body_positions"]:
+                            warmup_state["body_positions"][current_warmup_obj][2] += mug_step; moved = True
                     elif key == ord('s'):
-                        mug_pos[2] -= mug_step; moved = True
+                        if current_warmup_obj == "mug" and warmup_state["mug_pos"] is not None:
+                            warmup_state["mug_pos"][2] -= mug_step; moved = True
+                        elif current_warmup_obj in warmup_state["body_positions"]:
+                            warmup_state["body_positions"][current_warmup_obj][2] -= mug_step; moved = True
+                    elif current_warmup_obj == "mug" and warmup_state["mug_euler"] is not None:
+                        if key == ord('j'):
+                            warmup_state["mug_euler"][2] -= MUG_ROT_STEP_RAD; rotated = True
+                        elif key == ord('l'):
+                            warmup_state["mug_euler"][2] += MUG_ROT_STEP_RAD; rotated = True
+                        elif key == ord('i'):
+                            warmup_state["mug_euler"][1] += MUG_ROT_STEP_RAD; rotated = True
+                        elif key == ord('k'):
+                            warmup_state["mug_euler"][1] -= MUG_ROT_STEP_RAD; rotated = True
+                        elif key == ord('['):
+                            warmup_state["mug_euler"][0] -= MUG_ROT_STEP_RAD; rotated = True
+                        elif key == ord(']'):
+                            warmup_state["mug_euler"][0] += MUG_ROT_STEP_RAD; rotated = True
 
                     if key in (ord('-'), ord('_')):
                         mug_step /= 2.0
@@ -1215,12 +1442,17 @@ def main():
                         mug_step = min(mug_step * 2.0, MUG_STEP_INIT_M)
                         print(f"[INFO] Step: {mug_step*1000:.2f} mm")
 
-                    if moved:
-                        data.qpos[mug_qpos_addr:mug_qpos_addr + 3] = mug_pos
-                        mujoco.mj_forward(model, data)
-                        _render_current_view(warmup_contour=warmup_contour)
-                        print(f"[INFO] Mug pos: [{mug_pos[0]:.4f}, {mug_pos[1]:.4f}, {mug_pos[2]:.4f}]  "
-                              f"step={mug_step*1000:.2f}mm")
+                    if rotated:
+                        warmup_state["mug_quat"] = _quat_from_euler_xyz(warmup_state["mug_euler"])
+                    if moved or rotated:
+                        _apply_adjustable_state(warmup_state)
+                        print(f"[INFO] {_warmup_status(warmup_state, current_warmup_obj)}  step={mug_step*1000:.2f}mm")
+                    if moved or rotated or current_warmup_obj != previous_obj or key in (ord('-'), ord('_'), ord('+'), ord('=')):
+                        _render_current_view(
+                            warmup_contour=warmup_contour,
+                            status_text=_warmup_status(warmup_state, current_warmup_obj),
+                            help_text=warmup_help,
+                        )
 
                 # Clear stale pynput events from arrow keys
                 events["right_arrow"] = False
@@ -1423,27 +1655,29 @@ def main():
                     "actions": episode_actions,
                     "states": episode_states,
                 })
-                # Save episode data (states, actions, camera videos) to output directory
-                ep_dir = output_dir / f"episode_{completed_episodes:03d}"
-                ep_dir.mkdir(parents=True, exist_ok=True)
-                np.save(str(ep_dir / "states.npy"), np.array(episode_states))
-                np.save(str(ep_dir / "actions.npy"), np.array(episode_actions))
-                for _cam_key, _frames in episode_frames.items():
-                    if not _frames:
-                        continue
-                    _dataset_cam = CAMERA_CONFIG[_cam_key]["dataset_cam"]
-                    _video_path = ep_dir / f"{_dataset_cam}.mp4"
-                    _h, _w = _frames[0].shape[:2]
-                    _fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    _writer = cv2.VideoWriter(str(_video_path), _fourcc, args.fps, (_w, _h))
-                    for _frame in _frames:
-                        _writer.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
-                    _writer.release()
-                    print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
-                print(f"[INFO] Episode data saved → {ep_dir}")
+                if output_dir is not None:
+                    # Save episode data (states, actions, camera videos) to output directory
+                    ep_dir = output_dir / f"episode_{completed_episodes:03d}"
+                    ep_dir.mkdir(parents=True, exist_ok=True)
+                    np.save(str(ep_dir / "states.npy"), np.array(episode_states))
+                    np.save(str(ep_dir / "actions.npy"), np.array(episode_actions))
+                    for _cam_key, _frames in episode_frames.items():
+                        if not _frames:
+                            continue
+                        _dataset_cam = CAMERA_CONFIG[_cam_key]["dataset_cam"]
+                        _video_path = ep_dir / f"{_dataset_cam}.mp4"
+                        _h, _w = _frames[0].shape[:2]
+                        _fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        _writer = cv2.VideoWriter(str(_video_path), _fourcc, args.fps, (_w, _h))
+                        for _frame in _frames:
+                            _writer.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
+                        _writer.release()
+                        print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
+                    print(f"[INFO] Episode data saved → {ep_dir}")
                 completed_episodes += 1
+                _save_note = "" if output_dir is not None else " (no disk save)"
                 print(f">>> Episode {episode_idx} SAVED - {reason} "
-                      f"({step} steps, {completed_episodes}/{num_eval_episodes} done)")
+                      f"({step} steps, {completed_episodes}/{num_eval_episodes} done){_save_note}")
 
             episode_idx += 1
 
@@ -1459,7 +1693,8 @@ def main():
                 pass
         if not args.headless:
             cv2.destroyAllWindows()
-        print(f"[INFO] Evaluation finished: {completed_episodes}/{num_eval_episodes} episodes saved")
+        _fin = "episodes saved" if output_dir is not None else "episodes completed (no sim eval data saved)"
+        print(f"[INFO] Evaluation finished: {completed_episodes}/{num_eval_episodes} {_fin}")
 
 
 if __name__ == "__main__":

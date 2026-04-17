@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -7,17 +8,28 @@ class TaskProfile:
     single_task: str
     dataset_repo_id: str
     dataset_root: str
+    dataset_root_480640: str
     eval_dataset_repo_id: str
     eval_dataset_root: str
     sim_eval_dataset_root: str
     selection_object_name: str
     wandb_project: str
+    scene_xml_candidates: tuple[str, ...] = ("scene.xml",)
+    xarm7_xml: str = "xarm7.xml"
+    deploy_adjustable_object_names: tuple[str, ...] = ("mug",)
+    calibration_adjustable_object_names: tuple[str, ...] = ("mug",)
     output_dirs_by_policy: dict[str, str] = field(default_factory=dict)
 
     def output_dir(self, policy_type: str) -> str:
         if policy_type in self.output_dirs_by_policy:
             return f"outputs/{self.output_dirs_by_policy[policy_type]}"
         return f"outputs/{policy_type}_{self.task_id}"
+
+    def calibration_pairs_dir(self, camera_name: str = "stationary") -> Path:
+        return Path(self.dataset_root_480640) / f"calibration_pairs_{camera_name}"
+
+    def color_calibration_path(self, camera_name: str = "stationary") -> Path:
+        return self.calibration_pairs_dir(camera_name) / "calibrated" / "color_mapping.yaml"
 
     def _policy_suffix(self, policy_type: str | None = None, checkpoint_name: str | None = None) -> str:
         parts = []
@@ -45,12 +57,16 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         task_id="pick_mug",
         single_task="Pick up the mug",
         dataset_repo_id="xarm_pick_mug",
-        dataset_root="data",
+        dataset_root="data_pick_mug",
+        dataset_root_480640 = "data_pick_mug_copy",
         eval_dataset_repo_id="eval_xarm_pick_mug",
-        eval_dataset_root="data_eval",
-        sim_eval_dataset_root="data_sim_eval",
+        eval_dataset_root="data_eval_pick_mug",
+        sim_eval_dataset_root="data_sim_eval_pick_mug",
         selection_object_name="mug",
         wandb_project="pick_mug",
+        scene_xml_candidates=("scene.xml",),
+        deploy_adjustable_object_names=("mug",),
+        calibration_adjustable_object_names=("mug", "sticker"),
         output_dirs_by_policy={
             "act": "act_xarm_training",
             "diffusion": "diffusion_xarm_training",
@@ -63,22 +79,32 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         single_task="Pick and place the mug on the saucer",
         dataset_repo_id="place_mug",
         dataset_root="data_place_mug",
+        dataset_root_480640 = "data_place_mug_copy",
         eval_dataset_repo_id="eval_place_mug",
         eval_dataset_root="data_eval_place_mug",
         sim_eval_dataset_root="data_sim_eval_place_mug",
         selection_object_name="mug, saucer",
         wandb_project="place_mug",
+        scene_xml_candidates=("scene_saucer.xml",),
+        xarm7_xml="xarm7_saucer.xml",
+        deploy_adjustable_object_names=("mug", "saucer"),
+        calibration_adjustable_object_names=("mug", "saucer","table"),
     ),
     "hang_mug": TaskProfile(
         task_id="hang_mug",
         single_task="Hang the mug on the rack",
         dataset_repo_id="hang_mug",
         dataset_root="data_hang_mug",
+        dataset_root_480640 = "data_hang_mug_copy",
         eval_dataset_repo_id="eval_hang_mug",
         eval_dataset_root="data_eval_hang_mug",
         sim_eval_dataset_root="data_sim_eval_hang_mug",
-        selection_object_name="mug, rack",
+        selection_object_name="mug",
         wandb_project="hang_mug",
+        scene_xml_candidates=("scene_hang.xml",),
+        xarm7_xml="xarm7_hang.xml",
+        deploy_adjustable_object_names=("mug",),
+        calibration_adjustable_object_names=("mug", "rack","table"),
     ),
 }
 
@@ -93,3 +119,26 @@ def get_task_profile(task_id: str) -> TaskProfile:
     except KeyError as exc:
         available = ", ".join(sorted(_TASK_PROFILES))
         raise ValueError(f"Unknown task_id '{task_id}'. Expected one of: {available}.") from exc
+
+
+def resolve_task_scene_xml(task_id: str, xarm_dir: str | Path) -> Path:
+    task_profile = get_task_profile(task_id)
+    xarm_dir = Path(xarm_dir)
+    for scene_name in task_profile.scene_xml_candidates:
+        scene_path = xarm_dir / scene_name
+        if scene_path.exists():
+            return scene_path
+
+    searched = ", ".join(str(xarm_dir / scene_name) for scene_name in task_profile.scene_xml_candidates)
+    raise FileNotFoundError(f"Could not find a scene XML for task_id {task_id!r}. Checked: {searched}")
+
+
+def resolve_task_xarm7_xml(task_id: str, xarm_dir: str | Path) -> Path:
+    task_profile = get_task_profile(task_id)
+    path = Path(xarm_dir) / task_profile.xarm7_xml
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Could not find robot XML for task_id {task_id!r}: {path} "
+            f"(expected filename from task profile: {task_profile.xarm7_xml!r})"
+        )
+    return path

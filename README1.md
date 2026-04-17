@@ -123,7 +123,7 @@ python scripts/train_task.py \
 ```
 ```bash
 python scripts/train_task.py \
-  --task-id=place_mug \
+  --task-id=hang_mug \
   --policy-type=diffusion \
   --policy.device=cuda \
   --policy.push_to_hub=false \
@@ -132,8 +132,8 @@ python scripts/train_task.py \
   --policy.horizon=56 \
   --policy.n_action_steps=50 \
   --batch_size=128 \
-  --save_freq=8000 \
-  --steps=80000 \
+  --save_freq=30000 \
+  --steps=90000 \
   --config_path=outputs/diffusion_xarm_training/checkpoints/010000/pretrained_model/train_config.json \
   --resume=true
 ```
@@ -156,13 +156,13 @@ python scripts/train_task.py \
   --dataset.use_imagenet_stats=false \
   --dataset.image_transforms.enable=true \
   --batch_size=16 \
-  --steps=50000 \
-  --save_freq=10000
+  --steps=100000 \
+  --save_freq=40000
 ```
 
 ```bash
 python scripts/train_task.py \
-  --task-id=pick_mug \
+  --task-id=place_mug \
   --policy-type=groot \
   --policy.device=cuda \
   --policy.push_to_hub=false \
@@ -175,7 +175,7 @@ python scripts/train_task.py \
   --dataset.image_transforms.enable=true \
   --batch_size=16 \
   --steps=100000 \
-  --save_freq=20000 \
+  --save_freq=40000 \
   --num_workers=4 \
   --dataset.video_backend=pyav
 ```
@@ -200,10 +200,6 @@ Defaults in `src/lerobot/scripts/lerobot_record.py`:
 
 You can still override `--dataset.single_task`, `--dataset.root`, or `--dataset.repo_id` when needed.
 
-### Adjust obj position in mujoco (or --stiker)
-```bash
-python visual_match/sticker_alpha_calibration.py --cube 
-```
 
 ### Workflow
 Workflow:  gaussian splatting -> point cloud alignment-> camera calibration -> data collection -> composite rendering-> color alignment -> dynamics matching
@@ -220,17 +216,10 @@ load camera config:
 ```bash
 python tools/load_camera_config.py
 ```
-**adjust object position for color alignment** (press + to increase simulation blending)(arrows with w and s )
-```bash
-python visual_match/sticker_alpha_calibration.py --mug --sticker --table
-```
-**Save calibration pairs** from replay (frames 0,1,2,3,4) (press space to pause)
-```bash
-python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs --dataset-path data_color
-```
+
 **Run calibration** to learn affine transforms:
 ```bash
-python visual_match/calibrate_color_wrist.py
+python visual_match/calibrate_color.py
 ```
  **Verify**: check `calibration_pairs_wrist/calibrated/combined_*.png` (sim | real | calibrated side-by-side).
 
@@ -261,7 +250,56 @@ python tools/query_gemini.py -n 1 --stationary
 python tools/query_gemini.py -n 3 --wrist
 ```
 
-###Downsample dataset images
+Go to task_profiles.py to edit task configs.
+
+Collect dataset:
+Set _DEFAULT_RECORD_POLICY_CHECKPOINT = None in lerobot-record
+```bash
+python tools/gello_get_offset.py --port /dev/ttyUSB0
+lerobot-record
+```
+Make a copy before DS
+
+DS
 ```bash
 python scripts/prepare_lerobot_dataset_224.py /path/to/your_dataset_name
 ```
+
+Train
+Copy dataset to cluster
+
+Initial Dist:
+set DATA_DIR = copy before DS
+set TEXT_PROMPTS
+```bash
+python visual_match/initial_states_overlay.py
+python visual_match/temp_pixel_masks_overlay_10ep.py
+```
+Saved under DATA_DIR.
+
+Align object for replay or color alignment:
+```bash
+python tools/decomp_collision_mujoco.py
+python visual_match/obj_calibration_mujoco.py
+```
+
+Replay:
+```bash
+python visual_match/compare_recorded_vs_mujoco.py
+```
+
+Color Alignment:
+```bash
+python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
+python visual_match/calibrate_color.py
+```
+Deployment:
+Set policy checkpoint, run
+```bash
+lerobot-record
+python visual_match/deploy_act_policy_mujoco.py
+```
+Then deployment selection defaults come from the task_profiles.py:
+pick_mug -> mug
+place_mug -> mug + saucer
+hang_mug -> mug + rack

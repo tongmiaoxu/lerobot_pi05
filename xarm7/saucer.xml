@@ -1,0 +1,52 @@
+<!-- Shared saucer mesh assets and collision defaults.
+     Include at the <mujoco> level in any scene that uses the saucer. -->
+<mujoco>
+  <default>
+    <default class="saucer_collision">
+      <geom rgba="0.502 0.584 0.333 0" mass="0"
+            friction="2 0.05 0.01" condim="4" priority="1"
+            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
+    </default>
+  </default>
+
+  <asset>
+    <mesh name="saucer" file="saucer.stl" scale="0.0009 0.0009 0.0009"/>
+    <mesh name="saucer_hull_0" file="saucer/saucer_hull_0.stl"/>
+    <mesh name="saucer_hull_1" file="saucer/saucer_hull_1.stl"/>
+    <mesh name="saucer_hull_2" file="saucer/saucer_hull_2.stl"/>
+    <mesh name="saucer_hull_3" file="saucer/saucer_hull_3.stl"/>
+    <mesh name="saucer_hull_4" file="saucer/saucer_hull_4.stl"/>
+    <mesh name="saucer_hull_5" file="saucer/saucer_hull_5.stl"/>
+    <mesh name="saucer_hull_6" file="saucer/saucer_hull_6.stl"/>
+    <mesh name="saucer_hull_7" file="saucer/saucer_hull_7.stl"/>
+    <mesh name="saucer_hull_8" file="saucer/saucer_hull_8.stl"/>
+    <mesh name="saucer_hull_9" file="saucer/saucer_hull_9.stl"/>
+    <mesh name="saucer_hull_10" file="saucer/saucer_hull_10.stl"/>
+    <mesh name="saucer_hull_11" file="saucer/saucer_hull_11.stl"/>
+    <mesh name="saucer_hull_12" file="saucer/saucer_hull_12.stl"/>
+    <mesh name="saucer_hull_13" file="saucer/saucer_hull_13.stl"/>
+    <mesh name="saucer_hull_14" file="saucer/saucer_hull_14.stl"/>
+    <mesh name="saucer_hull_15" file="saucer/saucer_hull_15.stl"/>
+    <mesh name="saucer_hull_16" file="saucer/saucer_hull_16.stl"/>
+    <mesh name="saucer_hull_17" file="saucer/saucer_hull_17.stl"/>
+    <mesh name="saucer_hull_18" file="saucer/saucer_hull_18.stl"/>
+    <mesh name="saucer_hull_19" file="saucer/saucer_hull_19.stl"/>
+    <mesh name="saucer_hull_20" file="saucer/saucer_hull_20.stl"/>
+    <mesh name="saucer_hull_21" file="saucer/saucer_hull_21.stl"/>
+    <mesh name="saucer_hull_22" file="saucer/saucer_hull_22.stl"/>
+    <mesh name="saucer_hull_23" file="saucer/saucer_hull_23.stl"/>
+    <mesh name="saucer_hull_24" file="saucer/saucer_hull_24.stl"/>
+    <mesh name="saucer_hull_25" file="saucer/saucer_hull_25.stl"/>
+    <mesh name="saucer_hull_26" file="saucer/saucer_hull_26.stl"/>
+    <mesh name="saucer_hull_27" file="saucer/saucer_hull_27.stl"/>
+    <mesh name="saucer_hull_28" file="saucer/saucer_hull_28.stl"/>
+    <mesh name="saucer_hull_29" file="saucer/saucer_hull_29.stl"/>
+    <mesh name="saucer_hull_30" file="saucer/saucer_hull_30.stl"/>
+    <mesh name="saucer_hull_31" file="saucer/saucer_hull_31.stl"/>
+    <mesh name="saucer_hull_32" file="saucer/saucer_hull_32.stl"/>
+    <mesh name="saucer_hull_33" file="saucer/saucer_hull_33.stl"/>
+    <mesh name="saucer_hull_34" file="saucer/saucer_hull_34.stl"/>
+    <mesh name="saucer_hull_35" file="saucer/saucer_hull_35.stl"/>
+    <mesh name="saucer_hull_36" file="saucer/saucer_hull_36.stl"/>
+  </asset>
+</mujoco>

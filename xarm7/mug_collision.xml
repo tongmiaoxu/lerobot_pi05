@@ -1,0 +1,59 @@
+<!-- Mug visual + CoACD convex-decomposition collision geoms (53 parts).
+     Include inside <body name="mug"> in any scene file. -->
+<mujoco>
+  <geom name="mug_visual" type="mesh" mesh="mug" material="mug_mat"
+        contype="0" conaffinity="0" mass="0"/>
+  <geom name="mug_col_0"  type="mesh" mesh="mug_hull_0"  class="mug_collision"/>
+  <geom name="mug_col_1"  type="mesh" mesh="mug_hull_1"  class="mug_collision"/>
+  <geom name="mug_col_2"  type="mesh" mesh="mug_hull_2"  class="mug_collision"/>
+  <geom name="mug_col_3"  type="mesh" mesh="mug_hull_3"  class="mug_collision"/>
+  <geom name="mug_col_4"  type="mesh" mesh="mug_hull_4"  class="mug_collision"/>
+  <geom name="mug_col_5"  type="mesh" mesh="mug_hull_5"  class="mug_collision"/>
+  <geom name="mug_col_6"  type="mesh" mesh="mug_hull_6"  class="mug_collision"/>
+  <geom name="mug_col_7"  type="mesh" mesh="mug_hull_7"  class="mug_collision"/>
+  <geom name="mug_col_8"  type="mesh" mesh="mug_hull_8"  class="mug_collision"/>
+  <geom name="mug_col_9"  type="mesh" mesh="mug_hull_9"  class="mug_collision"/>
+  <geom name="mug_col_10" type="mesh" mesh="mug_hull_10" class="mug_collision"/>
+  <geom name="mug_col_11" type="mesh" mesh="mug_hull_11" class="mug_collision"/>
+  <geom name="mug_col_12" type="mesh" mesh="mug_hull_12" class="mug_collision"/>
+  <geom name="mug_col_13" type="mesh" mesh="mug_hull_13" class="mug_collision"/>
+  <geom name="mug_col_14" type="mesh" mesh="mug_hull_14" class="mug_collision"/>
+  <geom name="mug_col_15" type="mesh" mesh="mug_hull_15" class="mug_collision"/>
+  <geom name="mug_col_16" type="mesh" mesh="mug_hull_16" class="mug_collision"/>
+  <geom name="mug_col_17" type="mesh" mesh="mug_hull_17" class="mug_collision"/>
+  <geom name="mug_col_18" type="mesh" mesh="mug_hull_18" class="mug_collision"/>
+  <geom name="mug_col_19" type="mesh" mesh="mug_hull_19" class="mug_collision"/>
+  <geom name="mug_col_20" type="mesh" mesh="mug_hull_20" class="mug_collision"/>
+  <geom name="mug_col_21" type="mesh" mesh="mug_hull_21" class="mug_collision"/>
+  <geom name="mug_col_22" type="mesh" mesh="mug_hull_22" class="mug_collision"/>
+  <geom name="mug_col_23" type="mesh" mesh="mug_hull_23" class="mug_collision"/>
+  <geom name="mug_col_24" type="mesh" mesh="mug_hull_24" class="mug_collision"/>
+  <geom name="mug_col_25" type="mesh" mesh="mug_hull_25" class="mug_collision"/>
+  <geom name="mug_col_26" type="mesh" mesh="mug_hull_26" class="mug_collision"/>
+  <geom name="mug_col_27" type="mesh" mesh="mug_hull_27" class="mug_collision"/>
+  <geom name="mug_col_28" type="mesh" mesh="mug_hull_28" class="mug_collision"/>
+  <geom name="mug_col_29" type="mesh" mesh="mug_hull_29" class="mug_collision"/>
+  <geom name="mug_col_30" type="mesh" mesh="mug_hull_30" class="mug_collision"/>
+  <geom name="mug_col_31" type="mesh" mesh="mug_hull_31" class="mug_collision"/>
+  <geom name="mug_col_32" type="mesh" mesh="mug_hull_32" class="mug_collision"/>
+  <geom name="mug_col_33" type="mesh" mesh="mug_hull_33" class="mug_collision"/>
+  <geom name="mug_col_34" type="mesh" mesh="mug_hull_34" class="mug_collision"/>
+  <geom name="mug_col_35" type="mesh" mesh="mug_hull_35" class="mug_collision"/>
+  <geom name="mug_col_36" type="mesh" mesh="mug_hull_36" class="mug_collision"/>
+  <geom name="mug_col_37" type="mesh" mesh="mug_hull_37" class="mug_collision"/>
+  <geom name="mug_col_38" type="mesh" mesh="mug_hull_38" class="mug_collision"/>
+  <geom name="mug_col_39" type="mesh" mesh="mug_hull_39" class="mug_collision"/>
+  <geom name="mug_col_40" type="mesh" mesh="mug_hull_40" class="mug_collision"/>
+  <geom name="mug_col_41" type="mesh" mesh="mug_hull_41" class="mug_collision"/>
+  <geom name="mug_col_42" type="mesh" mesh="mug_hull_42" class="mug_collision"/>
+  <geom name="mug_col_43" type="mesh" mesh="mug_hull_43" class="mug_collision"/>
+  <geom name="mug_col_44" type="mesh" mesh="mug_hull_44" class="mug_collision"/>
+  <geom name="mug_col_45" type="mesh" mesh="mug_hull_45" class="mug_collision"/>
+  <geom name="mug_col_46" type="mesh" mesh="mug_hull_46" class="mug_collision"/>
+  <geom name="mug_col_47" type="mesh" mesh="mug_hull_47" class="mug_collision"/>
+  <geom name="mug_col_48" type="mesh" mesh="mug_hull_48" class="mug_collision"/>
+  <geom name="mug_col_49" type="mesh" mesh="mug_hull_49" class="mug_collision"/>
+  <geom name="mug_col_50" type="mesh" mesh="mug_hull_50" class="mug_collision"/>
+  <geom name="mug_col_51" type="mesh" mesh="mug_hull_51" class="mug_collision"/>
+  <geom name="mug_col_52" type="mesh" mesh="mug_hull_52" class="mug_collision"/>
+</mujoco>

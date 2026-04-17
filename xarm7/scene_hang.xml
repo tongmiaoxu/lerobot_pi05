@@ -1,5 +1,7 @@
 <mujoco model="xarm7 scene">
-  <include file="xarm7.xml"/>
+  <include file="xarm7_hang.xml"/>
+  <include file="mug.xml"/>
+  <include file="rack.xml"/>
 
   <statistic center="0.2 0 0.4" extent=".65"/>
 
@@ -15,11 +17,7 @@
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
       markrgb="0.8 0.8 0.8" width="300" height="300"/>
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
-    <!-- Matte material: no specular highlights so colors render true (e.g. pink sticker) -->
-    <material name="matte_pink" specular="0" shininess="1" reflectance="0"/>
 
-    <!-- mug.stl is in mm; scale 0.001 converts to meters (was filling view at scale 1) -->
-    <mesh name="mug" file="mug.stl" scale="0.001 0.001 0.001"/>
   </asset>
 
   <worldbody>
@@ -28,95 +26,22 @@
            diffuse="0.5 0.5 0.5" specular="0 0 0"/>
     <geom type="cylinder" size=".06 .06" pos="0 0 .06" rgba="1 1 1 1"/>
 
-    <geom name="table" type="box" size="0.8 1.5 0.05"
-          pos="0.9700 0.0000 -0.095" euler="0 0 0.0" rgba="0 0 0 1"
-          friction="2 0.05 0.01"
-          solref="0.004 1"
-          solimp="0.95 0.99 0.001"/>
-
-    <!-- Mug: visual mesh (no collision) + primitive collision shell (HOLLOW).
-         MuJoCo computes a CONVEX HULL for mesh collision, which fills the mug
-         cavity and causes phantom forces. We model the wall as thin box segments
-         arranged in a ring so the gripper finger can enter the interior.
-         Dimensions below assume ~40mm outer radius, ~90mm tall mug.
-         TUNE these to match your actual mug STL! -->
-    <!-- <body name="mug" pos="0.5634 -0.1034 -0.038860" euler="0 0 1.5708"> -->
-    <body name="mug" pos="0.3834 -0.1284 -0.0389" euler="0 0 4.7124">
-      <freejoint name="mug_joint"/>
-
-      <!-- Visual-only mesh (no collision) -->
-      <geom name="mug_visual" type="mesh" mesh="mug" rgba="0.882 0.878 0.510 1"
-            contype="0" conaffinity="0" mass="0"/>
-
-      <!-- ── Hollow wall: 8 thin box segments at R=0.0375m (37.5mm mug radius) ── -->
-      <!-- Measured from mug.stl: outer R≈37.5mm, height≈100mm, handle extends +X to 70mm.
-           8 segments → chord = 2*R*sin(π/8) ≈ 0.0287m, half-chord ≈ 0.0144m
-           wall half-thickness = 0.0025m, half-height = 0.05m, Z center = 0.0475m -->
-      <geom name="mug_w0" type="box" size="0.0025 0.0144 0.050"
-            pos="0.0375 0.0 0.0475" euler="0 0 0"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-      <geom name="mug_w1" type="box" size="0.0025 0.0144 0.050"
-            pos="0.02652 0.02652 0.0475" euler="0 0 0.7854"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-      <geom name="mug_w2" type="box" size="0.0025 0.0144 0.050"
-            pos="0.0 0.0375 0.0475" euler="0 0 1.5708"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-      <geom name="mug_w3" type="box" size="0.0025 0.0144 0.050"
-            pos="-0.02652 0.02652 0.0475" euler="0 0 2.3562"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-      <geom name="mug_w4" type="box" size="0.0025 0.0144 0.050"
-            pos="-0.0375 0.0 0.0475" euler="0 0 0"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-      <geom name="mug_w5" type="box" size="0.0025 0.0144 0.050"
-            pos="-0.02652 -0.02652 0.0475" euler="0 0 0.7854"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-      <geom name="mug_w6" type="box" size="0.0025 0.0144 0.050"
-            pos="0.0 -0.0375 0.0475" euler="0 0 1.5708"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-      <geom name="mug_w7" type="box" size="0.0025 0.0144 0.050"
-            pos="0.02652 -0.02652 0.0475" euler="0 0 2.3562"
-            rgba="0.882 0.878 0.510 0.2" mass="0.022"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-
-      <!-- ── Bottom disk (solid cylinder, R matches wall ring) ── -->
-      <geom name="mug_bottom" type="cylinder" size="0.0375 0.003"
-            pos="0 0 0.0005" rgba="0.882 0.878 0.510 0.2"
-            mass="0.024"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
-
-      <!-- ── Handle (capsule on +X side, centered at ~50mm height) ── -->
-      <geom name="mug_handle" type="capsule" size="0.006 0.025"
-            pos="0.055 0 0.050" euler="1.5708 0 0" rgba="0.882 0.878 0.510 0.2"
-            mass="0"
-            friction="2 0.05 0.01" condim="4" priority="1"
-            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
+    <body name="table" pos="0.9650 0.0000 -0.0950" euler="0.0000 0.0000 -0.0524">
+      <geom name="table" type="box" size="0.8 1.5 0.05"
+            rgba="0 0 0 1"
+            friction="2 0.05 0.01"
+            solref="0.004 1"
+            solimp="0.95 0.99 0.001"/>
     </body>
 
-    <!-- Cube: 28mm, color rgb(2,102,193), MuJoCo world-frame pose [541.5,-11,-56.9,180,0,0] -->
-    <!-- <body name="cube" pos="0.5286 0.0086 0.0771">
-      <freejoint name="cube_joint"/>
-      <geom name="cube" type="box" size="0.014 0.017 0.014"
-            rgba="0.008 0.4 0.757 1" mass="0.01"/> 
-    </body>-->
-    <body name="sticker" pos="0.3915 0.1410 -0.0450"> 
-      <geom name="sticker" type="box" size="0.036 0.036 0.0005"
-            material="matte_pink" rgba="0.996 0.698 0.706 1" mass="0"/>
+    <!-- <body name="mug" pos="0.4284 -0.1984 -0.0439" euler="0.0000 0.0000 -4.7997"> -->
+    <body name="mug" pos="0.4284 -0.1984 -0.0439" euler="0.0000 0.0000 1.5186">
+      <freejoint name="mug_joint"/>
+      <include file="mug_collision.xml"/>
+    </body>
+
+    <body name="rack" pos="0.3615 0.0910 -0.0500" euler="0.0000 0.0000 -1.6122">
+      <include file="rack_collision.xml"/>
     </body> 
 
     <!-- Stationary camera: pose overridden at runtime from visual_match/configs/stationary_cam.json -->

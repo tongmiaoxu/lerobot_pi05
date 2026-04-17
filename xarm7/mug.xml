@@ -1,0 +1,70 @@
+<!-- Shared mug mesh assets and collision defaults.
+     Include at the <mujoco> level in any scene that uses the mug. -->
+<mujoco>
+  <default>
+    <default class="mug_collision">
+      <geom material="mug_mat" mass="0.003774"
+            friction="3.0 0.5 0.05" condim="6" priority="1"
+            solref="0.002 1" solimp="0.99 0.9999 0.001" group="3"/>
+    </default>
+  </default>
+
+  <asset>
+    <material name="mug_mat" rgba="0.294 0.267 0.098 1" emission="1" specular="0.1" shininess="0.1"/>
+    <material name="mug_visual_mat" rgba="0.882 0.878 0.510 1" emission="1" specular="0" shininess="0"/>
+    <mesh name="mug" file="mug.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="mug_hull_0" file="mug/mug_hull_0.stl"/>
+    <mesh name="mug_hull_1" file="mug/mug_hull_1.stl"/>
+    <mesh name="mug_hull_2" file="mug/mug_hull_2.stl"/>
+    <mesh name="mug_hull_3" file="mug/mug_hull_3.stl"/>
+    <mesh name="mug_hull_4" file="mug/mug_hull_4.stl"/>
+    <mesh name="mug_hull_5" file="mug/mug_hull_5.stl"/>
+    <mesh name="mug_hull_6" file="mug/mug_hull_6.stl"/>
+    <mesh name="mug_hull_7" file="mug/mug_hull_7.stl"/>
+    <mesh name="mug_hull_8" file="mug/mug_hull_8.stl"/>
+    <mesh name="mug_hull_9" file="mug/mug_hull_9.stl"/>
+    <mesh name="mug_hull_10" file="mug/mug_hull_10.stl"/>
+    <mesh name="mug_hull_11" file="mug/mug_hull_11.stl"/>
+    <mesh name="mug_hull_12" file="mug/mug_hull_12.stl"/>
+    <mesh name="mug_hull_13" file="mug/mug_hull_13.stl"/>
+    <mesh name="mug_hull_14" file="mug/mug_hull_14.stl"/>
+    <mesh name="mug_hull_15" file="mug/mug_hull_15.stl"/>
+    <mesh name="mug_hull_16" file="mug/mug_hull_16.stl"/>
+    <mesh name="mug_hull_17" file="mug/mug_hull_17.stl"/>
+    <mesh name="mug_hull_18" file="mug/mug_hull_18.stl"/>
+    <mesh name="mug_hull_19" file="mug/mug_hull_19.stl"/>
+    <mesh name="mug_hull_20" file="mug/mug_hull_20.stl"/>
+    <mesh name="mug_hull_21" file="mug/mug_hull_21.stl"/>
+    <mesh name="mug_hull_22" file="mug/mug_hull_22.stl"/>
+    <mesh name="mug_hull_23" file="mug/mug_hull_23.stl"/>
+    <mesh name="mug_hull_24" file="mug/mug_hull_24.stl"/>
+    <mesh name="mug_hull_25" file="mug/mug_hull_25.stl"/>
+    <mesh name="mug_hull_26" file="mug/mug_hull_26.stl"/>
+    <mesh name="mug_hull_27" file="mug/mug_hull_27.stl"/>
+    <mesh name="mug_hull_28" file="mug/mug_hull_28.stl"/>
+    <mesh name="mug_hull_29" file="mug/mug_hull_29.stl"/>
+    <mesh name="mug_hull_30" file="mug/mug_hull_30.stl"/>
+    <mesh name="mug_hull_31" file="mug/mug_hull_31.stl"/>
+    <mesh name="mug_hull_32" file="mug/mug_hull_32.stl"/>
+    <mesh name="mug_hull_33" file="mug/mug_hull_33.stl"/>
+    <mesh name="mug_hull_34" file="mug/mug_hull_34.stl"/>
+    <mesh name="mug_hull_35" file="mug/mug_hull_35.stl"/>
+    <mesh name="mug_hull_36" file="mug/mug_hull_36.stl"/>
+    <mesh name="mug_hull_37" file="mug/mug_hull_37.stl"/>
+    <mesh name="mug_hull_38" file="mug/mug_hull_38.stl"/>
+    <mesh name="mug_hull_39" file="mug/mug_hull_39.stl"/>
+    <mesh name="mug_hull_40" file="mug/mug_hull_40.stl"/>
+    <mesh name="mug_hull_41" file="mug/mug_hull_41.stl"/>
+    <mesh name="mug_hull_42" file="mug/mug_hull_42.stl"/>
+    <mesh name="mug_hull_43" file="mug/mug_hull_43.stl"/>
+    <mesh name="mug_hull_44" file="mug/mug_hull_44.stl"/>
+    <mesh name="mug_hull_45" file="mug/mug_hull_45.stl"/>
+    <mesh name="mug_hull_46" file="mug/mug_hull_46.stl"/>
+    <mesh name="mug_hull_47" file="mug/mug_hull_47.stl"/>
+    <mesh name="mug_hull_48" file="mug/mug_hull_48.stl"/>
+    <mesh name="mug_hull_49" file="mug/mug_hull_49.stl"/>
+    <mesh name="mug_hull_50" file="mug/mug_hull_50.stl"/>
+    <mesh name="mug_hull_51" file="mug/mug_hull_51.stl"/>
+    <mesh name="mug_hull_52" file="mug/mug_hull_52.stl"/>
+  </asset>
+</mujoco>

@@ -40,7 +40,8 @@ from composite_rendering import (
 # ============================================================================
 _stationary_cfg = load_camera_config("stationary_cam")
 _wrist_cfg = load_camera_config("wrist_cam")
-
+SAVE_CALIB_FRAMES = [0,2,4,6,8,10]
+_DEFAULT_EPISODE = 1
 CAMERA_CONFIG = {
     "stationary": {
         "dataset_cam": "cam_high",
@@ -92,11 +93,14 @@ except ImportError:
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
+from lerobot.tasks import get_task_profile, get_task_profiles, resolve_task_scene_xml
 
 # ============================================================================
 # xArm conversion (imported from shared utils)
 # ============================================================================
 from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
+
+_DEFAULT_RECORD_TASK_ID = "place_mug"  # Keep in sync with lerobot-record defaults.
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -397,11 +401,14 @@ def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None =
 
 def parse_args():
     p = argparse.ArgumentParser(description="Compare recorded xArm video with MuJoCo replay + composite")
-    p.add_argument("--dataset-path", type=str, default="data",
-                   help="Path to dataset directory (local) or repo_id (Hub)")
+    p.add_argument("--task-id", type=str, choices=sorted(get_task_profiles()),
+                   default=_DEFAULT_RECORD_TASK_ID,
+                   help="Task ID used to pick task-specific defaults such as dataset path and MuJoCo scene XML.")
+    p.add_argument("--dataset-path", type=str, default=None,
+                   help="Path to dataset directory (local) or repo_id (Hub). Defaults to the selected task dataset root.")
     p.add_argument("--dataset-root", type=str, default=None)
-    p.add_argument("--episode", type=int, default=1)
-    p.add_argument("--fps", type=float, default=30.0)
+    p.add_argument("--episode", type=int, default=_DEFAULT_EPISODE)
+    p.add_argument("--fps", type=float, default=60.0)
     p.add_argument("--scene-path", type=str, default="pointclouds/xarm7_black.npz",
                    help="Path to Gaussian Splatting scene file")
     p.add_argument("--alpha", type=float, default=0.5,
@@ -431,6 +438,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    task_profile = get_task_profile(args.task_id)
+    stationary_calib_dir = task_profile.calibration_pairs_dir("stationary")
+    wrist_calib_dir = task_profile.calibration_pairs_dir("wrist")
+    stationary_color_calib = task_profile.color_calibration_path("stationary")
+    if args.dataset_path is None:
+        args.dataset_path = task_profile.dataset_root_480640
 
     # Load dataset
     episode_data = load_episode(args.dataset_path, args.episode, dataset_root=args.dataset_root)
@@ -480,10 +493,12 @@ def main():
     # Load MuJoCo model
     project_root = Path(__file__).parent.parent
     xarm_dir = project_root / "xarm7"
+    scene_xml_path = resolve_task_scene_xml(args.task_id, xarm_dir)
+    print(f"[INFO] Using MuJoCo scene for task {args.task_id!r}: {scene_xml_path.name}")
     original_cwd = os.getcwd()
     try:
         os.chdir(str(xarm_dir))
-        model = MjModel.from_xml_path("scene.xml")
+        model = MjModel.from_xml_path(scene_xml_path.name)
     finally:
         os.chdir(original_cwd)
 
@@ -685,10 +700,9 @@ def main():
     # Load color calibration
     color_calib = None
     if args.color_calibrate:
-        default_calib = Path(__file__).parent.parent / "calibration_pairs_stationary" / "calibrated" / "color_mapping.yaml"
-        if default_calib.exists():
-            color_calib = load_color_mapping(str(default_calib))
-            print(f"[INFO] Loaded default color calibration from: {default_calib}")
+        if stationary_color_calib.exists():
+            color_calib = load_color_mapping(str(stationary_color_calib))
+            print(f"[INFO] Loaded default color calibration from: {stationary_color_calib}")
 
     # Pre-compute ctrl sequence
     print("[INFO] Converting xArm states to MuJoCo ctrl...")
@@ -988,13 +1002,12 @@ def main():
                 }
 
             # Save calibration pairs for wrist color calibration
-            SAVE_CALIB_FRAMES = [0, 100, 200, 300, 400,500]
+            
             if args.save_calibration_pairs and frame_idx in SAVE_CALIB_FRAMES:
                 # Save stationary camera images
                 if "stationary" in cam_renders:
-                    base_dir_stationary = Path(__file__).parent.parent / "calibration_pairs_stationary"
-                    gs_dir_stationary = base_dir_stationary / "gs_renders"
-                    real_dir_stationary = base_dir_stationary / "real_captures"
+                    gs_dir_stationary = stationary_calib_dir / "gs_renders"
+                    real_dir_stationary = stationary_calib_dir / "real_captures"
                     gs_dir_stationary.mkdir(parents=True, exist_ok=True)
                     real_dir_stationary.mkdir(parents=True, exist_ok=True)
                     gs_path_stationary = gs_dir_stationary / f"frame_{frame_idx:04d}.png"
@@ -1004,9 +1017,8 @@ def main():
                     print(f"[INFO] Saved stationary calibration pair frame {frame_idx}: {gs_path_stationary}, {real_path_stationary}")
                 # Save wrist camera images
                 if "wrist" in cam_renders:
-                    base_dir_wrist = Path(__file__).parent.parent / "calibration_pairs_wrist"
-                    gs_dir_wrist = base_dir_wrist / "gs_renders"
-                    real_dir_wrist = base_dir_wrist / "real_captures"
+                    gs_dir_wrist = wrist_calib_dir / "gs_renders"
+                    real_dir_wrist = wrist_calib_dir / "real_captures"
                     gs_dir_wrist.mkdir(parents=True, exist_ok=True)
                     real_dir_wrist.mkdir(parents=True, exist_ok=True)
                     gs_path_wrist = gs_dir_wrist / f"frame_{frame_idx:04d}.png"
