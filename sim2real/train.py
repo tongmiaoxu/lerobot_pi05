@@ -70,10 +70,29 @@ def parse_args() -> argparse.Namespace:
         help="Tracker backend forwarded to the upstream trainer.",
     )
     parser.add_argument(
+        "--task-id",
+        type=str,
+        default=None,
+        help=(
+            "Optional lerobot task id (e.g. pick_mug, place_mug). When set and "
+            "--tracker-project-name is omitted, the W&B project defaults to that task's "
+            "`wandb_project` in src/lerobot/tasks/task_profiles.py."
+        ),
+    )
+    parser.add_argument(
         "--tracker-project-name",
         type=str,
-        default="pix2pix_turbo_sim2real",
-        help="Experiment name forwarded to the upstream trainer.",
+        default=None,
+        help=(
+            "W&B / Accelerate tracker project name. If omitted: use --task-id's wandb_project, "
+            "else default pix2pix_turbo_sim2real."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Weights & Biases run display name (default: random adjective-noun). Example: pick_mug_pix2pix_20260418.",
     )
     parser.add_argument(
         "--prepare-only",
@@ -101,6 +120,19 @@ def parse_args() -> argparse.Namespace:
         help="Replace an existing prepared dataset directory.",
     )
     args = parser.parse_args()
+
+    _src = _ROOT / "src"
+    if str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+
+    if args.tracker_project_name is None:
+        if args.task_id:
+            from lerobot.tasks.task_profiles import get_task_profile
+
+            args.tracker_project_name = get_task_profile(args.task_id).wandb_project
+        else:
+            args.tracker_project_name = "pix2pix_turbo_sim2real"
+
     if not 0.0 <= args.val_ratio < 1.0:
         raise ValueError("--val-ratio must be in [0, 1).")
     return args
@@ -289,6 +321,9 @@ def launch_training(args: argparse.Namespace) -> None:
         "--test_image_prep",
         image_prep,
     ]
+
+    if args.wandb_run_name:
+        train_argv.extend(["--wandb_run_name", args.wandb_run_name])
 
     if args.enable_xformers:
         train_argv.append("--enable_xformers_memory_efficient_attention")

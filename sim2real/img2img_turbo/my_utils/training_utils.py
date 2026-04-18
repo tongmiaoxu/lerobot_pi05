@@ -42,6 +42,12 @@ def parse_args_paired_training(input_args=None):
 
     parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
     parser.add_argument("--tracker_project_name", type=str, default="train_pix2pix_turbo", help="The name of the wandb project to log to.")
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default="turbo",
+        help="Weights & Biases run display name (default: random). Passed to Accelerate init_trackers init_kwargs.",
+    )
 
     # details about the model architecture
     parser.add_argument("--pretrained_model_name_or_path")

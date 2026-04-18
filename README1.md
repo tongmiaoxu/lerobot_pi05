@@ -309,5 +309,10 @@ python sim2real/train.py \
   --sim-dir data_place_mug_copy/calibration_pairs_stationary/gs_renders \
   --real-dir data_place_mug_copy/calibration_pairs_stationary/real_captures \
   --dataset-dir data_transfer_pairs \
-  --output-dir outputs/turbo_sim2real --overwrite
+  --output-dir outputs/turbo_sim2real --overwrite \
+  --train-batch-size 1 \
+  --gradient-checkpointing \
+  --enable-xformers \
+  --mixed-precision no\
+  --resolution 512 
 ```
