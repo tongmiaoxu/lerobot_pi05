@@ -31,6 +31,7 @@ import json
 import threading
 
 # Add src to path for lerobot imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
@@ -162,6 +163,20 @@ def apply_gemini_parallel(translator, observation: dict) -> dict:
         t.join()
     for cam_key, e in errs:
         print(f"  [WARN] Gemini failed for {cam_key}: {e}")
+    return out
+
+
+def apply_sim2real_translation(translator, observation: dict) -> dict:
+    """Translate sim camera observations to real-looking images for policy input."""
+    out = dict(observation)
+    for cam_cfg in CAMERA_CONFIG.values():
+        obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
+        if obs_key not in out:
+            continue
+        img = out[obs_key]
+        if not isinstance(img, np.ndarray):
+            continue
+        out[obs_key] = translator.translate(np.ascontiguousarray(img))
     return out
 
 
@@ -881,6 +896,35 @@ def main():
              "Only queries the API when a new policy prediction is needed (every n_action_steps frames). "
              "Uses 1 example pair for stationary, 3 for wrist.",
     )
+    parser.add_argument(
+        "--use-sim2real",
+        action="store_true",
+        help="Translate composite sim images to real-looking images with pix2pix-turbo before policy inference.",
+    )
+    parser.add_argument(
+        "--sim2real-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a fine-tuned pix2pix-turbo .pkl checkpoint.",
+    )
+    parser.add_argument(
+        "--sim2real-prompt",
+        type=str,
+        default=None,
+        help="Prompt used by pix2pix-turbo. Defaults to a generic real-world camera prompt.",
+    )
+    parser.add_argument(
+        "--sim2real-resolution",
+        type=int,
+        default=None,
+        help="Square model resolution for sim2real translation (must be a multiple of 8).",
+    )
+    parser.add_argument(
+        "--sim2real-device",
+        type=str,
+        default=None,
+        help="Torch device for sim2real inference. Defaults to CUDA when available.",
+    )
 
     args = parser.parse_args()
     num_eval_episodes = args.num_eval_episodes
@@ -897,6 +941,28 @@ def main():
     policy, config_dict = load_policy(args.policy_path)
     device = get_safe_torch_device(policy.config.device)
     policy = policy.to(device)
+    sim2real_cfg = config_dict.get("sim2real", {}) if isinstance(config_dict, dict) else {}
+    sim2real_enabled = bool(args.use_sim2real or sim2real_cfg.get("enabled", False))
+    sim2real_checkpoint = args.sim2real_checkpoint or sim2real_cfg.get("checkpoint")
+    sim2real_prompt = args.sim2real_prompt or sim2real_cfg.get(
+        "prompt",
+        "a real-world robot camera image",
+    )
+    sim2real_resolution = int(args.sim2real_resolution or sim2real_cfg.get("resolution", 512))
+    sim2real_device = args.sim2real_device or sim2real_cfg.get("device")
+    if sim2real_checkpoint is not None:
+        sim2real_checkpoint = Path(sim2real_checkpoint).expanduser()
+        if not sim2real_checkpoint.is_absolute():
+            sim2real_checkpoint = (Path(__file__).parent.parent / sim2real_checkpoint).resolve()
+        sim2real_checkpoint = str(sim2real_checkpoint)
+
+    if args.gemini and sim2real_enabled:
+        raise ValueError("Use either --gemini or --use-sim2real, not both.")
+    if sim2real_enabled and not sim2real_checkpoint:
+        raise ValueError(
+            "sim2real is enabled, but no checkpoint was provided. "
+            "Pass --sim2real-checkpoint or set sim2real.checkpoint in the policy config."
+        )
 
     if args.no_save_sim_eval:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
@@ -1070,7 +1136,7 @@ def main():
                 args.scene_path, w2c_init, camera_intrinsics["stationary"]
             )
             color_calib_by_camera = {}
-            if args.color_calibrate and not args.gemini:
+            if args.color_calibrate and not args.gemini and not sim2real_enabled:
                 for cam_key in CAMERA_CONFIG:
                     default_calib = task_profile.color_calibration_path(cam_key)
                     try:
@@ -1110,6 +1176,22 @@ def main():
                   f"(~{est_calls} query rounds/episode).")
         else:
             print("[INFO] Gemini ready: 2 parallel API calls each prediction step.")
+
+    sim2real_translator = None
+    if sim2real_enabled:
+        from sim2real import SimToRealTranslator
+
+        print(
+            "[INFO] Initializing sim2real translator "
+            f"(checkpoint={sim2real_checkpoint}, resolution={sim2real_resolution})..."
+        )
+        sim2real_translator = SimToRealTranslator(
+            checkpoint_path=sim2real_checkpoint,
+            prompt=sim2real_prompt,
+            resolution=sim2real_resolution,
+            device=sim2real_device,
+        )
+        print(f"[INFO] Sim2real ready on device: {sim2real_translator.device}")
 
     # Load real-world dataset frames for display (and for policy when --obs / --obs-eval).
     # With --no_obs, skip loading unless policy needs real images.
@@ -1561,6 +1643,8 @@ def main():
                     n_act = getattr(policy.config, 'n_action_steps', '?')
                     print(f"  [Gemini] Step {step}: parallel API calls on live composite "
                           f"(next query in ~{n_act} steps)")
+                elif sim2real_translator is not None:
+                    observation = apply_sim2real_translation(sim2real_translator, composite_obs)
                 else:
                     observation = composite_obs
 

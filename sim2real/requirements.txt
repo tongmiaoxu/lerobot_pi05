@@ -1,0 +1,35 @@
+diffusers
+accelerate
+transformers
+peft
+pillow
+torchvision
+tqdm
+requests
+# xformers: unpinned `xformers` on PyPI is now 0.0.34+ and declares torch>=2.10. If you use torch 2.7.x
+# (e.g. 2.7.1+cu118 for an older NVIDIA driver), pip will report a conflict. Pin a line built for your torch:
+#   torch 2.7.1 + cu118  ->  pip install "xformers==0.0.31"
+#   torch 2.10+          ->  pip install "xformers>=0.0.34"
+xformers>=0.0.27,<0.0.32
+
+# pix2pix-turbo training (vendored train_pix2pix_turbo.py) additionally needs:
+lpips
+clean-fid
+vision_aided_loss
+# wandb: keep within lerobot's range if this env also has lerobot installed
+wandb>=0.20.0,<0.22.0
+# lerobot 0.4.x expects headless OpenCV in many setups
+opencv-python-headless>=4.9.0,<4.13.0
+
+# OpenAI CLIP (`import clip`): install from https://github.com/openai/CLIP (see upstream img2img-turbo requirements.txt)
+#   pip install "git+https://github.com/openai/CLIP.git"
+#
+# If you see ImportError / undefined symbol from flash_attn_2_cuda when importing diffusers/xformers:
+#   pip uninstall -y flash-attn flash_attn
+# then reinstall xformers (or omit xformers) so it matches your torch + CUDA driver.
+#
+# Older driver + cu118 PyTorch (example order):
+#   pip uninstall -y torch torchvision torchaudio
+#   pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+#   pip install "xformers==0.0.31"
+#   pip install -r sim2real/requirements.txt

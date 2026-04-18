@@ -303,3 +303,11 @@ Then deployment selection defaults come from the task_profiles.py:
 pick_mug -> mug
 place_mug -> mug + saucer
 hang_mug -> mug + rack
+
+```bash
+python sim2real/train.py \
+  --sim-dir data_place_mug_copy/calibration_pairs_stationary/gs_renders \
+  --real-dir data_place_mug_copy/calibration_pairs_stationary/real_captures \
+  --dataset-dir data_transfer_pairs \
+  --output-dir outputs/turbo_sim2real --overwrite
+```
