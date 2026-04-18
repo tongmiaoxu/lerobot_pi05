@@ -214,7 +214,8 @@ def main(args):
         )
 
     global_step = 0
-    for epoch in range(0, args.num_training_epochs):
+    # Run until max_train_steps (cycle the dataloader); do not stop at num_training_epochs * len(dl_train) only.
+    while global_step < args.max_train_steps:
         for step, batch in enumerate(dl_train):
             l_acc = [net_pix2pix, net_disc]
             with accelerator.accumulate(*l_acc):
@@ -352,6 +353,9 @@ def main(args):
                         gc.collect()
                         torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)
+
+            if global_step >= args.max_train_steps:
+                break
 
 
 if __name__ == "__main__":
