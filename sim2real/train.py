@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpointing-steps",
         type=int,
-        default=500,
+        default=1000,
         help="Checkpoint save frequency for upstream training.",
     )
     parser.add_argument(
