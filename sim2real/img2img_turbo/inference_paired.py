@@ -27,7 +27,11 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.4, help="The sketch interpolation guidance amount")
     parser.add_argument("--seed", type=int, default=42, help="Random seed to be used")
     parser.add_argument("--use_fp16", action="store_true", help="Use Float16 precision for faster inference")
+    parser.add_argument("--resolution", type=int, default=512, help="Resolution used during training (must be a multiple of 8). Input is resized to this before inference and output is resized back to the original dimensions.")
     args = parser.parse_args()
+
+    if args.resolution <= 0 or args.resolution % 8 != 0:
+        raise ValueError(f"--resolution must be a positive multiple of 8, got {args.resolution}")
 
     if bool(args.model_name) == bool(args.model_path):
         raise ValueError("Provide exactly one of --model_name or --model_path")
@@ -45,10 +49,9 @@ if __name__ == "__main__":
     dev = model.device
 
     input_image = Image.open(args.input_image).convert("RGB")
-    new_width = input_image.width - input_image.width % 8
-    new_height = input_image.height - input_image.height % 8
-    input_image = input_image.resize((new_width, new_height), Image.LANCZOS)
-    bname = os.path.basename(args.input_image)
+    original_width, original_height = input_image.size
+    input_image = input_image.resize((args.resolution, args.resolution), Image.LANCZOS)
+    bname = os.path.basename(args.input_image).replace(".png", "_translated.png")
 
     with torch.no_grad():
         if args.model_name == "edge_to_image":
@@ -78,5 +81,6 @@ if __name__ == "__main__":
             output_image = model(c_t, args.prompt)
 
         output_pil = transforms.ToPILImage()(output_image[0].cpu() * 0.5 + 0.5)
+        output_pil = output_pil.resize((original_width, original_height), Image.LANCZOS)
 
     output_pil.save(os.path.join(args.output_dir, bname))

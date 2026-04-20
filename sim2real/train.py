@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpointing-steps",
         type=int,
-        default=500,
+        default=1000,
         help="Checkpoint save frequency for upstream training.",
     )
     parser.add_argument(
@@ -235,11 +235,10 @@ def write_split(
 
 
 def build_image_prep(resolution: int) -> str:
-    if resolution == 512:
-        return "resize_512x512"
-    if resolution == 256:
-        return "resize_256x256"
-    raise ValueError("Only 256 and 512 resolution are supported by this helper.")
+    """Tag passed to training_utils.build_transform; supports any N via resize_NxN."""
+    if resolution <= 0:
+        raise ValueError(f"resolution must be positive, got {resolution}")
+    return f"resize_{resolution}x{resolution}"
 
 
 def prepare_dataset(args: argparse.Namespace) -> tuple[int, int]:

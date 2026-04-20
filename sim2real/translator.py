@@ -26,7 +26,7 @@ class SimToRealTranslator:
         self.use_fp16 = self.device.type == "cuda" if use_fp16 is None else use_fp16
         self.resolution = int(resolution)
         if self.resolution <= 0 or self.resolution % 8 != 0:
-            raise ValueError("resolution must be a positive multiple of 8")
+            raise ValueError(f"resolution must be a positive multiple of 8, got {self.resolution}")
 
         self._net = Pix2Pix_Turbo(pretrained_path=str(Path(checkpoint_path).expanduser()), device=self.device)
         self._net.set_eval()

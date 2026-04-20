@@ -310,9 +310,20 @@ python sim2real/train.py \
   --real-dir data_place_mug_copy/calibration_pairs_stationary/real_captures \
   --dataset-dir data_transfer_pairs \
   --output-dir outputs/turbo_sim2real --overwrite \
+  --max-train-steps 2002 \
+  --learning-rate 1e-4 \
   --train-batch-size 1 \
+  --val-ratio 0.0 \
   --gradient-checkpointing \
   --enable-xformers \
-  --mixed-precision no\
-  --resolution 512 
+  --mixed-precision no \
+  --resolution 224
+```
+```bash
+python -m sim2real.img2img_turbo.inference_paired \
+  --model_path outputs/turbo_sim2real/checkpoints/model_2001.pkl \
+  --input_image data_place_mug_copy/calibration_pairs_stationary/gs_renders/frame_0000.png \
+  --prompt "a real-world robot camera image" \
+  --output_dir data_place_mug_copy/calibration_pairs_stationary/ \
+  --use_fp16
 ```

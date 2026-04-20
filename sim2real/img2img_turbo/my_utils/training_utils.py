@@ -227,6 +227,17 @@ def build_transform(image_prep):
         ])
     elif image_prep == "no_resize":
         T = transforms.Lambda(lambda x: x)
+    else:
+        # generic "resize_NxN" pattern e.g. "resize_224x224" (PIL out; PairedDataset adds to_tensor/normalize)
+        import re
+
+        m = re.match(r"resize_(\d+)x(\d+)$", image_prep)
+        if m:
+            h, w = int(m.group(1)), int(m.group(2))
+            return transforms.Compose(
+                [transforms.Resize((h, w), interpolation=Image.LANCZOS)]
+            )
+        raise ValueError(f"Unknown image_prep: {image_prep}")
     return T
 
 
