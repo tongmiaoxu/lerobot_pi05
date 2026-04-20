@@ -175,6 +175,13 @@ def main(args):
     net_lpips.to(dtype=weight_dtype)
     net_clip.to(dtype=weight_dtype)
 
+    # Cast trainable parameters back to FP32 so GradScaler can unscale gradients
+    for p in layers_to_opt:
+        p.data = p.data.float()
+    for p in net_disc.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         init_kwargs: dict = {}
@@ -235,7 +242,8 @@ def main(args):
                     loss += loss_clipsim * args.lambda_clipsim
                 accelerator.backward(loss, retain_graph=False)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(layers_to_opt, args.max_grad_norm)
+                    params_to_clip = [p for p in layers_to_opt if p.grad is not None]
+                    torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
@@ -244,7 +252,8 @@ def main(args):
                 lossG = net_disc(x_tgt_pred, for_G=True).mean() * args.lambda_gan
                 accelerator.backward(lossG)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(layers_to_opt, args.max_grad_norm)
+                    params_to_clip = [p for p in layers_to_opt if p.grad is not None]
+                    torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
