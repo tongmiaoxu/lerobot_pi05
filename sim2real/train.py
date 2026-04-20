@@ -49,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-train-steps", type=int, default=10000, help="Maximum training steps.")
     parser.add_argument("--learning-rate", type=float, default=5e-6, help="AdamW learning rate.")
+    parser.add_argument("--lambda-gan", type=float, default=0.0, help="Weight for the GAN loss.")
+    parser.add_argument("--lambda-clipsim", type=float, default=0.0, help="Weight for the CLIP similarity loss.")
+    parser.add_argument("--lambda-l2", type=float, default=10.0, help="Weight for the pixelwise L2 loss.")
+    parser.add_argument("--lambda-lpips", type=float, default=2.0, help="Weight for the LPIPS perceptual loss.")
     parser.add_argument("--viz-freq", type=int, default=100, help="Upstream visualization frequency.")
     parser.add_argument("--eval-freq", type=int, default=100, help="Upstream validation frequency.")
     parser.add_argument(
@@ -303,6 +307,14 @@ def launch_training(args: argparse.Namespace) -> None:
         str(args.max_train_steps),
         "--learning_rate",
         str(args.learning_rate),
+        "--lambda_gan",
+        str(args.lambda_gan),
+        "--lambda_clipsim",
+        str(args.lambda_clipsim),
+        "--lambda_l2",
+        str(args.lambda_l2),
+        "--lambda_lpips",
+        str(args.lambda_lpips),
         "--viz_freq",
         str(args.viz_freq),
         "--eval_freq",
