@@ -42,6 +42,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=512, help="Training resolution passed upstream.")
     parser.add_argument("--train-batch-size", type=int, default=2, help="Training batch size.")
     parser.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=4,
+        help="Number of background dataloader workers used by the upstream trainer.",
+    )
+    parser.add_argument(
+        "--pair-selection",
+        choices=("all", "odd", "even"),
+        default="all",
+        help="Subset matched pairs by their sorted index before the train/val split.",
+    )
+    parser.add_argument(
+        "--max-pairs",
+        type=int,
+        default=None,
+        help="Keep only the first N matched pairs after optional odd/even filtering.",
+    )
+    parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
         default=1,
@@ -139,6 +157,8 @@ def parse_args() -> argparse.Namespace:
 
     if not 0.0 <= args.val_ratio < 1.0:
         raise ValueError("--val-ratio must be in [0, 1).")
+    if args.max_pairs is not None and args.max_pairs <= 0:
+        raise ValueError("--max-pairs must be positive when provided.")
     return args
 
 
@@ -210,6 +230,24 @@ def split_pairs(
     return train_pairs, val_pairs
 
 
+def select_pairs(
+    pairs: list[tuple[Path, Path]],
+    selection: str,
+    max_pairs: int | None,
+) -> list[tuple[Path, Path]]:
+    if selection == "odd":
+        pairs = [pair for idx, pair in enumerate(pairs) if idx % 2 == 1]
+    elif selection == "even":
+        pairs = [pair for idx, pair in enumerate(pairs) if idx % 2 == 0]
+
+    if max_pairs is not None:
+        pairs = pairs[:max_pairs]
+
+    if not pairs:
+        raise ValueError("Pair selection produced an empty dataset.")
+    return pairs
+
+
 def save_rgb_png(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(source) as image:
@@ -247,6 +285,7 @@ def build_image_prep(resolution: int) -> str:
 
 def prepare_dataset(args: argparse.Namespace) -> tuple[int, int]:
     pairs = match_pairs(args.sim_dir, args.real_dir)
+    pairs = select_pairs(pairs, args.pair_selection, args.max_pairs)
     train_pairs, val_pairs = split_pairs(pairs, args.val_ratio, args.seed)
 
     if args.dataset_dir.exists():
@@ -301,6 +340,8 @@ def launch_training(args: argparse.Namespace) -> None:
         str(args.resolution),
         "--train_batch_size",
         str(args.train_batch_size),
+        "--dataloader_num_workers",
+        str(args.dataloader_num_workers),
         "--gradient_accumulation_steps",
         str(args.gradient_accumulation_steps),
         "--max_train_steps",
