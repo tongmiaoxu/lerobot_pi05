@@ -289,6 +289,7 @@ python visual_match/compare_recorded_vs_mujoco.py
 ```
 
 Color Alignment:
+( --save-replay-frames: save every single frame under root/gs_render/stationary/frame_XXXX.png and {root}/gs_render/wrist/frame_XXXX.png )
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
 python visual_match/calibrate_color.py
@@ -320,10 +321,40 @@ python sim2real/train.py \
   --resolution 224
 ```
 ```bash
+
+python sim2real/train.py \
+  --sim-dir data_place_mug_copy/gs_render/wrist \
+  --real-dir data_place_mug_copy/real_captures/wrist \
+  --dataset-dir data_transfer_pairs_wrist \
+  --output-dir outputs/turbo_sim2real_wrist \
+  --overwrite \
+  --max-train-steps 10000 \
+  --learning-rate 5e-5 \
+  --val-ratio 0.1 \
+  --viz-freq 200 \
+  --eval-freq 200 \
+  --checkpointing-steps 1000 \
+  --lambda-gan 0.5 \
+  --lambda-clipsim 2.0 \
+  --lambda-l2 1.0 \
+  --lambda-lpips 5.0 \
+  --train-batch-size 1 \
+  --gradient-accumulation-steps 4 \
+  --gradient-checkpointing \
+  --mixed-precision bf16
+```
+```bash
 python -m sim2real.img2img_turbo.inference_paired \
   --model_path outputs/turbo_sim2real/checkpoints/model_2001.pkl \
   --input_image data_place_mug_copy/calibration_pairs_stationary/gs_renders/frame_0000.png \
   --prompt "a real-world robot camera image" \
   --output_dir data_place_mug_copy/calibration_pairs_stationary/ \
+  --use_fp16
+```
+```bash
+python -m sim2real.img2img_turbo.inference_paired \
+  --model_path outputs/turbo_sim2real/checkpoints/model_2001.pkl \
+  --input_image data_place_mug_copy/calibration_pairs_stationary/gs_renders \
+  --prompt "a real-world robot camera image" \
   --use_fp16
 ```
