@@ -4,10 +4,11 @@
 
 import numpy as np
 from PIL import Image
-import cv2
 
 
 def canny_from_pil(image, low_threshold=100, high_threshold=200):
+    import cv2
+
     image = np.array(image)
     image = cv2.Canny(image, low_threshold, high_threshold)
     image = image[:, :, None]
