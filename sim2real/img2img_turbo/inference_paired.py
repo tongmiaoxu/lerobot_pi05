@@ -67,7 +67,12 @@ if __name__ == "__main__":
         required=True,
         help="Path to one input image, or to a directory of images (e.g. gs_renders/).",
     )
-    parser.add_argument("--prompt", type=str, required=True, help="the prompt to be used")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="a real-world robot camera image",
+        help="Text prompt (project default matches README1.md turbo / deploy examples).",
+    )
     parser.add_argument("--model_name", type=str, default="", help="name of the pretrained model to be used")
     parser.add_argument("--model_path", type=str, default="", help="path to a model state dict to be used")
     parser.add_argument(
@@ -84,8 +89,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
-        help="Resolution used during training (must be a multiple of 8). Input is resized to this before inference and output is resized back to the original dimensions.",
+        default=224,
+        help="Square side before VAE encode (multiple of 8). Default 224 matches README1.md / deploy --turbo-resolution.",
     )
     parser.add_argument(
         "--blend_alpha",

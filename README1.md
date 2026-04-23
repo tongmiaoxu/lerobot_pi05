@@ -328,8 +328,8 @@ python sim2real/train.py \
   --dataset-dir data_transfer_pairs_wrist \
   --output-dir outputs/turbo_sim2real_wrist \
   --overwrite \
-  --max-train-steps 10000 \
-  --learning-rate 5e-5 \
+  --max-train-steps 10002 \
+  --learning-rate 1e-4 \
   --val-ratio 0.1 \
   --viz-freq 200 \
   --eval-freq 200 \
@@ -341,7 +341,8 @@ python sim2real/train.py \
   --train-batch-size 1 \
   --gradient-accumulation-steps 4 \
   --gradient-checkpointing \
-  --mixed-precision bf16
+  --mixed-precision bf16 \
+  --resultion 224
 ```
 ```bash
 python -m sim2real.img2img_turbo.inference_paired \
@@ -349,12 +350,20 @@ python -m sim2real.img2img_turbo.inference_paired \
   --input_image data_place_mug_copy/calibration_pairs_stationary/gs_renders/frame_0000.png \
   --prompt "a real-world robot camera image" \
   --output_dir data_place_mug_copy/calibration_pairs_stationary/ \
+  --resolution 224 \
   --use_fp16
 ```
 ```bash
 python -m sim2real.img2img_turbo.inference_paired \
-  --model_path outputs/turbo_sim2real/checkpoints/model_2001.pkl \
-  --input_image data_place_mug_copy/calibration_pairs_stationary/gs_renders \
+  --model_path outputs/turbo_place_wrist/checkpoints/model_10001.pkl \
+  --input_image data_place_mug_copy/gs_render/wrist \
   --prompt "a real-world robot camera image" \
+  --resolution 224 \
   --use_fp16
+```
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+  --turbo \
+  --turbo-checkpoint-stationary outputs/turbo_place_high/checkpoints/model_10001.pkl \
+  --turbo-checkpoint-wrist outputs/turbo_place_wrist/checkpoints/model_10001.pkl \
 ```

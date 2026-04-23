@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/pi05_place_mug/checkpoints/100000/pretrained_model"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_place_mug/checkpoints/last/pretrained_model"
 _DEFAULT_RECORD_TASK_ID = "place_mug"
 _NUM_EPISODES = 10
 
@@ -162,21 +162,34 @@ def apply_gemini_parallel(translator, observation: dict) -> dict:
     for t in threads:
         t.join()
     for cam_key, e in errs:
-        print(f"  [WARN] Gemini failed for {cam_key}: {e}")
+        # print(f"  [WARN] Gemini failed for {cam_key}: {e}")
+        pass
     return out
 
 
-def apply_sim2real_translation(translator, observation: dict) -> dict:
-    """Translate sim camera observations to real-looking images for policy input."""
+def _resolve_path_under_project(path: str | Path | None, project_root: Path) -> str | None:
+    if path is None or path == "":
+        return None
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = (project_root / p).resolve()
+    return str(p)
+
+
+def apply_turbo_per_camera(translators: dict[str, object], observation: dict) -> dict:
+    """Run pix2pix-turbo per logical camera (stationary / wrist may use different checkpoints)."""
     out = dict(observation)
-    for cam_cfg in CAMERA_CONFIG.values():
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        tr = translators.get(cam_key)
+        if tr is None:
+            continue
         obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
         if obs_key not in out:
             continue
         img = out[obs_key]
         if not isinstance(img, np.ndarray):
             continue
-        out[obs_key] = translator.translate(np.ascontiguousarray(img))
+        out[obs_key] = tr.translate(np.ascontiguousarray(img))
     return out
 
 
@@ -250,7 +263,7 @@ def load_dataset_frames(episode_data: dict):
             video_path_rel = dataset.meta.get_video_file_path(episode_idx, camera_key)
             video_path = dataset.root / video_path_rel
             if not video_path.exists():
-                print(f"[WARN] Video not found for {cam_key}: {video_path}")
+                # print(f"[WARN] Video not found for {cam_key}: {video_path}")
                 cam_frames[cam_key] = []
                 continue
             from_timestamp = ep_meta.get(f"videos/{camera_key}/from_timestamp", 0.0)
@@ -264,9 +277,9 @@ def load_dataset_frames(episode_data: dict):
                 frame = (frame * 255).astype(np.uint8)  # RGB uint8
                 frames_list.append(frame)
             cam_frames[cam_key] = frames_list
-            print(f"[INFO] Loaded {len(frames_list)} real frames for {cam_key}")
+            # print(f"[INFO] Loaded {len(frames_list)} real frames for {cam_key}")
         except Exception as e:
-            print(f"[WARN] Failed to load {cam_key} video: {e}")
+            # print(f"[WARN] Failed to load {cam_key} video: {e}")
             cam_frames[cam_key] = []
     return cam_frames
 
@@ -290,7 +303,7 @@ def display_camera_images(observation: dict, policy_config=None, window_name_pre
 
 def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
     """Load ACT policy from checkpoint path."""
-    print(f"[INFO] Loading policy from: {policy_path}")
+    # print(f"[INFO] Loading policy from: {policy_path}")
 
     policy_path_obj = Path(policy_path)
     if not policy_path_obj.is_absolute():
@@ -313,10 +326,11 @@ def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
     policy_class = get_policy_class(policy_type)
     policy = policy_class.from_pretrained(policy_path)
     if policy_type != "act":
-        print(f"[WARN] Policy type is {policy_type}, expected 'act'")
+        # print(f"[WARN] Policy type is {policy_type}, expected 'act'")
+        pass
 
     policy.eval()
-    print(f"[INFO] Policy loaded: {policy_type}")
+    # print(f"[INFO] Policy loaded: {policy_type}")
     return policy, config_dict
 
 
@@ -415,7 +429,8 @@ def render_composite_view(model: MjModel, data: MjData,
                 composite = apply_color_transform(composite, color_calib)
             return composite
         except Exception as e:
-            print(f"[WARN] Gaussian rendering failed for {cam_name}: {e}")
+            # print(f"[WARN] Gaussian rendering failed for {cam_name}: {e}")
+            pass
     return fg_rgb
 
 
@@ -491,8 +506,8 @@ def load_initial_state_contours(
             combined_contours.extend(list(contours))
         list_of_contours.append(combined_contours if valid_all else [])
 
-    print(f"[INFO] Loaded contours for {len(list_of_contours)} episodes "
-          f"(eps {min(ep_ids)}–{max(ep_ids)}) from {', '.join(str(d[1]) for d in object_dirs)}")
+    # print(f"[INFO] Loaded contours for {len(list_of_contours)} episodes "
+          # f"(eps {min(ep_ids)}–{max(ep_ids)}) from {', '.join(str(d[1]) for d in object_dirs)}")
     return list_of_contours
 
 
@@ -604,7 +619,7 @@ def select_contours_ui(
     cv2.setMouseCallback(window_name, _on_mouse)
     _redraw()
 
-    print(f"[INFO] Select {num_eval_episodes} episodes from the grid, then press ENTER.")
+    # print(f"[INFO] Select {num_eval_episodes} episodes from the grid, then press ENTER.")
 
     while True:
         key = cv2.waitKey(50) & 0xFF
@@ -621,7 +636,7 @@ def select_contours_ui(
 
     selected_indices = sorted(selected)
     selected_contours = [list_of_contours[i] for i in selected_indices]
-    print(f"[INFO] Selected {len(selected_contours)} episodes: {selected_indices}")
+    # print(f"[INFO] Selected {len(selected_contours)} episodes: {selected_indices}")
     return selected_contours, selected_indices
 
 
@@ -634,15 +649,15 @@ def save_selection_grid(
 ) -> None:
     """Save all_episodes_grid.png with user-selected cells highlighted in green."""
     if initial_states_dir is None:
-        print("[WARN] initial_states_dir is None, skipping selection grid save")
+        # print("[WARN] initial_states_dir is None, skipping selection grid save")
         return
     grid_path = _selection_grid_path(initial_states_dir, object_name)
     if not grid_path.exists():
-        print(f"[WARN] Grid image not found, skipping selection grid: {grid_path}")
+        # print(f"[WARN] Grid image not found, skipping selection grid: {grid_path}")
         return
     grid_img = cv2.imread(str(grid_path))
     if grid_img is None:
-        print(f"[WARN] Failed to read grid image: {grid_path}")
+        # print(f"[WARN] Failed to read grid image: {grid_path}")
         return
 
     n = len(list_of_contours)
@@ -680,7 +695,7 @@ def save_selection_grid(
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(output_path), result)
-    print(f"[INFO] Saved selection grid → {output_path}")
+    # print(f"[INFO] Saved selection grid → {output_path}")
 
 
 def convert_action_to_mujoco(action: torch.Tensor, gripper_mj_range: tuple) -> np.ndarray:
@@ -897,39 +912,51 @@ def main():
              "Uses 1 example pair for stationary, 3 for wrist.",
     )
     parser.add_argument(
-        "--use-sim2real",
+        "--turbo",
         action="store_true",
-        help="Translate composite sim images to real-looking images with pix2pix-turbo before policy inference.",
+        help="Pix2pix-turbo on composite policy images (when action queue empty, like --gemini).",
     )
     parser.add_argument(
-        "--sim2real-checkpoint",
+        "--turbo-checkpoint",
         type=str,
         default=None,
-        help="Path to a fine-tuned pix2pix-turbo .pkl checkpoint.",
+        help="Shared .pkl if per-camera paths are not set.",
     )
     parser.add_argument(
-        "--sim2real-prompt",
+        "--turbo-checkpoint-stationary",
         type=str,
         default=None,
-        help="Prompt used by pix2pix-turbo. Defaults to a generic real-world camera prompt.",
+        help="Stationary cam .pkl (cam_high).",
     )
     parser.add_argument(
-        "--sim2real-resolution",
+        "--turbo-checkpoint-wrist",
+        type=str,
+        default=None,
+        help="Wrist cam .pkl (cam_wrist).",
+    )
+    parser.add_argument(
+        "--turbo-prompt",
+        type=str,
+        default=None,
+        help="Pix2pix text prompt.",
+    )
+    parser.add_argument(
+        "--turbo-resolution",
         type=int,
         default=None,
-        help="Square model resolution for sim2real translation (must be a multiple of 8).",
+        help="Square side before encode, multiple of 8 (default 224).",
     )
     parser.add_argument(
-        "--sim2real-device",
+        "--turbo-device",
         type=str,
         default=None,
-        help="Torch device for sim2real inference. Defaults to CUDA when available.",
+        help="Torch device (default: CUDA if available).",
     )
 
     args = parser.parse_args()
     num_eval_episodes = args.num_eval_episodes
     task_profile = get_task_profile(_DEFAULT_RECORD_TASK_ID)
-    print(f"[INFO] Default task: {_DEFAULT_RECORD_TASK_ID}")
+    # print(f"[INFO] Default task: {_DEFAULT_RECORD_TASK_ID}")
     if args.prompt is None:
         args.prompt = task_profile.single_task
     if args.initial_states_dir is None:
@@ -941,28 +968,25 @@ def main():
     policy, config_dict = load_policy(args.policy_path)
     device = get_safe_torch_device(policy.config.device)
     policy = policy.to(device)
-    sim2real_cfg = config_dict.get("sim2real", {}) if isinstance(config_dict, dict) else {}
-    sim2real_enabled = bool(args.use_sim2real or sim2real_cfg.get("enabled", False))
-    sim2real_checkpoint = args.sim2real_checkpoint or sim2real_cfg.get("checkpoint")
-    sim2real_prompt = args.sim2real_prompt or sim2real_cfg.get(
-        "prompt",
-        "a real-world robot camera image",
+    turbo_cfg = {}
+    if isinstance(config_dict, dict):
+        turbo_cfg = config_dict.get("turbo") or config_dict.get("sim2real") or {}
+    turbo_enabled = bool(args.turbo or turbo_cfg.get("enabled", False))
+    turbo_prompt = args.turbo_prompt or turbo_cfg.get("prompt", "a real-world robot camera image")
+    turbo_resolution = int(
+        args.turbo_resolution
+        if args.turbo_resolution is not None
+        else turbo_cfg.get("resolution", 224)
     )
-    sim2real_resolution = int(args.sim2real_resolution or sim2real_cfg.get("resolution", 512))
-    sim2real_device = args.sim2real_device or sim2real_cfg.get("device")
-    if sim2real_checkpoint is not None:
-        sim2real_checkpoint = Path(sim2real_checkpoint).expanduser()
-        if not sim2real_checkpoint.is_absolute():
-            sim2real_checkpoint = (Path(__file__).parent.parent / sim2real_checkpoint).resolve()
-        sim2real_checkpoint = str(sim2real_checkpoint)
+    if turbo_enabled:
+        if turbo_resolution <= 0 or turbo_resolution % 8 != 0:
+            raise ValueError(
+                f"--turbo-resolution / policy resolution must be a positive multiple of 8, got {turbo_resolution}"
+            )
+    turbo_device = args.turbo_device or turbo_cfg.get("device")
 
-    if args.gemini and sim2real_enabled:
-        raise ValueError("Use either --gemini or --use-sim2real, not both.")
-    if sim2real_enabled and not sim2real_checkpoint:
-        raise ValueError(
-            "sim2real is enabled, but no checkpoint was provided. "
-            "Pass --sim2real-checkpoint or set sim2real.checkpoint in the policy config."
-        )
+    if args.gemini and turbo_enabled:
+        raise ValueError("Use either --gemini or turbo, not both.")
 
     if args.no_save_sim_eval:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
@@ -982,9 +1006,10 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir is not None else None
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Sim eval output directory: {output_dir.resolve()}")
+        # print(f"[INFO] Sim eval output directory: {output_dir.resolve()}")
     else:
-        print("[INFO] Sim eval disk output disabled (--no-save-sim-eval)")
+        # print("[INFO] Sim eval disk output disabled (--no-save-sim-eval)")
+        pass
 
     # Load initial-state contours and open selection UI when --select is used
     list_of_contours = None
@@ -1002,11 +1027,11 @@ def main():
             object_name=args.object_name,
         )
         if not selected_contours:
-            print("[INFO] No episodes selected, exiting.")
+            # print("[INFO] No episodes selected, exiting.")
             sys.exit(0)
         if len(selected_contours) != num_eval_episodes:
-            print(f"[ERROR] Selected {len(selected_contours)} contours but "
-                  f"num_eval_episodes={num_eval_episodes}. Must be equal.")
+            # print(f"[ERROR] Selected {len(selected_contours)} contours but "
+                  # f"num_eval_episodes={num_eval_episodes}. Must be equal.")
             sys.exit(1)
         if output_dir is not None:
             save_selection_grid(
@@ -1018,19 +1043,24 @@ def main():
             )
 
     if args.obs:
-        print("[INFO] --obs: using real-world dataset images as policy input")
+        # print("[INFO] --obs: using real-world dataset images as policy input")
+        pass
     elif args.obs_eval:
-        print(
-            f"[INFO] --obs-eval: using episode 0 images from {args.obs_eval_path!r} as policy input"
-        )
+        # print(
+            # f"[INFO] --obs-eval: using episode 0 images from {args.obs_eval_path!r} as policy input"
+        # )
+        pass
 
-    print(f"[INFO] Policy action parameters:")
+    # print(f"[INFO] Policy action parameters:")
     if hasattr(policy.config, 'horizon'):
-        print(f"  - horizon: {policy.config.horizon}")
+        # print(f"  - horizon: {policy.config.horizon}")
+        pass
     if hasattr(policy.config, 'n_action_steps'):
-        print(f"  - n_action_steps: {policy.config.n_action_steps}")
+        # print(f"  - n_action_steps: {policy.config.n_action_steps}")
+        pass
     if hasattr(policy.config, 'chunk_size'):
-        print(f"  - chunk_size: {policy.config.chunk_size}")
+        # print(f"  - chunk_size: {policy.config.chunk_size}")
+        pass
 
     # Create pre/post processors
     processor_path = Path(args.policy_path) / "policy_preprocessor.json"
@@ -1040,7 +1070,7 @@ def main():
             pretrained_path=args.policy_path,
         )
     else:
-        print("[WARN] Processor files not found, creating from config")
+        # print("[WARN] Processor files not found, creating from config")
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy.config,
             pretrained_path=None,
@@ -1050,7 +1080,7 @@ def main():
     project_root = Path(__file__).parent.parent
     xarm_dir = project_root / "xarm7"
     scene_xml_path = resolve_task_scene_xml(_DEFAULT_RECORD_TASK_ID, xarm_dir)
-    print(f"[INFO] Using MuJoCo scene for task {_DEFAULT_RECORD_TASK_ID!r}: {scene_xml_path.name}")
+    # print(f"[INFO] Using MuJoCo scene for task {_DEFAULT_RECORD_TASK_ID!r}: {scene_xml_path.name}")
     original_cwd = os.getcwd()
     try:
         os.chdir(str(xarm_dir))
@@ -1070,7 +1100,7 @@ def main():
         model.actuator_ctrlrange[gripper_act_id, 0],
         model.actuator_ctrlrange[gripper_act_id, 1],
     )
-    print(f"[INFO] Gripper ctrl range: [{gripper_mj_range[0]}, {gripper_mj_range[1]}]")
+    # print(f"[INFO] Gripper ctrl range: [{gripper_mj_range[0]}, {gripper_mj_range[1]}]")
 
     adjustable_object_names = tuple(dict.fromkeys(task_profile.deploy_adjustable_object_names))
 
@@ -1078,9 +1108,11 @@ def main():
     mug_joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
     mug_qpos_addr = model.jnt_qposadr[mug_joint_id] if mug_joint_id >= 0 else -1
     if mug_qpos_addr >= 0:
-        print(f"[INFO] Mug freejoint found (qpos addr={mug_qpos_addr})")
+        # print(f"[INFO] Mug freejoint found (qpos addr={mug_qpos_addr})")
+        pass
     else:
-        print("[WARN] mug_joint not found – mug pose adjustment disabled")
+        # print("[WARN] mug_joint not found – mug pose adjustment disabled")
+        pass
 
     adjustable_body_ids = {}
     adjustable_body_default_pos = {}
@@ -1089,7 +1121,7 @@ def main():
             continue
         body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, obj_name)
         if body_id < 0:
-            print(f"[WARN] Adjustable body '{obj_name}' not found in {scene_xml_path.name}")
+            # print(f"[WARN] Adjustable body '{obj_name}' not found in {scene_xml_path.name}")
             continue
         adjustable_body_ids[obj_name] = body_id
         adjustable_body_default_pos[obj_name] = model.body_pos[body_id].copy()
@@ -1112,7 +1144,7 @@ def main():
     seg_renderer.enable_segmentation_rendering()
 
     robot_geom_ids = get_robot_geom_ids(model)
-    print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
+    # print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
 
     # Apply camera calibration
     mujoco.mj_forward(model, data)
@@ -1120,7 +1152,7 @@ def main():
         mj_cam = cam_cfg["mujoco_cam"]
         cc = cam_cfg["config"]
         cam_id = set_mujoco_camera_from_config(data, model, mj_cam, cc)
-        print(f"[INFO] Camera '{mj_cam}' (id={cam_id}) calibration applied")
+        # print(f"[INFO] Camera '{mj_cam}' (id={cam_id}) calibration applied")
 
     # Camera intrinsics from config (used for Gaussian rendering)
     camera_intrinsics = {cam_key: cam_cfg["config"]["intrinsics"]
@@ -1136,14 +1168,15 @@ def main():
                 args.scene_path, w2c_init, camera_intrinsics["stationary"]
             )
             color_calib_by_camera = {}
-            if args.color_calibrate and not args.gemini and not sim2real_enabled:
+            if args.color_calibrate and not args.gemini and not turbo_enabled:
                 for cam_key in CAMERA_CONFIG:
                     default_calib = task_profile.color_calibration_path(cam_key)
                     try:
                         color_calib_by_camera[cam_key] = load_color_mapping(default_calib)
-                        print(f"[INFO] Loaded {cam_key} color calibration from: {default_calib}")
+                        # print(f"[INFO] Loaded {cam_key} color calibration from: {default_calib}")
                     except Exception as e:
-                        print(f"[WARN] Failed to load {cam_key} color calibration from {default_calib}: {e}")
+                        # print(f"[WARN] Failed to load {cam_key} color calibration from {default_calib}: {e}")
+                        pass
             viz_cfg = {'viz_w': RENDER_W, 'viz_h': RENDER_H, 'viz_near': 0.1, 'viz_far': 10.0}
             gaussian_data = {
                 'scene_data': scene_data,
@@ -1152,19 +1185,20 @@ def main():
                 'color_calib_by_camera': color_calib_by_camera,
                 'camera_intrinsics': camera_intrinsics,
             }
-            print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
+            # print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
         except Exception as e:
-            print(f"[WARN] Failed to load Gaussian scene: {e}")
+            # print(f"[WARN] Failed to load Gaussian scene: {e}")
             import traceback
             traceback.print_exc()
     else:
-        print(f"[WARN] Scene file not found: {args.scene_path}")
+        # print(f"[WARN] Scene file not found: {args.scene_path}")
+        pass
 
     # Gemini sim→real translator (replaces color calibration when --gemini)
     gemini_translator = None
     if args.gemini:
         from query_gemini import GeminiTranslator
-        print("[INFO] Initializing Gemini translator (examples = query_gemini.EXAMPLE_FRAME_INDICES)...")
+        # print("[INFO] Initializing Gemini translator (examples = query_gemini.EXAMPLE_FRAME_INDICES)...")
         gemini_translator = GeminiTranslator(
             stationary_pairs=1,
             wrist_pairs=3,
@@ -1172,26 +1206,61 @@ def main():
         n_act = getattr(policy.config, 'n_action_steps', None)
         if n_act and n_act > 1:
             est_calls = args.max_steps // n_act + 1
-            print(f"[INFO] Gemini ready: 2 parallel API calls per query, every ~{n_act} steps "
-                  f"(~{est_calls} query rounds/episode).")
+            # print(f"[INFO] Gemini ready: 2 parallel API calls per query, every ~{n_act} steps "
+                  # f"(~{est_calls} query rounds/episode).")
         else:
-            print("[INFO] Gemini ready: 2 parallel API calls each prediction step.")
+            # print("[INFO] Gemini ready: 2 parallel API calls each prediction step.")
+            pass
 
-    sim2real_translator = None
-    if sim2real_enabled:
+    turbo_translators: dict[str, object] | None = None
+    if turbo_enabled:
         from sim2real import SimToRealTranslator
 
-        print(
-            "[INFO] Initializing sim2real translator "
-            f"(checkpoint={sim2real_checkpoint}, resolution={sim2real_resolution})..."
-        )
-        sim2real_translator = SimToRealTranslator(
-            checkpoint_path=sim2real_checkpoint,
-            prompt=sim2real_prompt,
-            resolution=sim2real_resolution,
-            device=sim2real_device,
-        )
-        print(f"[INFO] Sim2real ready on device: {sim2real_translator.device}")
+        def _ckpt_stationary() -> str | None:
+            return (
+                _resolve_path_under_project(args.turbo_checkpoint_stationary, project_root)
+                or _resolve_path_under_project(turbo_cfg.get("checkpoint_stationary"), project_root)
+                or _resolve_path_under_project(args.turbo_checkpoint, project_root)
+                or _resolve_path_under_project(turbo_cfg.get("checkpoint"), project_root)
+            )
+
+        def _ckpt_wrist() -> str | None:
+            return (
+                _resolve_path_under_project(args.turbo_checkpoint_wrist, project_root)
+                or _resolve_path_under_project(turbo_cfg.get("checkpoint_wrist"), project_root)
+                or _resolve_path_under_project(args.turbo_checkpoint, project_root)
+                or _resolve_path_under_project(turbo_cfg.get("checkpoint"), project_root)
+            )
+
+        ckpt_stationary = _ckpt_stationary()
+        ckpt_wrist = _ckpt_wrist()
+        if not ckpt_stationary or not ckpt_wrist:
+            raise ValueError(
+                "Turbo needs checkpoints for both cameras (--turbo-checkpoint-* or policy turbo.*)."
+            )
+        if ckpt_stationary == ckpt_wrist:
+            tr = SimToRealTranslator(
+                checkpoint_path=ckpt_stationary,
+                prompt=turbo_prompt,
+                resolution=turbo_resolution,
+                device=turbo_device,
+            )
+            turbo_translators = {"stationary": tr, "wrist": tr}
+        else:
+            turbo_translators = {
+                "stationary": SimToRealTranslator(
+                    checkpoint_path=ckpt_stationary,
+                    prompt=turbo_prompt,
+                    resolution=turbo_resolution,
+                    device=turbo_device,
+                ),
+                "wrist": SimToRealTranslator(
+                    checkpoint_path=ckpt_wrist,
+                    prompt=turbo_prompt,
+                    resolution=turbo_resolution,
+                    device=turbo_device,
+                ),
+            }
 
     # Load real-world dataset frames for display (and for policy when --obs / --obs-eval).
     # With --no_obs, skip loading unless policy needs real images.
@@ -1210,23 +1279,25 @@ def main():
             )
             obs_frames = load_dataset_frames(episode_data)
             num_obs_frames = max(len(obs_frames.get(k, [])) for k in CAMERA_CONFIG) or 1
-            print(
-                f"[INFO] Loaded real dataset images: {num_obs_frames} frames from "
-                f"{obs_load_path!r} episode {obs_load_episode}"
-            )
+            # print(
+                # f"[INFO] Loaded real dataset images: {num_obs_frames} frames from "
+                # f"{obs_load_path!r} episode {obs_load_episode}"
+            # )
         except Exception as e:
             if args.obs or args.obs_eval:
                 flag = "--obs-eval" if args.obs_eval else "--obs"
-                print(f"[ERROR] Failed to load dataset for {flag}: {e}")
+                # print(f"[ERROR] Failed to load dataset for {flag}: {e}")
                 import traceback
                 traceback.print_exc()
                 sys.exit(1)
-            print(f"[WARN] Could not load dataset for Real windows display: {e}")
+            # print(f"[WARN] Could not load dataset for Real windows display: {e}")
+            pass
     elif args.no_obs:
-        print(
-            "[INFO] --no_obs: skipping real-world replay load and Real camera windows "
-            "(composite-only deployment at --fps)."
-        )
+        # print(
+            # "[INFO] --no_obs: skipping real-world replay load and Real camera windows "
+            # "(composite-only deployment at --fps)."
+        # )
+        pass
 
     # Initialize keyboard listener (ALOHA-style state machine)
     listener, events = init_keyboard_listener()
@@ -1257,16 +1328,23 @@ def main():
                 cv2.namedWindow(win_gem, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(win_gem, WINDOW_W, WINDOW_H)
                 cv2.moveWindow(win_gem, X_START + i * X_STEP, Y_START + 2 * Y_STEP)
+            if turbo_translators is not None:
+                win_tb = f"Turbo: {cam_short}"
+                cv2.namedWindow(win_tb, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(win_tb, WINDOW_W, WINDOW_H)
+                cv2.moveWindow(win_tb, X_START + i * X_STEP, Y_START + 2 * Y_STEP)
 
     _obs_tag = ""
     if args.obs:
         _obs_tag = " [real obs]"
     elif args.obs_eval:
         _obs_tag = " [obs-eval]"
-    print(
-        f"[INFO] Starting policy evaluation ({num_eval_episodes} episodes, max {args.max_steps} steps each)"
-        f"{_obs_tag}"
-    )
+    elif turbo_translators is not None:
+        _obs_tag = " [turbo]"
+    # print(
+        # f"[INFO] Starting policy evaluation ({num_eval_episodes} episodes, max {args.max_steps} steps each)"
+        # f"{_obs_tag}"
+    # )
 
     step_dt = 1.0 / args.fps
 
@@ -1431,20 +1509,22 @@ def main():
                 "m/r/p/t: select | -/+: step"
             )
 
-            print(f"\n{'='*60}")
-            print(f"  WARMUP - Episode {completed_episodes + 1}/{num_eval_episodes}  "
-                  f"(eval #{episode_idx})")
+            # print(f"\n{'='*60}")
+            # print(f"  WARMUP - Episode {completed_episodes + 1}/{num_eval_episodes}  "
+                  # f"(eval #{episode_idx})")
             if warmup_contour:
                 src_ep = selected_episode_indices[completed_episodes]
-                print(f"  Contour: selected_contours[{completed_episodes}]  "
-                      f"(training ep {src_ep})")
+                # print(f"  Contour: selected_contours[{completed_episodes}]  "
+                      # f"(training ep {src_ep})")
             if can_adjust_scene:
-                print(f"  Adjustable objects: {', '.join(adjustable_object_names)}")
-                print(f"  {warmup_help}")
-                print(f"  ENTER: start evaluation | ESC: quit")
+                # print(f"  Adjustable objects: {', '.join(adjustable_object_names)}")
+                # print(f"  {warmup_help}")
+                # print(f"  ENTER: start evaluation | ESC: quit")
+                pass
             elif listener is not None:
-                print(f"  Press RIGHT to start evaluation, ESC to quit")
-            print(f"{'='*60}")
+                # print(f"  Press RIGHT to start evaluation, ESC to quit")
+                pass
+            # print(f"{'='*60}")
 
             if not args.headless:
                 # ── cv2-based warmup (with optional contour overlay) ──
@@ -1472,7 +1552,8 @@ def main():
                     previous_obj = current_warmup_obj
                     current_warmup_obj = _select_warmup_object(key, current_warmup_obj)
                     if current_warmup_obj != previous_obj:
-                        print(f"[INFO] Selected object: {current_warmup_obj}")
+                        # print(f"[INFO] Selected object: {current_warmup_obj}")
+                        pass
 
                     moved = False
                     rotated = False
@@ -1519,16 +1600,16 @@ def main():
 
                     if key in (ord('-'), ord('_')):
                         mug_step /= 2.0
-                        print(f"[INFO] Step: {mug_step*1000:.2f} mm")
+                        # print(f"[INFO] Step: {mug_step*1000:.2f} mm")
                     elif key in (ord('+'), ord('=')):
                         mug_step = min(mug_step * 2.0, MUG_STEP_INIT_M)
-                        print(f"[INFO] Step: {mug_step*1000:.2f} mm")
+                        # print(f"[INFO] Step: {mug_step*1000:.2f} mm")
 
                     if rotated:
                         warmup_state["mug_quat"] = _quat_from_euler_xyz(warmup_state["mug_euler"])
                     if moved or rotated:
                         _apply_adjustable_state(warmup_state)
-                        print(f"[INFO] {_warmup_status(warmup_state, current_warmup_obj)}  step={mug_step*1000:.2f}mm")
+                        # print(f"[INFO] {_warmup_status(warmup_state, current_warmup_obj)}  step={mug_step*1000:.2f}mm")
                     if moved or rotated or current_warmup_obj != previous_obj or key in (ord('-'), ord('_'), ord('+'), ord('=')):
                         _render_current_view(
                             warmup_contour=warmup_contour,
@@ -1565,18 +1646,21 @@ def main():
             events["rerecord_episode"] = False
             events["exit_early"] = False
 
-            print(f"\n{'='*60}")
-            print(f"  RECORDING episode {episode_idx}")
+            # print(f"\n{'='*60}")
+            # print(f"  RECORDING episode {episode_idx}")
             if listener is not None:
-                print(f"  RIGHT=save | LEFT=discard | ESC=quit")
+                # print(f"  RIGHT=save | LEFT=discard | ESC=quit")
+                pass
             else:
-                print(f"  (headless: auto-save after {args.max_steps} steps)")
-            print(f"{'='*60}")
+                # print(f"  (headless: auto-save after {args.max_steps} steps)")
+                pass
+            # print(f"{'='*60}")
 
             episode_actions = []
             episode_states = []
             episode_frames = {cam_key: [] for cam_key in CAMERA_CONFIG}
             last_gemini_display_obs = None
+            last_turbo_policy_display_obs: dict | None = None
             step = 0
             episode_discarded = False
 
@@ -1628,8 +1712,8 @@ def main():
                     frame_idx=step,
                 )
 
-                # Policy input: real obs, Gemini-translated composite (parallel API, same
-                # few-shot examples as query_gemini), or raw composite if no Gemini / queue step.
+                # Policy input: real obs, Gemini composite, turbo composite (when action queue empty), or raw composite.
+                turbo_obs_refresh = False
                 if args.obs or args.obs_eval:
                     observation = real_obs
                 elif gemini_translator is not None and needs_prediction:
@@ -1641,10 +1725,11 @@ def main():
                         and isinstance(observation[k], np.ndarray)
                     }
                     n_act = getattr(policy.config, 'n_action_steps', '?')
-                    print(f"  [Gemini] Step {step}: parallel API calls on live composite "
-                          f"(next query in ~{n_act} steps)")
-                elif sim2real_translator is not None:
-                    observation = apply_sim2real_translation(sim2real_translator, composite_obs)
+                    # print(f"  [Gemini] Step {step}: parallel API calls on live composite "
+                          # f"(next query in ~{n_act} steps)")
+                elif turbo_translators is not None and needs_prediction:
+                    observation = apply_turbo_per_camera(turbo_translators, composite_obs)
+                    turbo_obs_refresh = True
                 else:
                     observation = composite_obs
 
@@ -1681,12 +1766,25 @@ def main():
                         observation, args.policy_input_h, args.policy_input_w
                     )
 
-                # Display resized policy input so the window reflects what the policy actually sees
+                if turbo_translators is not None and turbo_obs_refresh:
+                    last_turbo_policy_display_obs = {
+                        k: np.ascontiguousarray(obs_for_policy[k].copy())
+                        for k in obs_for_policy
+                        if "image" in k.lower() and isinstance(obs_for_policy[k], np.ndarray)
+                    }
+
+                # Display resized policy input (same tensor as predict_action)
                 if not args.headless:
                     display_camera_images(obs_for_policy, policy_config=policy.config, window_name_prefix="Composite")
+                    if turbo_translators is not None and last_turbo_policy_display_obs is not None:
+                        display_camera_images(
+                            last_turbo_policy_display_obs,
+                            policy_config=policy.config,
+                            window_name_prefix="Turbo",
+                        )
 
                 with torch.inference_mode():
-                    print(observation["observation.state"])
+                    # print(observation["observation.state"])
                     action = predict_action(
                         obs_for_policy,
                         policy,
@@ -1717,18 +1815,19 @@ def main():
 
                 step += 1
                 if step % 100 == 0:
-                    print(f"[INFO] Episode {episode_idx} - Step {step}/{args.max_steps}")
+                    # print(f"[INFO] Episode {episode_idx} - Step {step}/{args.max_steps}")
+                    pass
 
             # ── Post-episode: save or discard ──
             if events["stop_recording"]:
-                print(f"\n[INFO] ESC pressed, stopping evaluation")
+                # print(f"\n[INFO] ESC pressed, stopping evaluation")
                 break
 
             if episode_discarded:
                 events["left_arrow"] = False
                 events["rerecord_episode"] = False
                 events["exit_early"] = False
-                print(f">>> Episode {episode_idx} DISCARDED ({step} steps)")
+                # print(f">>> Episode {episode_idx} DISCARDED ({step} steps)")
             else:
                 events["right_arrow"] = False
                 events["exit_early"] = False
@@ -1756,17 +1855,18 @@ def main():
                         for _frame in _frames:
                             _writer.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
                         _writer.release()
-                        print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
-                    print(f"[INFO] Episode data saved → {ep_dir}")
+                        # print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
+                    # print(f"[INFO] Episode data saved → {ep_dir}")
                 completed_episodes += 1
                 _save_note = "" if output_dir is not None else " (no disk save)"
-                print(f">>> Episode {episode_idx} SAVED - {reason} "
-                      f"({step} steps, {completed_episodes}/{num_eval_episodes} done){_save_note}")
+                # print(f">>> Episode {episode_idx} SAVED - {reason} "
+                      # f"({step} steps, {completed_episodes}/{num_eval_episodes} done){_save_note}")
 
             episode_idx += 1
 
     except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by user")
+        # print("\n[INFO] Interrupted by user")
+        pass
     finally:
         if listener is not None:
             listener.stop()
@@ -1778,7 +1878,7 @@ def main():
         if not args.headless:
             cv2.destroyAllWindows()
         _fin = "episodes saved" if output_dir is not None else "episodes completed (no sim eval data saved)"
-        print(f"[INFO] Evaluation finished: {completed_episodes}/{num_eval_episodes} {_fin}")
+        # print(f"[INFO] Evaluation finished: {completed_episodes}/{num_eval_episodes} {_fin}")
 
 
 if __name__ == "__main__":

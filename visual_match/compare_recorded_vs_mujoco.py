@@ -40,7 +40,7 @@ from composite_rendering import (
 # ============================================================================
 _stationary_cfg = load_camera_config("stationary_cam")
 _wrist_cfg = load_camera_config("wrist_cam")
-SAVE_CALIB_FRAMES = [0,2,4,6,8,10]
+SAVE_CALIB_FRAMES = [20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200]
 _DEFAULT_EPISODE = 1
 CAMERA_CONFIG = {
     "stationary": {
@@ -100,7 +100,7 @@ from lerobot.tasks import get_task_profile, get_task_profiles, resolve_task_scen
 # ============================================================================
 from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
 
-_DEFAULT_RECORD_TASK_ID = "place_mug"  # Keep in sync with lerobot-record defaults.
+_DEFAULT_RECORD_TASK_ID ="hang_mug"  # Keep in sync with lerobot-record defaults.
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -419,6 +419,12 @@ def parse_args():
                    help="Disable alpha blending plot overlay and window.")
     p.add_argument("--save-calibration-pairs", action="store_true",
                    help="Save frames 0,5,10,15,20 to calibration_pairs_*/ for color calibration")
+    p.add_argument("--save-replay-frames", action="store_true",
+                   help="Every replay frame: save composite_raw under <root>/gs_render/{stationary,wrist}/ "
+                        "and recorded video under <root>/real_captures/{stationary,wrist}/")
+    p.add_argument("--replay-export-root", type=str, default=None,
+                   help="Root directory used with --save-replay-frames "
+                        "(default: selected task's dataset_root_480640 from task_profiles)")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
@@ -439,6 +445,8 @@ def parse_args():
 def main():
     args = parse_args()
     task_profile = get_task_profile(args.task_id)
+    if args.replay_export_root is None:
+        args.replay_export_root = task_profile.dataset_root_480640
     stationary_calib_dir = task_profile.calibration_pairs_dir("stationary")
     wrist_calib_dir = task_profile.calibration_pairs_dir("wrist")
     stationary_color_calib = task_profile.color_calibration_path("stationary")
@@ -822,6 +830,14 @@ def main():
     paused = False
     frame_idx = 0
 
+    if args.save_replay_frames:
+        _export = Path(args.replay_export_root)
+        for _cam in CAMERA_CONFIG:
+            (_export / "gs_render" / _cam).mkdir(parents=True, exist_ok=True)
+            (_export / "real_captures" / _cam).mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] --save-replay-frames: writing to {_export}/gs_render/{{stationary,wrist}}/ "
+              f"and {_export}/real_captures/{{stationary,wrist}}/")
+
     # --- MuJoCo 3D Viewer Setup ---
     viewer = None
     viewer_ctx = None
@@ -1000,6 +1016,18 @@ def main():
                     "composite_raw": composite_raw,
                     "alpha": alpha_frame,
                 }
+
+            if args.save_replay_frames:
+                _root = Path(args.replay_export_root)
+                for _ck, _rend in cam_renders.items():
+                    cv2.imwrite(
+                        str(_root / "gs_render" / _ck / f"frame_{frame_idx:04d}.png"),
+                        _rend["composite_raw"],
+                    )
+                    cv2.imwrite(
+                        str(_root / "real_captures" / _ck / f"frame_{frame_idx:04d}.png"),
+                        _rend["recorded"],
+                    )
 
             # Save calibration pairs for wrist color calibration
             
