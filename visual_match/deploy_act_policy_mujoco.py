@@ -25,6 +25,7 @@ import os
 import re
 import math
 import argparse
+import shutil
 from pathlib import Path
 import time
 import json
@@ -39,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 _DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_place_mug/checkpoints/last/pretrained_model"
 _DEFAULT_RECORD_TASK_ID = "place_mug"
 _NUM_EPISODES = 10
+_MAX_PREDICTION_EVENTS_PER_TRAJECTORY = 6
 
 # Auto-detect display (for cv2.imshow, mujoco.viewer)
 def _detect_display():
@@ -62,9 +64,16 @@ import torch
 import cv2
 import mujoco
 from mujoco import MjModel, MjData
+from PIL import Image
 
 if _HAS_DISPLAY:
-    import mujoco.viewer
+    try:
+        import mujoco.viewer
+        _HAS_MJ_VIEWER = True
+    except ImportError:
+        _HAS_MJ_VIEWER = False
+else:
+    _HAS_MJ_VIEWER = False
 
 from lerobot.policies.factory import get_policy_class
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -92,6 +101,7 @@ from lerobot_mujoco_utils import (
     lerobot_state_to_mujoco_ctrl,
     mujoco_qpos_to_lerobot_state,
 )
+from object_pose_auto_align import ObjectPoseAlignConfig, auto_align_object_poses
 from lerobot.datasets.utils import copy_observation_frame_with_resized_images
 from lerobot.datasets.video_utils import decode_video_frames
 from lerobot.tasks import get_task_profile, resolve_task_scene_xml
@@ -103,6 +113,12 @@ _KEY_UP    = (65362, 82, 0)
 _KEY_DOWN  = (65364, 84, 1)
 MUG_STEP_INIT_M = 0.005  # 5 mm initial step for mug adjustment
 MUG_ROT_STEP_RAD = np.deg2rad(5.0)
+_DEFAULT_GPT_IMAGE_MODEL = "gpt-image-2"
+_DEFAULT_GPT_IMAGE_PROMPT =  "Style transfer only. Freeze all object positions, shapes, and layout. Change only the visual style, texture, and color treatment."
+# _DEFAULT_GPT_IMAGE_PROMPT =  "DeTransfer style while preserving geometry"
+_DEFAULT_GPT_IMAGE_QUALITY = "high"
+_DEFAULT_GPT_IMAGE_SIZE = "auto"
+_DEFAULT_GPT_IMAGE_MAX_SIDE = 1024
 
 
 
@@ -133,18 +149,63 @@ CAMERA_CONFIG = {
 }
 
 
-def apply_gemini_parallel(translator, observation: dict) -> dict:
-    """Few-shot Gemini per camera in parallel; same examples as query_gemini (translator holds pairs)."""
+def _load_rgb_pil(path: str | Path) -> Image.Image:
+    with Image.open(path) as image:
+        return image.convert("RGB")
+
+
+def _default_gpt_style_image_path(task_profile, cam_key: str) -> Path:
+    return Path(task_profile.dataset_root_480640) / "real_captures" / cam_key / "frame_0000.png"
+
+
+def _get_sorted_frame_paths(folder: Path) -> list:
+    """Return sorted list of frame_*.png paths under *folder*."""
+    return sorted(folder.glob("frame_*.png"))
+
+
+def _update_gpt_style_references(
+    translators: dict,
+    style_dirs: dict,
+    frame_cache: dict,
+    step: int,
+) -> None:
+    """Swap each GPTImageTranslator's style reference to the frame matching *step*.
+
+    If *step* exceeds the number of available frames the last frame is used.
+    Results are cached so the directory is only scanned once per camera.
+    """
+    for cam_key, translator in translators.items():
+        folder = style_dirs.get(cam_key)
+        if folder is None:
+            continue
+        if cam_key not in frame_cache:
+            frame_cache[cam_key] = _get_sorted_frame_paths(Path(folder))
+        frames = frame_cache[cam_key]
+        if not frames:
+            continue
+        idx = min(step, len(frames) - 1)
+        translator._style_references = [_load_rgb_pil(frames[idx])]
+        
+def apply_gpt_per_camera_parallel(translators: dict[str, object], observation: dict, frame_idx: int = 0) -> dict:
+    """Run GPT image translation per logical camera in parallel."""
     out = dict(observation)
     lock = threading.Lock()
-    errs: list[tuple[str, RuntimeError]] = []
+    errs: list[tuple[str, Exception]] = []
+    requested_cams: list[str] = []
 
     def work(cam_key: str, obs_key: str, img: np.ndarray):
+        print(f"  [DEBUG] frame {frame_idx} | {cam_key} → generating...", flush=True)
         try:
-            translated = translator.translate(np.ascontiguousarray(img), cam_key)
+            translator = translators.get(cam_key)
+            if translator is None:
+                print(f"  [DEBUG] frame {frame_idx} | {cam_key} → no translator found, skipping.", flush=True)
+                return
+            translated = translator.translate(np.ascontiguousarray(img))
             with lock:
                 out[obs_key] = translated
-        except RuntimeError as e:
+            print(f"  [DEBUG] frame {frame_idx} | {cam_key} → done ✓", flush=True)
+        except Exception as e:
+            print(f"  [ERROR] frame {frame_idx} | {cam_key} → FAILED: {type(e).__name__}: {e}", flush=True)
             with lock:
                 errs.append((cam_key, e))
 
@@ -152,18 +213,35 @@ def apply_gemini_parallel(translator, observation: dict) -> dict:
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
         obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
         if obs_key not in out:
+            print(f"  [DEBUG] frame {frame_idx} | {cam_key} → obs_key '{obs_key}' not in observation, skipping.", flush=True)
             continue
         img = out[obs_key]
         if not isinstance(img, np.ndarray):
+            print(f"  [DEBUG] frame {frame_idx} | {cam_key} → image is {type(img).__name__}, not ndarray, skipping.", flush=True)
             continue
+        requested_cams.append(cam_key)
         t = threading.Thread(target=work, args=(cam_key, obs_key, img))
         threads.append(t)
         t.start()
+
+    if requested_cams:
+        cam_list = ", ".join(requested_cams)
+        print(f"[INFO] frame {frame_idx} | {_DEFAULT_GPT_IMAGE_MODEL} | spawned {len(requested_cams)} thread(s): ({cam_list})", flush=True)
+    else:
+        print(f"[WARN] frame {frame_idx} | no cameras queued — nothing to translate.", flush=True)
+
     for t in threads:
         t.join()
-    for cam_key, e in errs:
-        # print(f"  [WARN] Gemini failed for {cam_key}: {e}")
-        pass
+
+    n_ok = len(requested_cams) - len(errs)
+    if errs:
+        print(f"[WARN] frame {frame_idx} | {len(errs)}/{len(requested_cams)} camera(s) failed:", flush=True)
+        for cam_key, e in errs:
+            print(f"  [WARN] frame {frame_idx} | {cam_key} → {type(e).__name__}: {e}", flush=True)
+
+    if requested_cams:
+        print(f"[INFO] frame {frame_idx} | {_DEFAULT_GPT_IMAGE_MODEL} | done — {n_ok}/{len(requested_cams)} succeeded.", flush=True)
+
     return out
 
 
@@ -174,6 +252,38 @@ def _resolve_path_under_project(path: str | Path | None, project_root: Path) -> 
     if not p.is_absolute():
         p = (project_root / p).resolve()
     return str(p)
+
+
+def _next_saved_episode_index(output_dir: Path) -> int:
+    """Return the next free episode_NNN index inside an evaluation output directory."""
+    max_episode_idx = -1
+    for child in output_dir.iterdir():
+        if not child.is_dir():
+            continue
+        match = re.fullmatch(r"episode_(\d+)", child.name)
+        if match is None:
+            continue
+        max_episode_idx = max(max_episode_idx, int(match.group(1)))
+    return max_episode_idx + 1
+
+
+def _reserve_episode_output_dir(output_dir: Path) -> tuple[int, Path]:
+    """Atomically reserve a unique episode_NNN directory for the next trajectory."""
+    episode_idx = _next_saved_episode_index(output_dir)
+    while True:
+        ep_dir = output_dir / f"episode_{episode_idx:03d}"
+        try:
+            ep_dir.mkdir(parents=False, exist_ok=False)
+            return episode_idx, ep_dir
+        except FileExistsError:
+            episode_idx += 1
+
+
+def _delete_episode_output_dir(ep_dir: Path | None) -> None:
+    """Remove a reserved episode directory and anything saved inside it."""
+    if ep_dir is None or not ep_dir.exists():
+        return
+    shutil.rmtree(ep_dir, ignore_errors=True)
 
 
 def apply_turbo_per_camera(translators: dict[str, object], observation: dict) -> dict:
@@ -284,7 +394,18 @@ def load_dataset_frames(episode_data: dict):
     return cam_frames
 
 
-def display_camera_images(observation: dict, policy_config=None, window_name_prefix: str = "Camera"):
+def _format_window_title(window_name_prefix: str, window_name: str, episode_idx: int | None = None) -> str:
+    if episode_idx is None:
+        return f"{window_name_prefix}: {window_name}"
+    return f"{window_name_prefix} [{episode_idx:03d}]: {window_name}"
+
+
+def display_camera_images(
+    observation: dict,
+    policy_config=None,
+    window_name_prefix: str = "Camera",
+    episode_idx: int | None = None,
+):
     """Display camera images from observation dict in OpenCV windows."""
     all_image_keys = [k for k in observation.keys() if "image" in k.lower()]
     if policy_config is not None and hasattr(policy_config, 'image_features') and policy_config.image_features:
@@ -298,7 +419,86 @@ def display_camera_images(observation: dict, policy_config=None, window_name_pre
         window_name = img_key.split(".")[-1] if "." in img_key else img_key
         window_full_name = f"{window_name_prefix}: {window_name}"
         cv2.imshow(window_full_name, img_bgr)
+        if hasattr(cv2, "setWindowTitle"):
+            cv2.setWindowTitle(
+                window_full_name,
+                _format_window_title(window_name_prefix, window_name, episode_idx),
+            )
     cv2.waitKey(1)
+
+
+def _fit_rgb_image(img: np.ndarray | None, width: int, height: int) -> np.ndarray:
+    """Resize an RGB image to fit inside a fixed tile while preserving aspect ratio."""
+    canvas = np.full((height, width, 3), 18, dtype=np.uint8)
+    if not isinstance(img, np.ndarray) or img.ndim != 3 or img.shape[2] != 3:
+        return canvas
+    src_h, src_w = img.shape[:2]
+    if src_h <= 0 or src_w <= 0:
+        return canvas
+    scale = min(width / src_w, height / src_h)
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
+    y0 = (height - new_h) // 2
+    x0 = (width - new_w) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
+
+
+def _build_window_tile(title: str, img: np.ndarray | None, width: int, height: int) -> np.ndarray:
+    """Create one labeled RGB tile matching an OpenCV display window."""
+    title_h = 28
+    tile = np.full((height, width, 3), 18, dtype=np.uint8)
+    cv2.rectangle(tile, (0, 0), (width, title_h), (44, 44, 44), -1)
+    cv2.putText(tile, title, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (235, 235, 235), 1, cv2.LINE_AA)
+    tile[title_h:, :, :] = _fit_rgb_image(img, width, height - title_h)
+    return tile
+
+
+def build_combined_window_frame(
+    row_specs: list[tuple[str, dict | None]],
+    tile_width: int = 400,
+    tile_height: int = 300,
+) -> np.ndarray:
+    """Build a single RGB frame containing the currently displayed camera windows."""
+    row_frames = []
+    for row_name, observation in row_specs:
+        tiles = []
+        for cam_key, cam_cfg in CAMERA_CONFIG.items():
+            obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
+            cam_short = obs_key.split(".")[-1]
+            img = None if observation is None else observation.get(obs_key)
+            tiles.append(
+                _build_window_tile(
+                    f"{row_name}: {cam_short}",
+                    img,
+                    tile_width,
+                    tile_height,
+                )
+            )
+        row_frames.append(np.hstack(tiles))
+    if not row_frames:
+        return np.full((tile_height, tile_width, 3), 18, dtype=np.uint8)
+    return np.vstack(row_frames)
+
+
+def build_prediction_event_panel(
+    translated_row_name: str,
+    composite_observation: dict | None,
+    translated_observation: dict | None,
+    tile_width: int = 400,
+    tile_height: int = 300,
+) -> np.ndarray:
+    """Build a paired 2x2 RGB panel for one prediction event."""
+    return build_combined_window_frame(
+        [
+            ("Composite", composite_observation),
+            (translated_row_name, translated_observation),
+        ],
+        tile_width=tile_width,
+        tile_height=tile_height,
+    )
 
 
 def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
@@ -798,6 +998,11 @@ def main():
         help="Run without GUI (for headless servers)"
     )
     parser.add_argument(
+        "--no-mujoco-view",
+        action="store_true",
+        help="Disable the MuJoCo 3D interactive viewer window",
+    )
+    parser.add_argument(
         "--scene-path",
         type=str,
         default="pointclouds/xarm7_black.npz",
@@ -894,6 +1099,31 @@ def main():
         help="Object name(s) matching the segmentation prompt, e.g. 'mug' or 'mug, saucer'"
     )
     parser.add_argument(
+        "--auto-align-initial-objects",
+        action="store_true",
+        default=True,
+        help=(
+            "Before each selected deployment episode, optimize MuJoCo object poses "
+            "against saved initial-state SAM masks."
+        ),
+    )
+    parser.add_argument(
+        "--auto-align-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for cached auto-aligned object poses. Defaults to <initial-states-dir>/auto_object_poses.",
+    )
+    parser.add_argument(
+        "--auto-align-force",
+        action="store_true",
+        help="Recompute automatic object alignment even if a cached pose exists.",
+    )
+    parser.add_argument(
+        "--auto-align-optimize-z",
+        action="store_true",
+        help="Also optimize object Z. By default only XY and yaw are optimized.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -905,16 +1135,20 @@ def main():
         help="Run evaluation but do not write sim outputs (episode npy/mp4, selected_states_grid.png, or output directory).",
     )
     parser.add_argument(
-        "--gemini",
+        "--record",
         action="store_true",
-        help="Use Gemini few-shot sim→real translation instead of color_mapping.yaml calibration. "
-             "Only queries the API when a new policy prediction is needed (every n_action_steps frames). "
-             "Uses 1 example pair for stationary, 3 for wrist.",
+        default=True,
+        help="Save a single tiled MP4 of the displayed camera windows for each episode.",
+    )
+    parser.add_argument(
+        "--gpt",
+        action="store_true",
+        help="Use GPT-Image-2 sim→real style transfer on composite policy images when a new prediction is needed.",
     )
     parser.add_argument(
         "--turbo",
         action="store_true",
-        help="Pix2pix-turbo on composite policy images (when action queue empty, like --gemini).",
+        help="Pix2pix-turbo on composite policy images when a new prediction is needed.",
     )
     parser.add_argument(
         "--turbo-checkpoint",
@@ -952,6 +1186,30 @@ def main():
         default=None,
         help="Torch device (default: CUDA if available).",
     )
+    parser.add_argument(
+        "--gpt-style-image-stationary",
+        type=str,
+        default=None,
+        help="Stationary-camera style reference for GPT image translation. Defaults to task_profile.dataset_root_480640/real_captures/stationary/frame_0000.png.",
+    )
+    parser.add_argument(
+        "--gpt-style-image-wrist",
+        type=str,
+        default=None,
+        help="Wrist-camera style reference for GPT image translation. Defaults to task_profile.dataset_root_480640/real_captures/wrist/frame_0000.png.",
+    )
+    parser.add_argument(
+        "--gpt-prompt",
+        type=str,
+        default=_DEFAULT_GPT_IMAGE_PROMPT,
+        help="Prompt for GPT-Image-2 style transfer.",
+    )
+    parser.add_argument(
+        "--gpt-max-side",
+        type=int,
+        default=_DEFAULT_GPT_IMAGE_MAX_SIDE,
+        help="Resize the longest input side before GPT-Image-2 upload (default 1024).",
+    )
 
     args = parser.parse_args()
     num_eval_episodes = args.num_eval_episodes
@@ -985,8 +1243,8 @@ def main():
             )
     turbo_device = args.turbo_device or turbo_cfg.get("device")
 
-    if args.gemini and turbo_enabled:
-        raise ValueError("Use either --gemini or turbo, not both.")
+    if args.gpt and turbo_enabled:
+        raise ValueError("Use either --gpt or --turbo, not both.")
 
     if args.no_save_sim_eval:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
@@ -1004,12 +1262,16 @@ def main():
 
     # Output directory for sim evaluation data (None when --no-save-sim-eval)
     output_dir = Path(args.output_dir) if args.output_dir is not None else None
+    next_saved_episode_idx: int | None = None
+    current_episode_output_dir: Path | None = None
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
         # print(f"[INFO] Sim eval output directory: {output_dir.resolve()}")
     else:
         # print("[INFO] Sim eval disk output disabled (--no-save-sim-eval)")
         pass
+    if args.record and output_dir is None:
+        raise ValueError("--record requires sim eval disk output. Remove --no-save-sim-eval or set --output-dir.")
 
     # Load initial-state contours and open selection UI when --select is used
     list_of_contours = None
@@ -1116,6 +1378,7 @@ def main():
 
     adjustable_body_ids = {}
     adjustable_body_default_pos = {}
+    adjustable_body_default_quat = {}
     for obj_name in adjustable_object_names:
         if obj_name == "mug":
             continue
@@ -1125,6 +1388,7 @@ def main():
             continue
         adjustable_body_ids[obj_name] = body_id
         adjustable_body_default_pos[obj_name] = model.body_pos[body_id].copy()
+        adjustable_body_default_quat[obj_name] = model.body_quat[body_id].copy()
 
     RENDER_W, RENDER_H = 640, 480
 
@@ -1145,6 +1409,16 @@ def main():
 
     robot_geom_ids = get_robot_geom_ids(model)
     # print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
+
+    auto_align_config = None
+    if args.auto_align_initial_objects:
+        auto_align_config = ObjectPoseAlignConfig(
+            initial_states_dir=args.initial_states_dir,
+            object_name=args.object_name,
+            cache_dir=args.auto_align_cache_dir,
+            optimize_z=args.auto_align_optimize_z,
+            force=args.auto_align_force,
+        )
 
     # Apply camera calibration
     mujoco.mj_forward(model, data)
@@ -1168,7 +1442,7 @@ def main():
                 args.scene_path, w2c_init, camera_intrinsics["stationary"]
             )
             color_calib_by_camera = {}
-            if args.color_calibrate and not args.gemini and not turbo_enabled:
+            if args.color_calibrate and not args.gpt and not turbo_enabled:
                 for cam_key in CAMERA_CONFIG:
                     default_calib = task_profile.color_calibration_path(cam_key)
                     try:
@@ -1194,22 +1468,48 @@ def main():
         # print(f"[WARN] Scene file not found: {args.scene_path}")
         pass
 
-    # Gemini sim→real translator (replaces color calibration when --gemini)
-    gemini_translator = None
-    if args.gemini:
-        from query_gemini import GeminiTranslator
-        # print("[INFO] Initializing Gemini translator (examples = query_gemini.EXAMPLE_FRAME_INDICES)...")
-        gemini_translator = GeminiTranslator(
-            stationary_pairs=1,
-            wrist_pairs=3,
-        )
+    # GPT image sim→real translators (replace color calibration when --gpt).
+    gpt_translators: dict[str, object] | None = None
+    gpt_style_dirs: dict = {}
+    _gpt_style_frame_cache: dict = {}
+    if args.gpt:
+        from sim2real import GPTImageTranslator
+
+        style_path_stationary = _resolve_path_under_project(
+            args.gpt_style_image_stationary, project_root
+        ) or str((project_root / _default_gpt_style_image_path(task_profile, "stationary")).resolve())
+        style_path_wrist = _resolve_path_under_project(
+            args.gpt_style_image_wrist, project_root
+        ) or str((project_root / _default_gpt_style_image_path(task_profile, "wrist")).resolve())
+        style_paths = {
+            "stationary": Path(style_path_stationary),
+            "wrist": Path(style_path_wrist),
+        }
+        for cam_key, style_path in style_paths.items():
+            if not style_path.exists():
+                raise FileNotFoundError(
+                    f"GPT style image for {cam_key!r} not found: {style_path}"
+                )
+        gpt_translators = {
+            cam_key: GPTImageTranslator(
+                style_references=[_load_rgb_pil(style_path)],
+                cam_name=cam_key,
+                prompt=args.gpt_prompt,
+                model=_DEFAULT_GPT_IMAGE_MODEL,
+                size=_DEFAULT_GPT_IMAGE_SIZE,
+                quality=_DEFAULT_GPT_IMAGE_QUALITY,
+                max_side=args.gpt_max_side,
+            )
+            for cam_key, style_path in style_paths.items()
+        }
+        gpt_style_dirs = {cam_key: path.parent for cam_key, path in style_paths.items()}
         n_act = getattr(policy.config, 'n_action_steps', None)
         if n_act and n_act > 1:
             est_calls = args.max_steps // n_act + 1
-            # print(f"[INFO] Gemini ready: 2 parallel API calls per query, every ~{n_act} steps "
+            # print(f"[INFO] GPT image translation ready: 2 parallel API calls per query, every ~{n_act} steps "
                   # f"(~{est_calls} query rounds/episode).")
         else:
-            # print("[INFO] Gemini ready: 2 parallel API calls each prediction step.")
+            # print("[INFO] GPT image translation ready: 2 parallel API calls each prediction step.")
             pass
 
     turbo_translators: dict[str, object] | None = None
@@ -1262,27 +1562,38 @@ def main():
                 ),
             }
 
-    # Load real-world dataset frames for display (and for policy when --obs / --obs-eval).
-    # With --no_obs, skip loading unless policy needs real images.
+    # Load real-world dataset frames lazily per selected initial-state episode.
+    # This keeps the Real windows synchronized with the selected grid cell.
     obs_frames = None
     need_dataset_frames = args.obs or args.obs_eval or not args.no_obs
-    if need_dataset_frames:
-        if args.obs_eval:
+    obs_frame_cache: dict[tuple[str, int], dict] = {}
+
+    def _load_obs_frames_for_episode(source_episode_idx: int | None) -> dict | None:
+        if not need_dataset_frames:
+            return None
+        if source_episode_idx is None:
+            source_episode_idx = args.episode
+        if args.obs_eval and selected_episode_indices is None:
             obs_load_path = args.obs_eval_path
             obs_load_episode = 0
         else:
             obs_load_path = args.dataset_path
-            obs_load_episode = args.episode
+            obs_load_episode = int(source_episode_idx)
+        cache_key = (str(obs_load_path), obs_load_episode)
+        if cache_key in obs_frame_cache:
+            return obs_frame_cache[cache_key]
         try:
             episode_data = load_episode(
                 obs_load_path, obs_load_episode, dataset_root=args.dataset_root
             )
-            obs_frames = load_dataset_frames(episode_data)
-            num_obs_frames = max(len(obs_frames.get(k, [])) for k in CAMERA_CONFIG) or 1
+            loaded_frames = load_dataset_frames(episode_data)
+            obs_frame_cache[cache_key] = loaded_frames
+            num_obs_frames = max(len(loaded_frames.get(k, [])) for k in CAMERA_CONFIG) or 1
             # print(
                 # f"[INFO] Loaded real dataset images: {num_obs_frames} frames from "
                 # f"{obs_load_path!r} episode {obs_load_episode}"
             # )
+            return loaded_frames
         except Exception as e:
             if args.obs or args.obs_eval:
                 flag = "--obs-eval" if args.obs_eval else "--obs"
@@ -1291,8 +1602,8 @@ def main():
                 traceback.print_exc()
                 sys.exit(1)
             # print(f"[WARN] Could not load dataset for Real windows display: {e}")
-            pass
-    elif args.no_obs:
+            return None
+    if args.no_obs and not need_dataset_frames:
         # print(
             # "[INFO] --no_obs: skipping real-world replay load and Real camera windows "
             # "(composite-only deployment at --fps)."
@@ -1306,8 +1617,8 @@ def main():
     # (those modes need to see real images next to composite).
     show_real_windows = (not args.no_obs) or args.obs or args.obs_eval
 
+    WINDOW_W, WINDOW_H = 400, 300
     if not args.headless:
-        WINDOW_W, WINDOW_H = 400, 300
         X_START, Y_START = 50, 30
         X_STEP, Y_STEP = 410, 340
         cam_keys = list(CAMERA_CONFIG.keys())
@@ -1318,19 +1629,27 @@ def main():
             win_comp = f"Composite: {cam_short}"
             if show_real_windows:
                 cv2.namedWindow(win_real, cv2.WINDOW_NORMAL)
+                if hasattr(cv2, "setWindowTitle"):
+                    cv2.setWindowTitle(win_real, _format_window_title("Real", cam_short, next_saved_episode_idx))
                 cv2.resizeWindow(win_real, WINDOW_W, WINDOW_H)
                 cv2.moveWindow(win_real, X_START + i * X_STEP, Y_START)
             cv2.namedWindow(win_comp, cv2.WINDOW_NORMAL)
+            if hasattr(cv2, "setWindowTitle"):
+                cv2.setWindowTitle(win_comp, _format_window_title("Composite", cam_short, next_saved_episode_idx))
             cv2.resizeWindow(win_comp, WINDOW_W, WINDOW_H)
             cv2.moveWindow(win_comp, X_START + i * X_STEP, Y_START + Y_STEP)
-            if args.gemini:
-                win_gem = f"Gemini: {cam_short}"
-                cv2.namedWindow(win_gem, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(win_gem, WINDOW_W, WINDOW_H)
-                cv2.moveWindow(win_gem, X_START + i * X_STEP, Y_START + 2 * Y_STEP)
+            if gpt_translators is not None:
+                win_gpt = f"GPT: {cam_short}"
+                cv2.namedWindow(win_gpt, cv2.WINDOW_NORMAL)
+                if hasattr(cv2, "setWindowTitle"):
+                    cv2.setWindowTitle(win_gpt, _format_window_title("GPT", cam_short, next_saved_episode_idx))
+                cv2.resizeWindow(win_gpt, WINDOW_W, WINDOW_H)
+                cv2.moveWindow(win_gpt, X_START + i * X_STEP, Y_START + 2 * Y_STEP)
             if turbo_translators is not None:
                 win_tb = f"Turbo: {cam_short}"
                 cv2.namedWindow(win_tb, cv2.WINDOW_NORMAL)
+                if hasattr(cv2, "setWindowTitle"):
+                    cv2.setWindowTitle(win_tb, _format_window_title("Turbo", cam_short, next_saved_episode_idx))
                 cv2.resizeWindow(win_tb, WINDOW_W, WINDOW_H)
                 cv2.moveWindow(win_tb, X_START + i * X_STEP, Y_START + 2 * Y_STEP)
 
@@ -1339,6 +1658,8 @@ def main():
         _obs_tag = " [real obs]"
     elif args.obs_eval:
         _obs_tag = " [obs-eval]"
+    elif gpt_translators is not None:
+        _obs_tag = " [gpt]"
     elif turbo_translators is not None:
         _obs_tag = " [turbo]"
     # print(
@@ -1353,20 +1674,29 @@ def main():
     # Skip mujoco 3D viewer when using EGL (e.g. SSH X11 forwarding) - GLFW/GLX fails
     use_viewer = (
         not args.headless
+        and not args.no_mujoco_view
         and _HAS_DISPLAY
+        and _HAS_MJ_VIEWER
         and os.environ.get("MUJOCO_GL") != "egl"
     )
     if use_viewer:
         try:
             viewer_ctx = mujoco.viewer.launch_passive(model, data)
             viewer = viewer_ctx.__enter__()
+            print("[INFO] MuJoCo 3D viewer launched (synchronized)")
         except Exception:
             viewer = None
             viewer_ctx = None
+    elif args.no_mujoco_view:
+        print("[INFO] MuJoCo 3D viewer disabled (--no-mujoco-view)")
+    elif _HAS_DISPLAY and not _HAS_MJ_VIEWER:
+        print("[WARN] mujoco.viewer not available; 3D viewer disabled.")
 
     saved_episodes = []
     completed_episodes = 0
     episode_idx = 0
+    episode_window_writer: cv2.VideoWriter | None = None
+    episode_window_tmp_path: Path | None = None
 
     default_mug_pos = data.qpos[mug_qpos_addr:mug_qpos_addr + 3].copy() if mug_qpos_addr >= 0 else None
     default_mug_quat = data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7].copy() if mug_qpos_addr >= 0 else None
@@ -1380,6 +1710,7 @@ def main():
             mujoco.mj_resetData(model, data)
         for obj_name, body_id in adjustable_body_ids.items():
             model.body_pos[body_id] = adjustable_body_default_pos[obj_name]
+            model.body_quat[body_id] = adjustable_body_default_quat[obj_name]
         if mug_qpos_addr >= 0 and default_mug_pos is not None and default_mug_quat is not None:
             data.qpos[mug_qpos_addr:mug_qpos_addr + 3] = default_mug_pos
             data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7] = default_mug_quat
@@ -1393,7 +1724,11 @@ def main():
             "body_positions": {
                 obj_name: model.body_pos[body_id].copy()
                 for obj_name, body_id in adjustable_body_ids.items()
-            }
+            },
+            "body_quats": {
+                obj_name: model.body_quat[body_id].copy()
+                for obj_name, body_id in adjustable_body_ids.items()
+            },
         }
         if mug_qpos_addr >= 0:
             mug_pos = data.qpos[mug_qpos_addr:mug_qpos_addr + 3].copy()
@@ -1415,6 +1750,8 @@ def main():
             body_id = adjustable_body_ids.get(obj_name)
             if body_id is not None:
                 model.body_pos[body_id] = body_pos
+                if obj_name in state.get("body_quats", {}):
+                    model.body_quat[body_id] = _quat_normalize(state["body_quats"][obj_name])
         mujoco.mj_forward(model, data)
 
     def _warmup_status(state: dict, current_obj: str | None) -> str:
@@ -1423,6 +1760,25 @@ def main():
         if current_obj and current_obj in state["body_positions"]:
             return f"{current_obj} pos={_fmt_xyz(state['body_positions'][current_obj])}"
         return f"objects={', '.join(adjustable_object_names) or 'none'}"
+
+    def _finalize_episode_window_recording(save_path: Path | None = None) -> None:
+        nonlocal episode_window_writer, episode_window_tmp_path
+        if episode_window_writer is not None:
+            episode_window_writer.release()
+            episode_window_writer = None
+        if episode_window_tmp_path is None:
+            return
+        if save_path is None:
+            try:
+                episode_window_tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            if save_path.exists():
+                save_path.unlink()
+            episode_window_tmp_path.replace(save_path)
+        episode_window_tmp_path = None
 
     def _select_warmup_object(key: int, current_obj: str | None) -> str | None:
         key_to_obj = {
@@ -1474,27 +1830,45 @@ def main():
                         y += 22
                     if help_text:
                         cv2.putText(img, help_text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
-            display_camera_images(composite_obs, policy_config=policy.config, window_name_prefix="Composite")
+            display_camera_images(
+                composite_obs,
+                policy_config=policy.config,
+                window_name_prefix="Composite",
+                episode_idx=next_saved_episode_idx if output_dir is not None else None,
+            )
             if obs_frames is not None and show_real_windows:
                 real_obs = build_observation_from_mujoco(
                     model, data, renderer,
                     seg_renderer=seg_renderer, robot_geom_ids=robot_geom_ids,
                     gaussian_data=gaussian_data, obs_frames=obs_frames, frame_idx=0,
                 )
-                display_camera_images(real_obs, policy_config=policy.config, window_name_prefix="Real")
+                display_camera_images(
+                    real_obs,
+                    policy_config=policy.config,
+                    window_name_prefix="Real",
+                    episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                )
         if viewer is not None:
             viewer.sync()
 
     try:
         while completed_episodes < num_eval_episodes and not events["stop_recording"]:
+            if output_dir is not None and current_episode_output_dir is None:
+                next_saved_episode_idx, current_episode_output_dir = _reserve_episode_output_dir(output_dir)
+
             # ── WARMUP: reset sim and wait for RIGHT arrow to begin episode ──
             _reset_sim()
             policy.reset()
 
             # Pick the contour for this evaluation episode (sequential)
             warmup_contour = None
+            selected_source_episode_idx = None
             if selected_contours is not None and completed_episodes < len(selected_contours):
                 warmup_contour = selected_contours[completed_episodes]
+                selected_source_episode_idx = selected_episode_indices[completed_episodes]
+            if selected_source_episode_idx is None:
+                selected_source_episode_idx = args.episode
+            obs_frames = _load_obs_frames_for_episode(selected_source_episode_idx)
 
             events["right_arrow"] = False
             events["left_arrow"] = False
@@ -1502,6 +1876,29 @@ def main():
             events["exit_early"] = False
 
             can_adjust_scene = bool(adjustable_object_names) and not args.headless
+            auto_align_succeeded = False
+            if auto_align_config is not None:
+                try:
+                    align_result = auto_align_object_poses(
+                        model=model,
+                        data=data,
+                        seg_renderer=seg_renderer,
+                        camera_config=CAMERA_CONFIG,
+                        config=auto_align_config,
+                        episode_idx=selected_source_episode_idx,
+                        apply=True,
+                    )
+                    iou_text = ", ".join(
+                        f"{name} IoU={iou:.3f}" for name, iou in align_result.iou_by_object.items()
+                    )
+                    print(
+                        f"[INFO] Auto-aligned objects for training episode {selected_source_episode_idx}: "
+                        f"loss={align_result.loss:.4f} {iou_text}",
+                        flush=True,
+                    )
+                    auto_align_succeeded = True
+                except Exception as exc:
+                    print(f"[WARN] Automatic object alignment failed: {exc}", flush=True)
             warmup_state = _capture_adjustable_state()
             current_warmup_obj = adjustable_object_names[0] if adjustable_object_names else None
             warmup_help = (
@@ -1534,8 +1931,10 @@ def main():
                     status_text=_warmup_status(warmup_state, current_warmup_obj),
                     help_text=warmup_help if can_adjust_scene else None,
                 )
+                if auto_align_succeeded:
+                    cv2.waitKeyEx(1)
 
-                while not events["stop_recording"]:
+                while not auto_align_succeeded and not events["stop_recording"]:
                     key = cv2.waitKeyEx(50)
                     if key < 0:
                         continue
@@ -1628,7 +2027,8 @@ def main():
 
             elif listener is not None:
                 # ── pynput-based warmup (no contour selection) ──
-                while (not events["right_arrow"]
+                while (not auto_align_succeeded
+                       and not events["right_arrow"]
                        and not events["stop_recording"]):
                     step_start = time.perf_counter()
                     _render_current_view()
@@ -1659,10 +2059,14 @@ def main():
             episode_actions = []
             episode_states = []
             episode_frames = {cam_key: [] for cam_key in CAMERA_CONFIG}
-            last_gemini_display_obs = None
+            prediction_event_panels: list[tuple[str, int, int, np.ndarray]] = []
+            last_gpt_policy_display_obs: dict | None = None
             last_turbo_policy_display_obs: dict | None = None
+            _finalize_episode_window_recording()
             step = 0
             episode_discarded = False
+            prediction_events = 0
+            prediction_limit_reached = False
 
             while step < args.max_steps:
                 if events["stop_recording"]:
@@ -1680,12 +2084,17 @@ def main():
                         set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
                 # ACT action chunking: the policy only needs a new observation
-                # when its action queue is depleted. Skip expensive Gemini API
-                # calls on intermediate steps where we just pop from the queue.
+                # when its action queue is depleted. Skip expensive sim→real
+                # translation calls on intermediate steps where we just pop from
+                # the queue.
                 needs_prediction = (
                     not hasattr(policy, '_action_queue')
                     or len(policy._action_queue) == 0
                 )
+                current_prediction_event_idx = prediction_events + 1 if needs_prediction else None
+                if needs_prediction and prediction_events >= _MAX_PREDICTION_EVENTS_PER_TRAJECTORY:
+                    prediction_limit_reached = True
+                    break
 
                 need_real_obs = (
                     args.obs or args.obs_eval
@@ -1702,7 +2111,7 @@ def main():
                         frame_idx=step,
                     )
 
-                # Always build composite without Gemini (fast, for display + video)
+                # Always build the raw composite first (fast, for display + video).
                 composite_obs = build_observation_from_mujoco(
                     model, data, renderer,
                     seg_renderer=seg_renderer,
@@ -1712,36 +2121,49 @@ def main():
                     frame_idx=step,
                 )
 
-                # Policy input: real obs, Gemini composite, turbo composite (when action queue empty), or raw composite.
+                resize_policy_images = (
+                    not args.policy_no_resize
+                    and args.policy_input_h > 0
+                    and args.policy_input_w > 0
+                )
+                composite_display_obs = composite_obs
+                if resize_policy_images:
+                    composite_display_obs = copy_observation_frame_with_resized_images(
+                        composite_obs, args.policy_input_h, args.policy_input_w
+                    )
+
+                if not args.headless:
+                    if real_obs is not None and show_real_windows:
+                        display_camera_images(
+                            real_obs,
+                            policy_config=policy.config,
+                            window_name_prefix="Real",
+                            episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                        )
+                    # Update the composite windows before any GPT/Turbo call so they
+                    # snap to policy resolution immediately after warmup confirm.
+                    display_camera_images(
+                        composite_display_obs,
+                        policy_config=policy.config,
+                        window_name_prefix="Composite",
+                        episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                    )
+
+                # Policy input: real obs, GPT composite, turbo composite
+                # (when action queue empty), or raw composite.
+                gpt_obs_refresh = False
                 turbo_obs_refresh = False
                 if args.obs or args.obs_eval:
                     observation = real_obs
-                elif gemini_translator is not None and needs_prediction:
-                    observation = apply_gemini_parallel(gemini_translator, composite_obs)
-                    last_gemini_display_obs = {
-                        k: observation[k].copy()
-                        for k in observation
-                        if "image" in k.lower()
-                        and isinstance(observation[k], np.ndarray)
-                    }
-                    n_act = getattr(policy.config, 'n_action_steps', '?')
-                    # print(f"  [Gemini] Step {step}: parallel API calls on live composite "
-                          # f"(next query in ~{n_act} steps)")
+                elif gpt_translators is not None and needs_prediction:
+                    _update_gpt_style_references(gpt_translators, gpt_style_dirs, _gpt_style_frame_cache, step)
+                    observation = apply_gpt_per_camera_parallel(gpt_translators, composite_obs, frame_idx=step)
+                    gpt_obs_refresh = True
                 elif turbo_translators is not None and needs_prediction:
                     observation = apply_turbo_per_camera(turbo_translators, composite_obs)
                     turbo_obs_refresh = True
                 else:
                     observation = composite_obs
-
-                if not args.headless:
-                    if real_obs is not None and show_real_windows:
-                        display_camera_images(real_obs, policy_config=policy.config, window_name_prefix="Real")
-                    if gemini_translator is not None and last_gemini_display_obs:
-                        display_camera_images(
-                            last_gemini_display_obs,
-                            policy_config=policy.config,
-                            window_name_prefix="Gemini",
-                        )
 
                 if hasattr(policy.config, 'language_features') and policy.config.language_features:
                     observation["observation.language"] = args.prompt
@@ -1757,33 +2179,106 @@ def main():
                                       else composite_obs[OBS_STATE])
 
                 obs_for_policy = observation
-                if (
-                    not args.policy_no_resize
-                    and args.policy_input_h > 0
-                    and args.policy_input_w > 0
-                ):
+                if resize_policy_images:
                     obs_for_policy = copy_observation_frame_with_resized_images(
                         observation, args.policy_input_h, args.policy_input_w
                     )
 
+                if gpt_translators is not None and gpt_obs_refresh:
+                    last_gpt_policy_display_obs = {
+                        k: np.ascontiguousarray(obs_for_policy[k].copy())
+                        for k in obs_for_policy
+                        if "image" in k.lower() and isinstance(obs_for_policy[k], np.ndarray)
+                    }
                 if turbo_translators is not None and turbo_obs_refresh:
                     last_turbo_policy_display_obs = {
                         k: np.ascontiguousarray(obs_for_policy[k].copy())
                         for k in obs_for_policy
                         if "image" in k.lower() and isinstance(obs_for_policy[k], np.ndarray)
                     }
+                if output_dir is not None and current_prediction_event_idx is not None:
+                    if gpt_obs_refresh and last_gpt_policy_display_obs is not None:
+                        prediction_event_panels.append(
+                            (
+                                "gpt",
+                                current_prediction_event_idx,
+                                step,
+                                build_prediction_event_panel(
+                                    "GPT",
+                                    composite_display_obs,
+                                    last_gpt_policy_display_obs,
+                                    tile_width=WINDOW_W,
+                                    tile_height=WINDOW_H,
+                                ),
+                            )
+                        )
+                    if turbo_obs_refresh and last_turbo_policy_display_obs is not None:
+                        prediction_event_panels.append(
+                            (
+                                "turbo",
+                                current_prediction_event_idx,
+                                step,
+                                build_prediction_event_panel(
+                                    "Turbo",
+                                    composite_display_obs,
+                                    last_turbo_policy_display_obs,
+                                    tile_width=WINDOW_W,
+                                    tile_height=WINDOW_H,
+                                ),
+                            )
+                        )
 
                 # Display resized policy input (same tensor as predict_action)
                 if not args.headless:
-                    display_camera_images(obs_for_policy, policy_config=policy.config, window_name_prefix="Composite")
+                    if gpt_translators is not None and last_gpt_policy_display_obs is not None:
+                        display_camera_images(
+                            last_gpt_policy_display_obs,
+                            policy_config=policy.config,
+                            window_name_prefix="GPT",
+                            episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                        )
                     if turbo_translators is not None and last_turbo_policy_display_obs is not None:
                         display_camera_images(
                             last_turbo_policy_display_obs,
                             policy_config=policy.config,
                             window_name_prefix="Turbo",
+                            episode_idx=next_saved_episode_idx if output_dir is not None else None,
                         )
+                if args.record and output_dir is not None:
+                    display_rows: list[tuple[str, dict | None]] = []
+                    if real_obs is not None and show_real_windows:
+                        display_rows.append(("Real", real_obs))
+                    display_rows.append(("Composite", composite_display_obs))
+                    if gpt_translators is not None:
+                        display_rows.append(("GPT", last_gpt_policy_display_obs))
+                    if turbo_translators is not None:
+                        display_rows.append(("Turbo", last_turbo_policy_display_obs))
+                    combined_rgb = build_combined_window_frame(
+                        display_rows,
+                        tile_width=WINDOW_W,
+                        tile_height=WINDOW_H,
+                    )
+                    combined_bgr = cv2.cvtColor(combined_rgb, cv2.COLOR_RGB2BGR)
+                    if episode_window_writer is None:
+                        if current_episode_output_dir is None:
+                            raise RuntimeError("Episode output directory was not reserved before recording.")
+                        episode_window_tmp_path = current_episode_output_dir / "combined_windows_tmp.mp4"
+                        episode_window_tmp_path.unlink(missing_ok=True)
+                        frame_h, frame_w = combined_bgr.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        episode_window_writer = cv2.VideoWriter(
+                            str(episode_window_tmp_path),
+                            fourcc,
+                            args.fps,
+                            (frame_w, frame_h),
+                        )
+                        if not episode_window_writer.isOpened():
+                            raise RuntimeError(f"Failed to open video writer for {episode_window_tmp_path}")
+                    episode_window_writer.write(combined_bgr)
 
                 with torch.inference_mode():
+                    if needs_prediction:
+                        prediction_events += 1
                     # print(observation["observation.state"])
                     action = predict_action(
                         obs_for_policy,
@@ -1819,19 +2314,26 @@ def main():
                     pass
 
             # ── Post-episode: save or discard ──
-            if events["stop_recording"]:
-                # print(f"\n[INFO] ESC pressed, stopping evaluation")
-                break
-
             if episode_discarded:
+                _finalize_episode_window_recording()
+                _delete_episode_output_dir(current_episode_output_dir)
+                current_episode_output_dir = None
+                next_saved_episode_idx = None
                 events["left_arrow"] = False
                 events["rerecord_episode"] = False
                 events["exit_early"] = False
                 # print(f">>> Episode {episode_idx} DISCARDED ({step} steps)")
+            elif events["stop_recording"] and not prediction_limit_reached:
+                _finalize_episode_window_recording()
+                # print(f"\n[INFO] ESC pressed, stopping evaluation")
+                break
             else:
                 events["right_arrow"] = False
                 events["exit_early"] = False
-                reason = "max steps reached" if step >= args.max_steps else "RIGHT pressed"
+                if prediction_limit_reached:
+                    reason = f"prediction limit reached ({_MAX_PREDICTION_EVENTS_PER_TRAJECTORY})"
+                else:
+                    reason = "max steps reached" if step >= args.max_steps else "RIGHT pressed"
                 saved_episodes.append({
                     "episode": episode_idx,
                     "steps": step,
@@ -1839,11 +2341,23 @@ def main():
                     "states": episode_states,
                 })
                 if output_dir is not None:
+                    if current_episode_output_dir is None:
+                        raise RuntimeError("Episode output directory was not reserved before saving.")
                     # Save episode data (states, actions, camera videos) to output directory
-                    ep_dir = output_dir / f"episode_{completed_episodes:03d}"
-                    ep_dir.mkdir(parents=True, exist_ok=True)
+                    ep_dir = current_episode_output_dir
                     np.save(str(ep_dir / "states.npy"), np.array(episode_states))
                     np.save(str(ep_dir / "actions.npy"), np.array(episode_actions))
+                    if prediction_event_panels:
+                        prediction_dir = ep_dir / "prediction_events"
+                        prediction_dir.mkdir(parents=True, exist_ok=True)
+                        for _mode_name, _event_idx, _step_idx, _panel_rgb in prediction_event_panels:
+                            _panel_path = prediction_dir / (
+                                f"{_mode_name}_prediction_event_{_event_idx:02d}_step_{_step_idx:04d}.png"
+                            )
+                            cv2.imwrite(
+                                str(_panel_path),
+                                cv2.cvtColor(_panel_rgb, cv2.COLOR_RGB2BGR),
+                            )
                     for _cam_key, _frames in episode_frames.items():
                         if not _frames:
                             continue
@@ -1856,7 +2370,14 @@ def main():
                             _writer.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
                         _writer.release()
                         # print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
-                    # print(f"[INFO] Episode data saved → {ep_dir}")
+                    if args.record:
+                        _finalize_episode_window_recording(ep_dir / "combined_windows.mp4")
+                    print(f"[INFO] Episode data saved ({reason}) → {ep_dir.resolve()}", flush=True)
+                    current_episode_output_dir = None
+                    next_saved_episode_idx = None
+                else:
+                    _finalize_episode_window_recording()
+                    print(f"[INFO] Episode completed ({reason}) with sim eval disk output disabled.", flush=True)
                 completed_episodes += 1
                 _save_note = "" if output_dir is not None else " (no disk save)"
                 # print(f">>> Episode {episode_idx} SAVED - {reason} "
@@ -1868,6 +2389,8 @@ def main():
         # print("\n[INFO] Interrupted by user")
         pass
     finally:
+        _finalize_episode_window_recording()
+        _delete_episode_output_dir(current_episode_output_dir)
         if listener is not None:
             listener.stop()
         if viewer_ctx is not None:

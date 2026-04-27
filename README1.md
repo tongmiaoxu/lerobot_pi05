@@ -289,12 +289,15 @@ python visual_match/compare_recorded_vs_mujoco.py
 ```
 
 Color Alignment:
-( --save-replay-frames: save every single frame under root/gs_render/stationary/frame_XXXX.png and {root}/gs_render/wrist/frame_XXXX.png )
+( --save-replay-frames: save every single frame under root/gs_render/stationary/frame_XXXX.png and {root}/gs_render/wrist/frame_XXXX.png; 
+--save-replay-frames-all-episodes;
+--auto-align-initial-objects)
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
 python visual_match/calibrate_color.py
 ```
 Deployment:
+(--auto-align-initial-objects)
 Set policy checkpoint, run
 ```bash
 lerobot-record
@@ -365,5 +368,11 @@ python -m sim2real.img2img_turbo.inference_paired \
 python visual_match/deploy_act_policy_mujoco.py \
   --turbo \
   --turbo-checkpoint-stationary outputs/turbo_place_high/checkpoints/model_10001.pkl \
-  --turbo-checkpoint-wrist outputs/turbo_place_wrist/checkpoints/model_10001.pkl \
+  --turbo-checkpoint-wrist outputs/turbo_place_wrist/checkpoints/model_10001.pkl
+```
+```bash
+python tools/query_gpt_image.py \
+  --input-image data_place_mug_copy/gs_render/stationary/frame_0000.png \
+  --style-image data_place_mug_copy/real_captures/stationary/frame_0000.png \
+  --prompt "Transfer style while preserving geometry."
 ```

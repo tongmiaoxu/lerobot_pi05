@@ -18,10 +18,41 @@ import sys
 import os
 import re
 import argparse
+import atexit
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
+
+# ============================================================================
+# Display/headless detection
+# ============================================================================
+def _detect_ssh_session() -> bool:
+    return any(os.environ.get(name) for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"))
+
+
+def _detect_local_display() -> bool:
+    if os.environ.get("DISPLAY"):
+        return True
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    if sys.platform in ("darwin", "win32"):
+        return True
+    return False
+
+
+def _detect_auto_headless() -> bool:
+    if sys.platform in ("darwin", "win32"):
+        return False
+    return _detect_ssh_session() or not _detect_local_display()
+
+
+_AUTO_HEADLESS = _detect_auto_headless()
+_HAS_DISPLAY = _detect_local_display() and not _AUTO_HEADLESS
+if _AUTO_HEADLESS and "MUJOCO_GL" not in os.environ:
+    os.environ["MUJOCO_GL"] = "egl"
+
+_RENDERERS_TO_CLOSE = []
 
 from camera_config import load_camera_config, set_mujoco_camera_from_config
 from composite_rendering import (
@@ -41,7 +72,7 @@ from composite_rendering import (
 _stationary_cfg = load_camera_config("stationary_cam")
 _wrist_cfg = load_camera_config("wrist_cam")
 SAVE_CALIB_FRAMES = [20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200]
-_DEFAULT_EPISODE = 1
+_DEFAULT_EPISODE = 94
 CAMERA_CONFIG = {
     "stationary": {
         "dataset_cam": "cam_high",
@@ -54,24 +85,6 @@ CAMERA_CONFIG = {
         "config": _wrist_cfg,
     },
 }
-
-# ============================================================================
-# Display detection
-# ============================================================================
-def _detect_display():
-    if os.environ.get("DISPLAY"):
-        return True
-    if os.environ.get("WAYLAND_DISPLAY"):
-        return True
-    if sys.platform in ("darwin", "win32"):
-        return True
-    return False
-
-_HAS_DISPLAY = _detect_display()
-# Only exit when run as main (not when imported by deploy_act_policy_mujoco --headless)
-if not _HAS_DISPLAY and __name__ == "__main__":
-    print("[ERROR] This script requires a display for visualization")
-    sys.exit(1)
 
 import numpy as np
 import torch
@@ -99,8 +112,15 @@ from lerobot.tasks import get_task_profile, get_task_profiles, resolve_task_scen
 # xArm conversion (imported from shared utils)
 # ============================================================================
 from lerobot_mujoco_utils import GRIPPER_OPEN_MM, lerobot_state_to_mujoco_ctrl
+from object_pose_auto_align import (
+    ObjectPoseAlignConfig,
+    apply_object_poses,
+    auto_align_object_poses,
+    capture_object_poses,
+    selection_object_names,
+)
 
-_DEFAULT_RECORD_TASK_ID ="hang_mug"  # Keep in sync with lerobot-record defaults.
+_DEFAULT_RECORD_TASK_ID ="place_mug"  # Keep in sync with lerobot-record defaults.
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -395,6 +415,559 @@ def load_episode(dataset_path: str, episode_idx: int, dataset_root: str | None =
     }
 
 
+def load_episode_camera_frames(episode_data: dict, render_w: int, render_h: int) -> tuple[dict, int]:
+    episode_idx = episode_data["episode_index"]
+    num_frames = episode_data["num_frames"]
+    dataset = episode_data["dataset"]
+    ep_meta = dataset.meta.episodes[episode_idx]
+    video_fps = dataset.fps
+    relative_timestamps = [i / video_fps for i in range(num_frames)]
+
+    cam_frames = {}
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        dataset_cam = cam_cfg["dataset_cam"]
+        camera_key = f"observation.images.{dataset_cam}"
+        try:
+            video_path_rel = dataset.meta.get_video_file_path(episode_idx, camera_key)
+            video_path = dataset.root / video_path_rel
+            if not video_path.exists():
+                print(f"[WARN] Video not found for episode {episode_idx}, {cam_key}: {video_path}")
+                cam_frames[cam_key] = []
+                continue
+            print(f"[INFO] Loading episode {episode_idx} {cam_key} camera video: {video_path}")
+            from_timestamp = ep_meta.get(f"videos/{camera_key}/from_timestamp", 0.0)
+            absolute_timestamps = [from_timestamp + ts for ts in relative_timestamps]
+            frames_tensor = decode_video_frames(
+                video_path, absolute_timestamps, tolerance_s=1e-4, backend="pyav"
+            )
+            frames_list = []
+            for i in range(frames_tensor.shape[0]):
+                frame = frames_tensor[i].permute(1, 2, 0).cpu().numpy()
+                frame = (frame * 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                if frame_bgr.shape[:2] != (render_h, render_w):
+                    frame_bgr = cv2.resize(frame_bgr, (render_w, render_h))
+                frames_list.append(frame_bgr)
+            cam_frames[cam_key] = frames_list
+            print(f"[INFO] Loaded {len(frames_list)} frames for episode {episode_idx}, {cam_key}")
+        except Exception as e:
+            print(f"[WARN] Failed to load episode {episode_idx} {cam_key} camera: {e}")
+            cam_frames[cam_key] = []
+
+    video_frame_count = max(len(cam_frames.get(k, [])) for k in CAMERA_CONFIG)
+    return cam_frames, max(video_frame_count, num_frames)
+
+
+def set_robot_to_ctrl_frame(model, data, ctrl: np.ndarray):
+    data.ctrl[:] = ctrl
+    data.qpos[:7] = ctrl[:7]
+    data.qpos[7] = ctrl[7] / 255.0 * 0.85
+    data.qvel[:8] = 0
+    mujoco.mj_forward(model, data)
+
+
+def force_robot_ctrl_frame(model, data, ctrl: np.ndarray, qvel: np.ndarray | None = None):
+    data.qpos[:7] = ctrl[:7]
+    data.qpos[7] = ctrl[7] / 255.0 * 0.85
+    if qvel is None:
+        data.qvel[:8] = 0
+    else:
+        data.qvel[:8] = qvel
+    mujoco.mj_forward(model, data)
+
+
+def copy_physics_object_state_for_exact_robot_render(
+    model,
+    render_data,
+    physics_data,
+    exact_ctrl: np.ndarray,
+):
+    render_data.time = physics_data.time
+    render_data.qpos[:] = physics_data.qpos
+    render_data.qvel[:] = physics_data.qvel
+    render_data.ctrl[:] = physics_data.ctrl
+    force_robot_ctrl_frame(model, render_data, exact_ctrl)
+
+
+def build_replay_ctrl_sequence(
+    observations_raw: np.ndarray,
+    actions_raw: np.ndarray,
+    gripper_mj_range: tuple[float, float],
+    replay_source: str,
+) -> np.ndarray:
+    if replay_source == "action":
+        source = actions_raw
+    elif replay_source == "observation":
+        source = observations_raw
+    else:
+        raise ValueError(f"Unsupported replay_source: {replay_source}")
+    return np.array([
+        lerobot_state_to_mujoco_ctrl(source[i], gripper_mj_range)
+        for i in range(len(source))
+    ])
+
+
+def delayed_ctrl_index(frame_idx: int, delay_frames: int) -> int:
+    return max(0, frame_idx - max(0, int(delay_frames)))
+
+
+def register_renderer(renderer):
+    _RENDERERS_TO_CLOSE.append(renderer)
+    return renderer
+
+
+def close_renderer_quietly(renderer):
+    if renderer is None:
+        return
+    try:
+        renderer.close()
+    except Exception:
+        pass
+    try:
+        _RENDERERS_TO_CLOSE.remove(renderer)
+    except ValueError:
+        pass
+
+
+def close_registered_renderers():
+    for renderer in reversed(_RENDERERS_TO_CLOSE[:]):
+        close_renderer_quietly(renderer)
+
+
+atexit.register(close_registered_renderers)
+
+
+def advance_forced_robot_dynamics(
+    model,
+    data,
+    prev_exact_ctrl: np.ndarray,
+    target_exact_ctrl: np.ndarray,
+    sim_ctrl: np.ndarray,
+    fps: float,
+):
+    frame_dt = 1.0 / fps
+    mj_dt = float(model.opt.timestep)
+    num_substeps = max(1, int(np.ceil(frame_dt / mj_dt)))
+
+    prev_qpos = np.empty(8, dtype=np.float64)
+    target_qpos = np.empty(8, dtype=np.float64)
+    prev_qpos[:7] = prev_exact_ctrl[:7]
+    target_qpos[:7] = target_exact_ctrl[:7]
+    prev_qpos[7] = prev_exact_ctrl[7] / 255.0 * 0.85
+    target_qpos[7] = target_exact_ctrl[7] / 255.0 * 0.85
+    robot_qvel = (target_qpos - prev_qpos) / frame_dt
+
+    data.ctrl[:] = sim_ctrl
+    for step_idx in range(num_substeps):
+        u = (step_idx + 1) / num_substeps
+        interp_qpos = (1.0 - u) * prev_qpos + u * target_qpos
+        data.qpos[:8] = interp_qpos
+        data.qvel[:8] = robot_qvel
+        mujoco.mj_forward(model, data)
+        mujoco.mj_step(model, data)
+
+    force_robot_ctrl_frame(model, data, target_exact_ctrl)
+
+def render_camera_frames(
+    model,
+    data,
+    renderer,
+    seg_renderer,
+    robot_geom_ids,
+    camera_intrinsics,
+    scene_data,
+    scene_depth_data,
+    gaussian_available,
+    viz_cfg,
+    cam_frames,
+    frame_idx: int,
+    render_w: int,
+    render_h: int,
+    alpha: float,
+    color_calib=None,
+    color_calibrate: bool = False,
+) -> dict:
+    cam_renders = {}
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        mujoco_cam = cam_cfg["mujoco_cam"]
+        frames_list = cam_frames.get(cam_key, [])
+        recorded_frame = (frames_list[frame_idx].copy()
+                          if frame_idx < len(frames_list)
+                          else np.zeros((render_h, render_w, 3), dtype=np.uint8))
+
+        renderer.update_scene(data, camera=mujoco_cam)
+        fg_rgb = renderer.render()
+        fg_bgr = cv2.cvtColor(fg_rgb, cv2.COLOR_RGB2BGR)
+
+        seg_renderer.update_scene(data, camera=mujoco_cam)
+        seg_mask = seg_renderer.render()
+        seg_labels = seg_mask[:, :, 0].astype(np.int32)
+
+        K_cam = camera_intrinsics[cam_key]
+        fg_bgr = shift_for_principal_point(fg_bgr, K_cam)
+        seg_labels = shift_for_principal_point(seg_labels, K_cam, seg=True)
+
+        robot_mask = np.isin(seg_labels, list(robot_geom_ids))
+        mask_uint8 = (robot_mask.astype(np.uint8)) * 255
+
+        if gaussian_available and scene_data is not None:
+            try:
+                camera_pose = get_mujoco_camera_pose(model, data, mujoco_cam)
+                w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
+                bg_im = render(w2c, camera_intrinsics[cam_key],
+                               scene_data, scene_depth_data, viz_cfg)[0]
+                bg_np = bg_im.permute(1, 2, 0).cpu().numpy()
+                bg_np = (bg_np * 255).astype(np.uint8)
+                bg_bgr = cv2.cvtColor(bg_np, cv2.COLOR_RGB2BGR)
+                composite_frame = bg_bgr.copy()
+                composite_frame[mask_uint8 > 0] = fg_bgr[mask_uint8 > 0]
+                composite_raw = composite_frame.copy()
+                if color_calibrate and color_calib is not None:
+                    composite_frame = apply_color_transform(composite_frame, color_calib)
+            except Exception as e:
+                if frame_idx == 0:
+                    print(f"[WARN] {cam_key} Gaussian rendering failed: {e}")
+                composite_frame = fg_bgr.copy()
+                composite_raw = composite_frame.copy()
+        else:
+            composite_frame = fg_bgr.copy()
+            composite_raw = composite_frame.copy()
+
+        alpha_blend = cv2.addWeighted(composite_raw, alpha, recorded_frame, 1.0 - alpha, 0)
+
+        alpha_mask = (mask_uint8 / 255.0).astype(np.float32)
+        alpha_mask_3ch = np.stack([alpha_mask] * 3, axis=-1)
+        foreground = fg_bgr.astype(np.float32)
+        background = recorded_frame.astype(np.float32)
+        blended = (alpha * foreground + (1 - alpha) * background) * alpha_mask_3ch + \
+                  background * (1 - alpha_mask_3ch)
+        alpha_frame = blended.astype(np.uint8)
+
+        cam_renders[cam_key] = {
+            "recorded": recorded_frame,
+            "mujoco": fg_bgr.copy(),
+            "composite": composite_frame,
+            "composite_raw": composite_raw,
+            "alpha": alpha_frame,
+            "alpha_blend": alpha_blend,
+        }
+    return cam_renders
+
+
+def export_all_episode_replay_frames(args, task_profile):
+    render_w, render_h = 640, 480
+    first_episode = load_episode(args.dataset_path, 0, dataset_root=args.dataset_root)
+    total_episodes = first_episode["dataset"].meta.total_episodes
+    print(f"[INFO] --save-replay-frames-all-episodes: exporting {total_episodes} episodes")
+    print("[INFO] Headless batch mode: no OpenCV image windows, MuJoCo viewer, or Open3D viewer will be opened")
+
+    project_root = Path(__file__).parent.parent
+    xarm_dir = project_root / "xarm7"
+    scene_xml_path = resolve_task_scene_xml(args.task_id, xarm_dir)
+    print(f"[INFO] Using MuJoCo scene for task {args.task_id!r}: {scene_xml_path.name}")
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(str(xarm_dir))
+        model = MjModel.from_xml_path(scene_xml_path.name)
+    finally:
+        os.chdir(original_cwd)
+
+    data = MjData(model)
+    physics_data = MjData(model)
+    try:
+        home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+        mujoco.mj_resetDataKeyframe(model, data, home_id)
+        mujoco.mj_resetDataKeyframe(model, physics_data, home_id)
+    except Exception:
+        mujoco.mj_resetData(model, data)
+        mujoco.mj_resetData(model, physics_data)
+
+    gripper_act_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
+    gripper_mj_range = (
+        model.actuator_ctrlrange[gripper_act_id, 0],
+        model.actuator_ctrlrange[gripper_act_id, 1],
+    )
+    print(f"[INFO] Gripper ctrl range: [{gripper_mj_range[0]}, {gripper_mj_range[1]}]")
+
+    cma_delay_frames = None
+    if args.cma:
+        import pickle
+        with open(args.cma_params, "rb") as f:
+            cma_result = pickle.load(f)
+        cma_delay_frames = cma_result.get("best_delay_frames")
+        xbest = cma_result["xbest"]
+        kp = xbest[:7]
+        act_damp = xbest[7:14]
+        jnt_damp = xbest[14:]
+        model.actuator_gainprm[:7, 0] = kp
+        model.actuator_biasprm[:7, 1] = -kp
+        model.actuator_biasprm[:7, 2] = -act_damp
+        model.dof_damping[:7] = jnt_damp
+        print(f"[INFO] Applied CMA-ES params from {args.cma_params}")
+        if cma_delay_frames is not None:
+            print(f"[INFO] CMA result best_delay_frames={cma_delay_frames}")
+
+    mug_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
+    if mug_jnt_id >= 0:
+        mug_dof_addr = model.jnt_dofadr[mug_jnt_id]
+        model.dof_damping[mug_dof_addr:mug_dof_addr + 6] = 100
+        print(f"[INFO] Set mug freejoint dof_damping=100 (DOFs {mug_dof_addr}:{mug_dof_addr+6})")
+
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        K = cam_cfg["config"]["intrinsics"]
+        fy = K[1, 1]
+        correct_fovy = float(2.0 * np.degrees(np.arctan(render_h / (2.0 * fy))))
+        mj_cam = cam_cfg["mujoco_cam"]
+        cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, mj_cam)
+        if cid >= 0:
+            old_fovy = model.cam_fovy[cid]
+            model.cam_fovy[cid] = correct_fovy
+            print(f"[INFO] Corrected fovy for '{mj_cam}': {old_fovy:.2f}° → {correct_fovy:.2f}°")
+
+    renderer = register_renderer(mujoco.Renderer(model, height=render_h, width=render_w))
+    seg_renderer = register_renderer(mujoco.Renderer(model, height=render_h, width=render_w))
+    seg_renderer.enable_segmentation_rendering()
+
+    robot_geom_ids = get_robot_geom_ids(model)
+    print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
+
+    auto_align_config = None
+    default_auto_object_poses = None
+    if args.auto_align_initial_objects:
+        auto_align_config = ObjectPoseAlignConfig(
+            initial_states_dir=args.initial_states_dir,
+            object_name=args.object_name,
+            cache_dir=args.auto_align_cache_dir,
+            optimize_z=args.auto_align_optimize_z,
+            force=args.auto_align_force,
+        )
+        default_auto_object_poses = capture_object_poses(
+            model,
+            data,
+            selection_object_names(args.object_name),
+        )
+
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        if cam_cfg["config"].get("type", "stationary") == "wrist":
+            set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+    mujoco.mj_forward(model, data)
+    for cam_key, cam_cfg in CAMERA_CONFIG.items():
+        if cam_cfg["config"].get("type", "stationary") == "stationary":
+            set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+
+    camera_intrinsics = {
+        cam_key: cam_cfg["config"]["intrinsics"]
+        for cam_key, cam_cfg in CAMERA_CONFIG.items()
+    }
+
+    scene_data = None
+    scene_depth_data = None
+    gaussian_available = False
+    if os.path.exists(args.scene_path):
+        try:
+            from diff_gaussian_rasterization import GaussianRasterizer
+            init_pose = get_mujoco_camera_pose(model, data, "stationary_cam")
+            w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
+            scene_data, scene_depth_data, _ = load_scene_data(
+                args.scene_path, w2c_init, camera_intrinsics["stationary"]
+            )
+            gaussian_available = True
+            print(f"[INFO] Loaded Gaussian Splatting scene from: {args.scene_path}")
+        except ImportError:
+            print("[WARN] diff_gaussian_rasterization not installed. Composite = MuJoCo only.")
+        except Exception as e:
+            print(f"[WARN] Failed to load Gaussian Splatting: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"[WARN] Scene file not found: {args.scene_path}")
+
+    color_calib = None
+    stationary_color_calib = task_profile.color_calibration_path("stationary")
+    if args.color_calibrate and stationary_color_calib.exists():
+        color_calib = load_color_mapping(str(stationary_color_calib))
+        print(f"[INFO] Loaded default color calibration from: {stationary_color_calib}")
+
+    camera_adjust_delta = None
+    if args.load_camera_adjust:
+        adjust_path = Path(args.open3d_cam_save_path)
+        if adjust_path.exists():
+            camera_adjust_delta = np.load(str(adjust_path))
+            print(f"[INFO] Loaded camera adjustment delta from: {adjust_path}")
+        else:
+            print(f"[WARN] --load-camera-adjust set but file not found: {adjust_path}")
+    if auto_align_config is not None:
+        auto_align_config.camera_adjust_delta = camera_adjust_delta
+
+    viz_cfg = {'viz_w': render_w, 'viz_h': render_h, 'viz_near': 0.1, 'viz_far': 10.0}
+    export_root = Path(args.replay_export_root)
+    alpha_root = export_root / "alpha blending"
+    print(f"[INFO] Writing real captures to: {export_root / 'real_captures'}")
+    print(f"[INFO] Writing renders to: {export_root / 'gs_render'}")
+    print(f"[INFO] Writing alpha blends to: {alpha_root}")
+
+    for episode_idx in range(total_episodes):
+        episode_data = first_episode if episode_idx == 0 else load_episode(
+            args.dataset_path, episode_idx, dataset_root=args.dataset_root
+        )
+        actions_raw = episode_data["action"].numpy()
+        observations_raw = episode_data["observation.state"].numpy()
+        num_frames = len(observations_raw)
+        exact_ctrl_sequence = np.array([
+            lerobot_state_to_mujoco_ctrl(observations_raw[i], gripper_mj_range)
+            for i in range(num_frames)
+        ])
+        dynamics_ctrl_sequence = build_replay_ctrl_sequence(
+            observations_raw,
+            actions_raw,
+            gripper_mj_range,
+            args.replay_source,
+        )
+        if args.control_delay_frames is not None:
+            control_delay_frames = args.control_delay_frames
+        elif args.replay_source == "action" and cma_delay_frames is not None:
+            control_delay_frames = int(cma_delay_frames)
+        else:
+            control_delay_frames = 0
+        cam_frames, video_frame_count = load_episode_camera_frames(episode_data, render_w, render_h)
+        frame_count = min(num_frames, video_frame_count)
+        episode_dir = f"episode_{episode_idx:06d}"
+        aligned_pose_result = None
+
+        if auto_align_config is not None and frame_count > 0:
+            try:
+                home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+                mujoco.mj_resetDataKeyframe(model, data, home_id)
+            except Exception:
+                mujoco.mj_resetData(model, data)
+            if default_auto_object_poses is not None:
+                apply_object_poses(model, data, default_auto_object_poses)
+            set_robot_to_ctrl_frame(model, data, exact_ctrl_sequence[0])
+            for cam_key, cam_cfg in CAMERA_CONFIG.items():
+                if cam_cfg["config"].get("type", "stationary") == "stationary":
+                    set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+            if camera_adjust_delta is not None:
+                cam_name = CAMERA_CONFIG["stationary"]["mujoco_cam"]
+                cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+                adjusted = get_mujoco_camera_pose(model, data, cam_name) @ camera_adjust_delta
+                data.cam_xpos[cam_id] = adjusted[:3, 3]
+                data.cam_xmat[cam_id] = adjusted[:3, :3].flatten()
+            try:
+                aligned_pose_result = auto_align_object_poses(
+                    model=model,
+                    data=data,
+                    seg_renderer=seg_renderer,
+                    camera_config=CAMERA_CONFIG,
+                    config=auto_align_config,
+                    episode_idx=episode_idx,
+                    apply=True,
+                )
+                iou_text = ", ".join(
+                    f"{name} IoU={iou:.3f}" for name, iou in aligned_pose_result.iou_by_object.items()
+                )
+                print(
+                    f"[INFO] Auto-aligned episode {episode_idx}: "
+                    f"loss={aligned_pose_result.loss:.4f} {iou_text}"
+                )
+            except Exception as exc:
+                print(f"[WARN] Auto-align failed for episode {episode_idx}: {exc}")
+
+        for cam_key in CAMERA_CONFIG:
+            (export_root / "gs_render" / episode_dir / cam_key).mkdir(parents=True, exist_ok=True)
+            (export_root / "real_captures" / episode_dir / cam_key).mkdir(parents=True, exist_ok=True)
+        (alpha_root / episode_dir).mkdir(parents=True, exist_ok=True)
+
+        try:
+            home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+            mujoco.mj_resetDataKeyframe(model, data, home_id)
+            mujoco.mj_resetDataKeyframe(model, physics_data, home_id)
+        except Exception:
+            mujoco.mj_resetData(model, data)
+            mujoco.mj_resetData(model, physics_data)
+        if aligned_pose_result is not None:
+            apply_object_poses(model, data, aligned_pose_result.poses)
+            apply_object_poses(model, physics_data, aligned_pose_result.poses)
+        elif default_auto_object_poses is not None:
+            apply_object_poses(model, data, default_auto_object_poses)
+            apply_object_poses(model, physics_data, default_auto_object_poses)
+        set_robot_to_ctrl_frame(model, data, exact_ctrl_sequence[0])
+        set_robot_to_ctrl_frame(model, physics_data, exact_ctrl_sequence[0])
+
+        print(
+            f"[INFO] Exporting episode {episode_idx}/{total_episodes - 1}: {frame_count} frames "
+            f"(physics replay object state + exact robot render, replay_source={args.replay_source}, "
+            f"control_delay_frames={control_delay_frames})"
+        )
+        for frame_idx in range(frame_count):
+            if frame_idx > 0:
+                ctrl_idx = delayed_ctrl_index(frame_idx, control_delay_frames)
+                physics_data.ctrl[:] = dynamics_ctrl_sequence[ctrl_idx]
+                sim_target = physics_data.time + 1.0 / args.fps
+                while physics_data.time < sim_target:
+                    mujoco.mj_step(model, physics_data)
+                copy_physics_object_state_for_exact_robot_render(
+                    model,
+                    data,
+                    physics_data,
+                    exact_ctrl_sequence[frame_idx],
+                )
+            else:
+                copy_physics_object_state_for_exact_robot_render(
+                    model,
+                    data,
+                    physics_data,
+                    exact_ctrl_sequence[frame_idx],
+                )
+
+            for cam_key, cam_cfg in CAMERA_CONFIG.items():
+                if cam_cfg["config"].get("type", "stationary") == "stationary":
+                    set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+            if camera_adjust_delta is not None:
+                cam_name = CAMERA_CONFIG["stationary"]["mujoco_cam"]
+                cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+                adjusted = get_mujoco_camera_pose(model, data, cam_name) @ camera_adjust_delta
+                data.cam_xpos[cam_id] = adjusted[:3, 3]
+                data.cam_xmat[cam_id] = adjusted[:3, :3].flatten()
+
+            cam_renders = render_camera_frames(
+                model=model,
+                data=data,
+                renderer=renderer,
+                seg_renderer=seg_renderer,
+                robot_geom_ids=robot_geom_ids,
+                camera_intrinsics=camera_intrinsics,
+                scene_data=scene_data,
+                scene_depth_data=scene_depth_data,
+                gaussian_available=gaussian_available,
+                viz_cfg=viz_cfg,
+                cam_frames=cam_frames,
+                frame_idx=frame_idx,
+                render_w=render_w,
+                render_h=render_h,
+                alpha=args.alpha,
+                color_calib=color_calib,
+                color_calibrate=args.color_calibrate,
+            )
+
+            for cam_key, rend in cam_renders.items():
+                cv2.imwrite(
+                    str(export_root / "gs_render" / episode_dir / cam_key / f"frame_{frame_idx:04d}.png"),
+                    rend["composite_raw"],
+                )
+                cv2.imwrite(
+                    str(export_root / "real_captures" / episode_dir / cam_key / f"frame_{frame_idx:04d}.png"),
+                    rend["recorded"],
+                )
+                cv2.imwrite(
+                    str(alpha_root / episode_dir / f"{cam_key}_frame_{frame_idx:04d}.png"),
+                    rend["alpha_blend"],
+                )
+
+    close_renderer_quietly(seg_renderer)
+    close_renderer_quietly(renderer)
+    print("[INFO] All-episode frame-aligned export finished")
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -408,7 +981,7 @@ def parse_args():
                    help="Path to dataset directory (local) or repo_id (Hub). Defaults to the selected task dataset root.")
     p.add_argument("--dataset-root", type=str, default=None)
     p.add_argument("--episode", type=int, default=_DEFAULT_EPISODE)
-    p.add_argument("--fps", type=float, default=60.0)
+    p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--scene-path", type=str, default="pointclouds/xarm7_black.npz",
                    help="Path to Gaussian Splatting scene file")
     p.add_argument("--alpha", type=float, default=0.5,
@@ -422,13 +995,27 @@ def parse_args():
     p.add_argument("--save-replay-frames", action="store_true",
                    help="Every replay frame: save composite_raw under <root>/gs_render/{stationary,wrist}/ "
                         "and recorded video under <root>/real_captures/{stationary,wrist}/")
+    p.add_argument("--save-replay-frames-all-episodes", action="store_true",
+                   help="Headless batch export of every episode. Runs a normal physics replay for object state, "
+                        "then renders with the robot snapped to each recorded state before saving. "
+                        "Does not open image windows, MuJoCo viewer, or Open3D viewer. "
+                        "Saves under <root>/gs_render/episode_*/{stationary,wrist}/, "
+                        "<root>/real_captures/episode_*/{stationary,wrist}/, and <root>/alpha blending/episode_*/.")
+    p.add_argument("--headless", action="store_true",
+                   help="Disable OpenCV image windows, MuJoCo viewer, and Open3D viewer. "
+                        "Automatically enabled on SSH sessions or when no local display is available.")
     p.add_argument("--replay-export-root", type=str, default=None,
-                   help="Root directory used with --save-replay-frames "
+                   help="Root directory used with --save-replay-frames or --save-replay-frames-all-episodes "
                         "(default: selected task's dataset_root_480640 from task_profiles)")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
                    help="Apply CMA-ES optimised parameters to the model.")
+    p.add_argument("--replay-source", choices=["observation", "action"], default="observation",
+                   help="Use observation.state or action as the physics replay control stream.")
+    p.add_argument("--control-delay-frames", type=int, default=None,
+                   help="Fixed command delay in frames. If omitted with --replay-source action, "
+                        "uses best_delay_frames from --cma-params when available; otherwise 0.")
     p.add_argument("--no-mujoco-view", action="store_true",
                    help="Disable the MuJoCo 3D interactive viewer window")
     p.add_argument("--open3d-cam-view", action="store_true",
@@ -439,12 +1026,35 @@ def parse_args():
                    help="Path to save camera adjustment delta transform (.npy)")
     p.add_argument("--load-camera-adjust", action="store_true",
                    help="Load camera adjustment delta from --open3d-cam-save-path if it exists")
+    p.add_argument("--initial-states-dir", type=str, default=None,
+                   help="Dataset root containing <object>/individual_masks for automatic object alignment.")
+    p.add_argument("--object-name", type=str, default=None,
+                   help="Object name(s) matching initial-state masks, e.g. 'mug' or 'mug, saucer'.")
+    p.add_argument("--auto-align-initial-objects", action="store_true", default=True,
+                   help="Optimize MuJoCo initial object poses against saved SAM masks before replay export.")
+    p.add_argument("--auto-align-cache-dir", type=str, default=None,
+                   help="Directory for cached auto-aligned object poses. Defaults to <initial-states-dir>/auto_object_poses.")
+    p.add_argument("--auto-align-force", action="store_true",
+                   help="Recompute automatic object alignment even if cached poses exist.")
+    p.add_argument("--auto-align-optimize-z", action="store_true",
+                   help="Also optimize object Z. By default only XY and yaw are optimized.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     task_profile = get_task_profile(args.task_id)
+    if _AUTO_HEADLESS and not args.headless:
+        reason = "SSH session" if _detect_ssh_session() else "no local display"
+        print(f"[INFO] Auto-enabled headless mode ({reason} detected)")
+        args.headless = True
+    if args.headless:
+        args.no_mujoco_view = True
+        args.open3d_cam_view = False
+        args.no_stack = True
+    if not _HAS_DISPLAY and not args.headless and not args.save_replay_frames_all_episodes:
+        print("[ERROR] This script requires a display for visualization; use --headless to disable viewers")
+        sys.exit(1)
     if args.replay_export_root is None:
         args.replay_export_root = task_profile.dataset_root_480640
     stationary_calib_dir = task_profile.calibration_pairs_dir("stationary")
@@ -452,6 +1062,14 @@ def main():
     stationary_color_calib = task_profile.color_calibration_path("stationary")
     if args.dataset_path is None:
         args.dataset_path = task_profile.dataset_root_480640
+    if args.initial_states_dir is None:
+        args.initial_states_dir = task_profile.dataset_root
+    if args.object_name is None:
+        args.object_name = task_profile.selection_object_name
+
+    if args.save_replay_frames_all_episodes:
+        export_all_episode_replay_frames(args, task_profile)
+        return
 
     # Load dataset
     episode_data = load_episode(args.dataset_path, args.episode, dataset_root=args.dataset_root)
@@ -562,8 +1180,8 @@ def main():
             model.cam_fovy[cid] = correct_fovy
             print(f"[INFO] Corrected fovy for '{mj_cam}': {old_fovy:.2f}° → {correct_fovy:.2f}°")
 
-    renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
-    seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
+    renderer = register_renderer(mujoco.Renderer(model, height=RENDER_H, width=RENDER_W))
+    seg_renderer = register_renderer(mujoco.Renderer(model, height=RENDER_H, width=RENDER_W))
     seg_renderer.enable_segmentation_rendering()
 
     robot_geom_ids = get_robot_geom_ids(model)
@@ -664,7 +1282,7 @@ def main():
     # When --load-camera-adjust is used without --open3d-cam-view, still apply
     # the delta to the first stationary camera each frame.
     if _loaded_delta is not None and not o3d_cam_keys:
-        o3d_cam_keys = ["stationary"]
+        o3d_cam_keys = ["wrist"]
 
     for _ck in o3d_cam_keys:
         o3d_cam_user_delta[_ck] = _loaded_delta.copy() if _loaded_delta is not None else np.eye(4)
@@ -726,6 +1344,35 @@ def main():
     mujoco.mj_forward(model, data)
     print("[INFO] Initialized sim from dataset first frame (aligned with replay start)")
 
+    if args.auto_align_initial_objects:
+        try:
+            align_config = ObjectPoseAlignConfig(
+                initial_states_dir=args.initial_states_dir,
+                object_name=args.object_name,
+                cache_dir=args.auto_align_cache_dir,
+                optimize_z=args.auto_align_optimize_z,
+                force=args.auto_align_force,
+                camera_adjust_delta=_loaded_delta,
+            )
+            align_result = auto_align_object_poses(
+                model=model,
+                data=data,
+                seg_renderer=seg_renderer,
+                camera_config=CAMERA_CONFIG,
+                config=align_config,
+                episode_idx=args.episode,
+                apply=True,
+            )
+            iou_text = ", ".join(
+                f"{name} IoU={iou:.3f}" for name, iou in align_result.iou_by_object.items()
+            )
+            print(
+                f"[INFO] Auto-aligned episode {args.episode}: "
+                f"loss={align_result.loss:.4f} {iou_text}"
+            )
+        except Exception as exc:
+            print(f"[WARN] Auto-align failed for episode {args.episode}: {exc}")
+
     # Create windows — 2 rows: stationary + wrist, 4 columns: recorded, mujoco, composite, alpha
     # When --no-mujoco-view: only wrist alpha, fullscreen
     win_stat_rec = "Stationary - Recorded"
@@ -737,24 +1384,27 @@ def main():
     win_wrist_comp = "Wrist - Composite"
     win_wrist_alpha = "Wrist - Alpha"
 
-    WINDOW_W, WINDOW_H = 400, 300
-    for win in [win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha,
-                win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha]:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
+    if not args.headless:
+        WINDOW_W, WINDOW_H = 400, 300
+        for win in [win_stat_rec, win_stat_mj, win_stat_comp, win_stat_alpha,
+                    win_wrist_rec, win_wrist_mj, win_wrist_comp, win_wrist_alpha]:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win, WINDOW_W, WINDOW_H)
 
-    X_START, Y_START = 50, 30
-    X_STEP, Y_STEP = 410, 340
-    cv2.moveWindow(win_stat_rec, X_START, Y_START)
-    cv2.moveWindow(win_stat_comp, X_START + X_STEP, Y_START)
-    cv2.moveWindow(win_stat_mj, X_START + 2 * X_STEP, Y_START)
-    cv2.moveWindow(win_stat_alpha, X_START + 3 * X_STEP, Y_START)
-    cv2.moveWindow(win_wrist_rec, X_START, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_comp, X_START + X_STEP, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_mj, X_START + 2 * X_STEP, Y_START + Y_STEP)
-    cv2.moveWindow(win_wrist_alpha, X_START + 3 * X_STEP, Y_START + Y_STEP)
+        X_START, Y_START = 50, 30
+        X_STEP, Y_STEP = 410, 340
+        cv2.moveWindow(win_stat_rec, X_START, Y_START)
+        cv2.moveWindow(win_stat_comp, X_START + X_STEP, Y_START)
+        cv2.moveWindow(win_stat_mj, X_START + 2 * X_STEP, Y_START)
+        cv2.moveWindow(win_stat_alpha, X_START + 3 * X_STEP, Y_START)
+        cv2.moveWindow(win_wrist_rec, X_START, Y_START + Y_STEP)
+        cv2.moveWindow(win_wrist_comp, X_START + X_STEP, Y_START + Y_STEP)
+        cv2.moveWindow(win_wrist_mj, X_START + 2 * X_STEP, Y_START + Y_STEP)
+        cv2.moveWindow(win_wrist_alpha, X_START + 3 * X_STEP, Y_START + Y_STEP)
 
-    print("[INFO] Starting playback (q=quit, SPACE=pause, +/-=alpha). Click an OpenCV video window for key input.")
+        print("[INFO] Starting playback (q=quit, SPACE=pause, +/-=alpha). Click an OpenCV video window for key input.")
+    else:
+        print("[INFO] Headless playback: OpenCV windows, MuJoCo viewer, and Open3D viewer are disabled")
     alpha = args.alpha
 
     # FK comparison setup
@@ -1090,17 +1740,18 @@ def main():
                         print(f"[WARN] FK overlay failed: {e}")
 
             # Display
-            for cam_key, (w_rec, w_mj, w_comp, w_alpha) in window_map.items():
-                cv2.imshow(w_rec, cam_renders[cam_key]["recorded"])
-                cv2.imshow(w_mj, cam_renders[cam_key]["mujoco"])
-                cv2.imshow(w_comp, cam_renders[cam_key]["composite"])
-                cv2.imshow(w_alpha, cam_renders[cam_key]["alpha"])
+            if not args.headless:
+                for cam_key, (w_rec, w_mj, w_comp, w_alpha) in window_map.items():
+                    cv2.imshow(w_rec, cam_renders[cam_key]["recorded"])
+                    cv2.imshow(w_mj, cam_renders[cam_key]["mujoco"])
+                    cv2.imshow(w_comp, cam_renders[cam_key]["composite"])
+                    cv2.imshow(w_alpha, cam_renders[cam_key]["alpha"])
 
             if not paused:
                 frame_idx += 1
 
             # When paused, wait longer for key input (focus must be on an OpenCV window)
-            key = cv2.waitKey(100 if paused else frame_delay) & 0xFF
+            key = -1 if args.headless else (cv2.waitKey(100 if paused else frame_delay) & 0xFF)
             if key == ord('q'):
                 print("[INFO] Quit requested")
                 break
@@ -1215,6 +1866,8 @@ def main():
                 pass
         if viewer is not None and viewer_ctx is not None:
             viewer_ctx.__exit__(None, None, None)
+        close_renderer_quietly(seg_renderer)
+        close_renderer_quietly(renderer)
         cv2.destroyAllWindows()
         print("[INFO] Playback finished")
 
