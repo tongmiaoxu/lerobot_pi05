@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sim-dir", type=Path, required=True, help="Directory containing simulation images.")
     parser.add_argument("--real-dir", type=Path, required=True, help="Directory containing paired real images.")
+    parser.add_argument(
+        "--camera",
+        choices=("stationary", "wrist"),
+        default=None,
+        help="Filter recursive paired data to one camera directory, e.g. episode_*/stationary or episode_*/wrist.",
+    )
     parser.add_argument("--dataset-dir", type=Path, required=True, help="Prepared pix2pix-turbo dataset output.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Training output directory (checkpoints under output_dir/checkpoints/).")
     parser.add_argument(
@@ -71,6 +77,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-clipsim", type=float, default=0.0, help="Weight for the CLIP similarity loss.")
     parser.add_argument("--lambda-l2", type=float, default=10.0, help="Weight for the pixelwise L2 loss.")
     parser.add_argument("--lambda-lpips", type=float, default=2.0, help="Weight for the LPIPS perceptual loss.")
+    parser.add_argument(
+        "--lambda-dinov3-pixel",
+        type=float,
+        default=0.0,
+        help="Weight for pixel-aligned L2 between DINOv3 patch features of sim inputs and generated images.",
+    )
+    parser.add_argument(
+        "--dinov3-model-name",
+        type=str,
+        default="facebook/dinov3-vits16-pretrain-lvd1689m",
+        help="Hugging Face model id or local path for the frozen DINOv3 feature extractor.",
+    )
+    parser.add_argument(
+        "--dinov3-trust-remote-code",
+        action="store_true",
+        help="Pass trust_remote_code=True when loading the DINOv3 model from Hugging Face.",
+    )
     parser.add_argument("--viz-freq", type=int, default=100, help="Upstream visualization frequency.")
     parser.add_argument("--eval-freq", type=int, default=100, help="Upstream validation frequency.")
     parser.add_argument(
@@ -209,6 +232,26 @@ def match_pairs(sim_dir: Path, real_dir: Path) -> list[tuple[Path, Path]]:
     return [(sim_images[key], real_images[key]) for key in common_keys]
 
 
+def filter_pairs_by_camera(
+    pairs: list[tuple[Path, Path]],
+    camera: str | None,
+) -> list[tuple[Path, Path]]:
+    if camera is None:
+        return pairs
+
+    filtered_pairs = [
+        (sim_path, real_path)
+        for sim_path, real_path in pairs
+        if camera in sim_path.parts and camera in real_path.parts
+    ]
+    if not filtered_pairs:
+        raise ValueError(
+            f"--camera {camera!r} produced an empty dataset. "
+            "Expected paths like episode_*/stationary/frame_*.png or episode_*/wrist/frame_*.png."
+        )
+    return filtered_pairs
+
+
 def split_pairs(
     pairs: list[tuple[Path, Path]],
     val_ratio: float,
@@ -285,6 +328,7 @@ def build_image_prep(resolution: int) -> str:
 
 def prepare_dataset(args: argparse.Namespace) -> tuple[int, int]:
     pairs = match_pairs(args.sim_dir, args.real_dir)
+    pairs = filter_pairs_by_camera(pairs, args.camera)
     pairs = select_pairs(pairs, args.pair_selection, args.max_pairs)
     train_pairs, val_pairs = split_pairs(pairs, args.val_ratio, args.seed)
 
@@ -356,6 +400,10 @@ def launch_training(args: argparse.Namespace) -> None:
         str(args.lambda_l2),
         "--lambda_lpips",
         str(args.lambda_lpips),
+        "--lambda_dinov3_pixel",
+        str(args.lambda_dinov3_pixel),
+        "--dinov3_model_name",
+        str(args.dinov3_model_name),
         "--viz_freq",
         str(args.viz_freq),
         "--eval_freq",
@@ -383,6 +431,8 @@ def launch_training(args: argparse.Namespace) -> None:
         train_argv.append("--gradient_checkpointing")
     if args.track_val_fid:
         train_argv.append("--track_val_fid")
+    if args.dinov3_trust_remote_code:
+        train_argv.append("--dinov3_trust_remote_code")
 
     try:
         from sim2real.img2img_turbo.train_pix2pix_turbo import main as train_pix2pix_main

@@ -29,6 +29,9 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--lambda_lpips", default=2.0, type=float)
     parser.add_argument("--lambda_l2", default=10.0, type=float)
     parser.add_argument("--lambda_clipsim", default=0.0, type=float)
+    parser.add_argument("--lambda_dinov3_pixel", default=0.0, type=float)
+    parser.add_argument("--dinov3_model_name", default="facebook/dinov3-vits16-pretrain-lvd1689m", type=str)
+    parser.add_argument("--dinov3_trust_remote_code", default=False, action="store_true")
 
     # dataset options
     parser.add_argument("--dataset_folder", required=True, type=str)

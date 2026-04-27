@@ -72,6 +72,7 @@ from composite_rendering import (
 _stationary_cfg = load_camera_config("stationary_cam")
 _wrist_cfg = load_camera_config("wrist_cam")
 SAVE_CALIB_FRAMES = [20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200]
+DEFAULT_REPLAY_EXPORT_FRAME_STRIDE = 20
 _DEFAULT_EPISODE = 94
 CAMERA_CONFIG = {
     "stationary": {
@@ -656,9 +657,11 @@ def render_camera_frames(
 
 def export_all_episode_replay_frames(args, task_profile):
     render_w, render_h = 640, 480
+    export_frame_stride = args.replay_export_frame_stride
     first_episode = load_episode(args.dataset_path, 0, dataset_root=args.dataset_root)
     total_episodes = first_episode["dataset"].meta.total_episodes
     print(f"[INFO] --save-replay-frames-all-episodes: exporting {total_episodes} episodes")
+    print(f"[INFO] Saving one replay frame every {export_frame_stride} frame(s)")
     print("[INFO] Headless batch mode: no OpenCV image windows, MuJoCo viewer, or Open3D viewer will be opened")
 
     project_root = Path(__file__).parent.parent
@@ -893,8 +896,9 @@ def export_all_episode_replay_frames(args, task_profile):
         set_robot_to_ctrl_frame(model, data, exact_ctrl_sequence[0])
         set_robot_to_ctrl_frame(model, physics_data, exact_ctrl_sequence[0])
 
+        sampled_frame_count = (frame_count + export_frame_stride - 1) // export_frame_stride
         print(
-            f"[INFO] Exporting episode {episode_idx}/{total_episodes - 1}: {frame_count} frames "
+            f"[INFO] Exporting episode {episode_idx}/{total_episodes - 1}: {sampled_frame_count}/{frame_count} frames "
             f"(physics replay object state + exact robot render, replay_source={args.replay_source}, "
             f"control_delay_frames={control_delay_frames})"
         )
@@ -918,6 +922,9 @@ def export_all_episode_replay_frames(args, task_profile):
                     physics_data,
                     exact_ctrl_sequence[frame_idx],
                 )
+
+            if frame_idx % export_frame_stride != 0:
+                continue
 
             for cam_key, cam_cfg in CAMERA_CONFIG.items():
                 if cam_cfg["config"].get("type", "stationary") == "stationary":
@@ -1007,6 +1014,9 @@ def parse_args():
     p.add_argument("--replay-export-root", type=str, default=None,
                    help="Root directory used with --save-replay-frames or --save-replay-frames-all-episodes "
                         "(default: selected task's dataset_root_480640 from task_profiles)")
+    p.add_argument("--replay-export-frame-stride", type=int, default=DEFAULT_REPLAY_EXPORT_FRAME_STRIDE,
+                   help="Frame sampling stride for --save-replay-frames-all-episodes. "
+                        "Default saves frames 0, 20, 40, ...")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
@@ -1044,6 +1054,9 @@ def parse_args():
 def main():
     args = parse_args()
     task_profile = get_task_profile(args.task_id)
+    if args.replay_export_frame_stride < 1:
+        print("[ERROR] --replay-export-frame-stride must be >= 1")
+        sys.exit(1)
     if _AUTO_HEADLESS and not args.headless:
         reason = "SSH session" if _detect_ssh_session() else "no local display"
         print(f"[INFO] Auto-enabled headless mode ({reason} detected)")

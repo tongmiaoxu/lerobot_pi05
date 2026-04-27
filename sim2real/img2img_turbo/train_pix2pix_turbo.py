@@ -31,6 +31,22 @@ from .pix2pix_turbo import Pix2Pix_Turbo
 from .my_utils.training_utils import PairedDataset, parse_args_paired_training
 
 
+def _forward_dinov3(net_dinov3, pixel_values):
+    try:
+        return net_dinov3(pixel_values=pixel_values, interpolate_pos_encoding=True)
+    except TypeError:
+        return net_dinov3(pixel_values=pixel_values)
+
+
+def _dinov3_patch_features(net_dinov3, images, normalize):
+    images = normalize(images * 0.5 + 0.5)
+    outputs = _forward_dinov3(net_dinov3, images)
+    features = outputs.last_hidden_state
+    dinov3_config = getattr(net_dinov3, "config", getattr(getattr(net_dinov3, "module", None), "config", None))
+    num_prefix_tokens = 1 + int(getattr(dinov3_config, "num_register_tokens", 0))
+    return features[:, num_prefix_tokens:, :]
+
+
 def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -86,6 +102,17 @@ def main(args):
     net_clip.eval()
 
     net_lpips.requires_grad_(False)
+
+    net_dinov3 = None
+    if args.lambda_dinov3_pixel > 0:
+        from transformers import AutoModel
+
+        net_dinov3 = AutoModel.from_pretrained(
+            args.dinov3_model_name,
+            trust_remote_code=args.dinov3_trust_remote_code,
+        ).cuda()
+        net_dinov3.requires_grad_(False)
+        net_dinov3.eval()
 
     # make the optimizer
     layers_to_opt = []
@@ -161,9 +188,12 @@ def main(args):
         )
     )
     net_clip, net_lpips = accelerator.prepare(net_clip, net_lpips)
+    if net_dinov3 is not None:
+        net_dinov3 = accelerator.prepare(net_dinov3)
     t_clip_renorm = transforms.Normalize(
         mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)
     )
+    t_dinov3_renorm = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -174,6 +204,8 @@ def main(args):
     net_disc.to(dtype=weight_dtype)
     net_lpips.to(dtype=weight_dtype)
     net_clip.to(dtype=weight_dtype)
+    if net_dinov3 is not None:
+        net_dinov3.to(dtype=weight_dtype)
 
     # Cast trainable parameters back to FP32 so GradScaler can unscale gradients
     for p in layers_to_opt:
@@ -240,6 +272,15 @@ def main(args):
                     clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
                     loss_clipsim = 1 - clipsim.mean() / 100
                     loss += loss_clipsim * args.lambda_clipsim
+                if net_dinov3 is not None:
+                    with torch.no_grad():
+                        dinov3_src_features = _dinov3_patch_features(net_dinov3, x_src.detach(), t_dinov3_renorm).float()
+                    dinov3_pred_features = _dinov3_patch_features(net_dinov3, x_tgt_pred, t_dinov3_renorm).float()
+                    loss_dinov3_pixel = (
+                        F.mse_loss(dinov3_pred_features, dinov3_src_features, reduction="mean")
+                        * args.lambda_dinov3_pixel
+                    )
+                    loss += loss_dinov3_pixel
                 accelerator.backward(loss, retain_graph=False)
                 if accelerator.sync_gradients:
                     params_to_clip = [p for p in layers_to_opt if p.grad is not None]
@@ -285,6 +326,8 @@ def main(args):
                     logs["loss_lpips"] = loss_lpips.detach().item()
                     if args.lambda_clipsim > 0:
                         logs["loss_clipsim"] = loss_clipsim.detach().item()
+                    if net_dinov3 is not None:
+                        logs["loss_dinov3_pixel"] = loss_dinov3_pixel.detach().item()
                     progress_bar.set_postfix(**logs)
 
                     if global_step % args.viz_freq == 1:
@@ -308,7 +351,7 @@ def main(args):
                         accelerator.unwrap_model(net_pix2pix).save_model(outf)
 
                     if global_step % args.eval_freq == 1:
-                        l_l2, l_lpips, l_clipsim = [], [], []
+                        l_l2, l_lpips, l_clipsim, l_dinov3_pixel = [], [], [], []
                         if args.track_val_fid:
                             os.makedirs(os.path.join(args.output_dir, "eval", f"fid_{global_step}"), exist_ok=True)
                         for step, batch_val in enumerate(dl_val):
@@ -331,10 +374,20 @@ def main(args):
                                 caption_tokens = clip.tokenize(batch_val["caption"], truncate=True).to(x_tgt_pred.device)
                                 clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
                                 clipsim = clipsim.mean()
+                                if net_dinov3 is not None:
+                                    dinov3_src_features = _dinov3_patch_features(net_dinov3, x_src, t_dinov3_renorm).float()
+                                    dinov3_pred_features = _dinov3_patch_features(
+                                        net_dinov3, x_tgt_pred, t_dinov3_renorm
+                                    ).float()
+                                    loss_dinov3_pixel = F.mse_loss(
+                                        dinov3_pred_features, dinov3_src_features, reduction="mean"
+                                    )
 
                                 l_l2.append(loss_l2.item())
                                 l_lpips.append(loss_lpips.item())
                                 l_clipsim.append(clipsim.item())
+                                if net_dinov3 is not None:
+                                    l_dinov3_pixel.append(loss_dinov3_pixel.item())
                             if args.track_val_fid:
                                 output_pil = transforms.ToPILImage()(x_tgt_pred[0].cpu() * 0.5 + 0.5)
                                 outf = os.path.join(args.output_dir, "eval", f"fid_{global_step}", f"val_{step}.png")
@@ -359,6 +412,8 @@ def main(args):
                         logs["val/l2"] = np.mean(l_l2)
                         logs["val/lpips"] = np.mean(l_lpips)
                         logs["val/clipsim"] = np.mean(l_clipsim)
+                        if net_dinov3 is not None:
+                            logs["val/dinov3_pixel"] = np.mean(l_dinov3_pixel)
                         gc.collect()
                         torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)

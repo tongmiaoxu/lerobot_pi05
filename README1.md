@@ -326,8 +326,9 @@ python sim2real/train.py \
 ```bash
 
 python sim2real/train.py \
-  --sim-dir data_place_mug_copy/gs_render/wrist \
-  --real-dir data_place_mug_copy/real_captures/wrist \
+  --sim-dir data_place_mug_copy/gs_render \
+  --real-dir data_place_mug_copy/real_captures \
+  --camera wrist \
   --dataset-dir data_transfer_pairs_wrist \
   --output-dir outputs/turbo_sim2real_wrist \
   --overwrite \
@@ -338,14 +339,17 @@ python sim2real/train.py \
   --eval-freq 200 \
   --checkpointing-steps 1000 \
   --lambda-gan 0.5 \
-  --lambda-clipsim 2.0 \
-  --lambda-l2 1.0 \
-  --lambda-lpips 5.0 \
+  --lambda-clipsim 0 \
+  --lambda-dinov3-pixel 1.0 \
+  --lambda-l2 0 \
+  --lambda-lpips 0 \
   --train-batch-size 1 \
   --gradient-accumulation-steps 4 \
   --gradient-checkpointing \
   --mixed-precision bf16 \
-  --resultion 224
+  --resultion 224 \
+  --pair-selection odd \
+  --max-pairs 268
 ```
 ```bash
 python -m sim2real.img2img_turbo.inference_paired \
