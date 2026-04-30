@@ -73,7 +73,8 @@ _stationary_cfg = load_camera_config("stationary_cam")
 _wrist_cfg = load_camera_config("wrist_cam")
 SAVE_CALIB_FRAMES = [20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200]
 DEFAULT_REPLAY_EXPORT_FRAME_STRIDE = 20
-_DEFAULT_EPISODE = 94
+# Use an int for one episode, a range, or comma-separated selectors, e.g. "0-4,95-99".
+_DEFAULT_EPISODE = "0-4,95-99"
 CAMERA_CONFIG = {
     "stationary": {
         "dataset_cam": "cam_high",
@@ -86,6 +87,45 @@ CAMERA_CONFIG = {
         "config": _wrist_cfg,
     },
 }
+
+
+def parse_episode_selector(value: int | str) -> list[int]:
+    """Parse episode selectors like 3, 0-9, or 0-4,95-99."""
+    value_str = str(value).strip()
+    episode_indices = []
+    for token in value_str.split(","):
+        token = token.strip()
+        if not token:
+            raise argparse.ArgumentTypeError(
+                f"episode selector contains an empty entry: {value_str!r}"
+            )
+        if re.fullmatch(r"\d+", token):
+            episode_indices.append(int(token))
+            continue
+        range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+        if range_match:
+            start, end = (int(part) for part in range_match.groups())
+            if end < start:
+                raise argparse.ArgumentTypeError(
+                    f"episode range must end after it starts: {token!r}"
+                )
+            episode_indices.extend(range(start, end + 1))
+            continue
+        raise argparse.ArgumentTypeError(
+            f"episode must be a number, inclusive range, or comma-separated list like 0-4,95-99; got {value_str!r}"
+        )
+    return episode_indices
+
+
+def format_episode_selector(episode_indices: list[int]) -> str:
+    if not episode_indices:
+        return "none"
+    if len(episode_indices) == 1:
+        return str(episode_indices[0])
+    contiguous = episode_indices == list(range(episode_indices[0], episode_indices[-1] + 1))
+    if contiguous:
+        return f"{episode_indices[0]}-{episode_indices[-1]}"
+    return ",".join(str(idx) for idx in episode_indices)
 
 import numpy as np
 import torch
@@ -121,7 +161,7 @@ from object_pose_auto_align import (
     selection_object_names,
 )
 
-_DEFAULT_RECORD_TASK_ID ="place_mug"  # Keep in sync with lerobot-record defaults.
+_DEFAULT_RECORD_TASK_ID ="hang_mug"  # Keep in sync with lerobot-record defaults.
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -467,29 +507,6 @@ def set_robot_to_ctrl_frame(model, data, ctrl: np.ndarray):
     mujoco.mj_forward(model, data)
 
 
-def force_robot_ctrl_frame(model, data, ctrl: np.ndarray, qvel: np.ndarray | None = None):
-    data.qpos[:7] = ctrl[:7]
-    data.qpos[7] = ctrl[7] / 255.0 * 0.85
-    if qvel is None:
-        data.qvel[:8] = 0
-    else:
-        data.qvel[:8] = qvel
-    mujoco.mj_forward(model, data)
-
-
-def copy_physics_object_state_for_exact_robot_render(
-    model,
-    render_data,
-    physics_data,
-    exact_ctrl: np.ndarray,
-):
-    render_data.time = physics_data.time
-    render_data.qpos[:] = physics_data.qpos
-    render_data.qvel[:] = physics_data.qvel
-    render_data.ctrl[:] = physics_data.ctrl
-    force_robot_ctrl_frame(model, render_data, exact_ctrl)
-
-
 def build_replay_ctrl_sequence(
     observations_raw: np.ndarray,
     actions_raw: np.ndarray,
@@ -536,38 +553,6 @@ def close_registered_renderers():
 
 
 atexit.register(close_registered_renderers)
-
-
-def advance_forced_robot_dynamics(
-    model,
-    data,
-    prev_exact_ctrl: np.ndarray,
-    target_exact_ctrl: np.ndarray,
-    sim_ctrl: np.ndarray,
-    fps: float,
-):
-    frame_dt = 1.0 / fps
-    mj_dt = float(model.opt.timestep)
-    num_substeps = max(1, int(np.ceil(frame_dt / mj_dt)))
-
-    prev_qpos = np.empty(8, dtype=np.float64)
-    target_qpos = np.empty(8, dtype=np.float64)
-    prev_qpos[:7] = prev_exact_ctrl[:7]
-    target_qpos[:7] = target_exact_ctrl[:7]
-    prev_qpos[7] = prev_exact_ctrl[7] / 255.0 * 0.85
-    target_qpos[7] = target_exact_ctrl[7] / 255.0 * 0.85
-    robot_qvel = (target_qpos - prev_qpos) / frame_dt
-
-    data.ctrl[:] = sim_ctrl
-    for step_idx in range(num_substeps):
-        u = (step_idx + 1) / num_substeps
-        interp_qpos = (1.0 - u) * prev_qpos + u * target_qpos
-        data.qpos[:8] = interp_qpos
-        data.qvel[:8] = robot_qvel
-        mujoco.mj_forward(model, data)
-        mujoco.mj_step(model, data)
-
-    force_robot_ctrl_frame(model, data, target_exact_ctrl)
 
 def render_camera_frames(
     model,
@@ -655,12 +640,27 @@ def render_camera_frames(
     return cam_renders
 
 
-def export_all_episode_replay_frames(args, task_profile):
+def export_selected_episode_replay_frames(args, task_profile, episode_indices: list[int] | None = None):
     render_w, render_h = 640, 480
     export_frame_stride = args.replay_export_frame_stride
     first_episode = load_episode(args.dataset_path, 0, dataset_root=args.dataset_root)
     total_episodes = first_episode["dataset"].meta.total_episodes
-    print(f"[INFO] --save-replay-frames-all-episodes: exporting {total_episodes} episodes")
+    if episode_indices is None:
+        episode_indices = list(range(total_episodes))
+    invalid_episode_indices = [
+        episode_idx for episode_idx in episode_indices
+        if episode_idx < 0 or episode_idx >= total_episodes
+    ]
+    if invalid_episode_indices:
+        raise ValueError(
+            f"Episode(s) {invalid_episode_indices} not found. Dataset has {total_episodes} episodes"
+        )
+
+    episode_selector = format_episode_selector(episode_indices)
+    print(
+        f"[INFO] --save-replay-frames: exporting episodes {episode_selector} "
+        f"({len(episode_indices)}/{total_episodes} episodes)"
+    )
     print(f"[INFO] Saving one replay frame every {export_frame_stride} frame(s)")
     print("[INFO] Headless batch mode: no OpenCV image windows, MuJoCo viewer, or Open3D viewer will be opened")
 
@@ -676,14 +676,11 @@ def export_all_episode_replay_frames(args, task_profile):
         os.chdir(original_cwd)
 
     data = MjData(model)
-    physics_data = MjData(model)
     try:
         home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
         mujoco.mj_resetDataKeyframe(model, data, home_id)
-        mujoco.mj_resetDataKeyframe(model, physics_data, home_id)
     except Exception:
         mujoco.mj_resetData(model, data)
-        mujoco.mj_resetData(model, physics_data)
 
     gripper_act_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
     gripper_mj_range = (
@@ -809,18 +806,15 @@ def export_all_episode_replay_frames(args, task_profile):
     print(f"[INFO] Writing renders to: {export_root / 'gs_render'}")
     print(f"[INFO] Writing alpha blends to: {alpha_root}")
 
-    for episode_idx in range(total_episodes):
+    for episode_idx in episode_indices:
         episode_data = first_episode if episode_idx == 0 else load_episode(
             args.dataset_path, episode_idx, dataset_root=args.dataset_root
         )
         actions_raw = episode_data["action"].numpy()
         observations_raw = episode_data["observation.state"].numpy()
         num_frames = len(observations_raw)
-        exact_ctrl_sequence = np.array([
-            lerobot_state_to_mujoco_ctrl(observations_raw[i], gripper_mj_range)
-            for i in range(num_frames)
-        ])
-        dynamics_ctrl_sequence = build_replay_ctrl_sequence(
+        initial_ctrl = lerobot_state_to_mujoco_ctrl(observations_raw[0], gripper_mj_range)
+        ctrl_sequence = build_replay_ctrl_sequence(
             observations_raw,
             actions_raw,
             gripper_mj_range,
@@ -845,7 +839,7 @@ def export_all_episode_replay_frames(args, task_profile):
                 mujoco.mj_resetData(model, data)
             if default_auto_object_poses is not None:
                 apply_object_poses(model, data, default_auto_object_poses)
-            set_robot_to_ctrl_frame(model, data, exact_ctrl_sequence[0])
+            set_robot_to_ctrl_frame(model, data, initial_ctrl)
             for cam_key, cam_cfg in CAMERA_CONFIG.items():
                 if cam_cfg["config"].get("type", "stationary") == "stationary":
                     set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
@@ -883,45 +877,26 @@ def export_all_episode_replay_frames(args, task_profile):
         try:
             home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
             mujoco.mj_resetDataKeyframe(model, data, home_id)
-            mujoco.mj_resetDataKeyframe(model, physics_data, home_id)
         except Exception:
             mujoco.mj_resetData(model, data)
-            mujoco.mj_resetData(model, physics_data)
         if aligned_pose_result is not None:
             apply_object_poses(model, data, aligned_pose_result.poses)
-            apply_object_poses(model, physics_data, aligned_pose_result.poses)
         elif default_auto_object_poses is not None:
             apply_object_poses(model, data, default_auto_object_poses)
-            apply_object_poses(model, physics_data, default_auto_object_poses)
-        set_robot_to_ctrl_frame(model, data, exact_ctrl_sequence[0])
-        set_robot_to_ctrl_frame(model, physics_data, exact_ctrl_sequence[0])
+        set_robot_to_ctrl_frame(model, data, initial_ctrl)
 
         sampled_frame_count = (frame_count + export_frame_stride - 1) // export_frame_stride
         print(
             f"[INFO] Exporting episode {episode_idx}/{total_episodes - 1}: {sampled_frame_count}/{frame_count} frames "
-            f"(physics replay object state + exact robot render, replay_source={args.replay_source}, "
+            f"(original physics replay, replay_source={args.replay_source}, "
             f"control_delay_frames={control_delay_frames})"
         )
         for frame_idx in range(frame_count):
-            if frame_idx > 0:
-                ctrl_idx = delayed_ctrl_index(frame_idx, control_delay_frames)
-                physics_data.ctrl[:] = dynamics_ctrl_sequence[ctrl_idx]
-                sim_target = physics_data.time + 1.0 / args.fps
-                while physics_data.time < sim_target:
-                    mujoco.mj_step(model, physics_data)
-                copy_physics_object_state_for_exact_robot_render(
-                    model,
-                    data,
-                    physics_data,
-                    exact_ctrl_sequence[frame_idx],
-                )
-            else:
-                copy_physics_object_state_for_exact_robot_render(
-                    model,
-                    data,
-                    physics_data,
-                    exact_ctrl_sequence[frame_idx],
-                )
+            ctrl_idx = delayed_ctrl_index(frame_idx, control_delay_frames)
+            data.ctrl[:] = ctrl_sequence[ctrl_idx]
+            sim_target = data.time + 1.0 / args.fps
+            while data.time < sim_target:
+                mujoco.mj_step(model, data)
 
             if frame_idx % export_frame_stride != 0:
                 continue
@@ -972,7 +947,7 @@ def export_all_episode_replay_frames(args, task_profile):
 
     close_renderer_quietly(seg_renderer)
     close_renderer_quietly(renderer)
-    print("[INFO] All-episode frame-aligned export finished")
+    print("[INFO] Replay export finished")
 
 
 # ============================================================================
@@ -987,7 +962,9 @@ def parse_args():
     p.add_argument("--dataset-path", type=str, default=None,
                    help="Path to dataset directory (local) or repo_id (Hub). Defaults to the selected task dataset root.")
     p.add_argument("--dataset-root", type=str, default=None)
-    p.add_argument("--episode", type=int, default=_DEFAULT_EPISODE)
+    p.add_argument("--episode", type=parse_episode_selector, default=parse_episode_selector(_DEFAULT_EPISODE),
+                   help="Episode index or inclusive range. Examples: 94, 0-9, 0-99. "
+                        "A single episode runs the interactive path; multiple episodes run headless replay export.")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--scene-path", type=str, default="pointclouds/xarm7_black.npz",
                    help="Path to Gaussian Splatting scene file")
@@ -1000,22 +977,19 @@ def parse_args():
     p.add_argument("--save-calibration-pairs", action="store_true",
                    help="Save frames 0,5,10,15,20 to calibration_pairs_*/ for color calibration")
     p.add_argument("--save-replay-frames", action="store_true",
-                   help="Every replay frame: save composite_raw under <root>/gs_render/{stationary,wrist}/ "
-                        "and recorded video under <root>/real_captures/{stationary,wrist}/")
-    p.add_argument("--save-replay-frames-all-episodes", action="store_true",
-                   help="Headless batch export of every episode. Runs a normal physics replay for object state, "
-                        "then renders with the robot snapped to each recorded state before saving. "
-                        "Does not open image windows, MuJoCo viewer, or Open3D viewer. "
-                        "Saves under <root>/gs_render/episode_*/{stationary,wrist}/, "
-                        "<root>/real_captures/episode_*/{stationary,wrist}/, and <root>/alpha blending/episode_*/.")
+                   help="Single episode: save every replay frame under "
+                        "<root>/gs_render/episode_*/{stationary,wrist}/ and "
+                        "<root>/real_captures/episode_*/{stationary,wrist}/, plus "
+                        "<root>/alpha blending/episode_*/. "
+                        "Multiple episodes: run headless batch export for the selected episode range.")
     p.add_argument("--headless", action="store_true",
                    help="Disable OpenCV image windows, MuJoCo viewer, and Open3D viewer. "
                         "Automatically enabled on SSH sessions or when no local display is available.")
     p.add_argument("--replay-export-root", type=str, default=None,
-                   help="Root directory used with --save-replay-frames or --save-replay-frames-all-episodes "
+                   help="Root directory used with --save-replay-frames "
                         "(default: selected task's dataset_root_480640 from task_profiles)")
     p.add_argument("--replay-export-frame-stride", type=int, default=DEFAULT_REPLAY_EXPORT_FRAME_STRIDE,
-                   help="Frame sampling stride for --save-replay-frames-all-episodes. "
+                   help="Frame sampling stride for multi-episode --save-replay-frames. "
                         "Default saves frames 0, 20, 40, ...")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
@@ -1053,6 +1027,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.episode_indices = args.episode
+    multiple_episodes_selected = len(args.episode_indices) > 1
+    args.episode = args.episode_indices[0]
+    if multiple_episodes_selected:
+        args.save_replay_frames = True
+        args.headless = True
+        print(
+            f"[INFO] Multiple episodes selected ({format_episode_selector(args.episode_indices)}); "
+            "using headless replay-frame export"
+        )
     task_profile = get_task_profile(args.task_id)
     if args.replay_export_frame_stride < 1:
         print("[ERROR] --replay-export-frame-stride must be >= 1")
@@ -1065,7 +1049,7 @@ def main():
         args.no_mujoco_view = True
         args.open3d_cam_view = False
         args.no_stack = True
-    if not _HAS_DISPLAY and not args.headless and not args.save_replay_frames_all_episodes:
+    if not _HAS_DISPLAY and not args.headless:
         print("[ERROR] This script requires a display for visualization; use --headless to disable viewers")
         sys.exit(1)
     if args.replay_export_root is None:
@@ -1080,8 +1064,8 @@ def main():
     if args.object_name is None:
         args.object_name = task_profile.selection_object_name
 
-    if args.save_replay_frames_all_episodes:
-        export_all_episode_replay_frames(args, task_profile)
+    if multiple_episodes_selected:
+        export_selected_episode_replay_frames(args, task_profile, episode_indices=args.episode_indices)
         return
 
     # Load dataset
@@ -1495,11 +1479,18 @@ def main():
 
     if args.save_replay_frames:
         _export = Path(args.replay_export_root)
+        _episode_dir = f"episode_{args.episode:06d}"
+        _alpha_root = _export / "alpha blending"
         for _cam in CAMERA_CONFIG:
-            (_export / "gs_render" / _cam).mkdir(parents=True, exist_ok=True)
-            (_export / "real_captures" / _cam).mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] --save-replay-frames: writing to {_export}/gs_render/{{stationary,wrist}}/ "
-              f"and {_export}/real_captures/{{stationary,wrist}}/")
+            (_export / "gs_render" / _episode_dir / _cam).mkdir(parents=True, exist_ok=True)
+            (_export / "real_captures" / _episode_dir / _cam).mkdir(parents=True, exist_ok=True)
+        (_alpha_root / _episode_dir).mkdir(parents=True, exist_ok=True)
+        print(
+            f"[INFO] --save-replay-frames: writing to "
+            f"{_export}/gs_render/{_episode_dir}/{{stationary,wrist}}/ "
+            f"and {_export}/real_captures/{_episode_dir}/{{stationary,wrist}}/ "
+            f"and {_alpha_root}/{_episode_dir}/"
+        )
 
     # --- MuJoCo 3D Viewer Setup ---
     viewer = None
@@ -1664,6 +1655,8 @@ def main():
                     composite_frame = fg_bgr.copy()
                     composite_raw = composite_frame.copy()
 
+                alpha_blend = cv2.addWeighted(composite_raw, args.alpha, recorded_frame, 1.0 - args.alpha, 0)
+
                 alpha_mask = (mask_uint8 / 255.0).astype(np.float32)
                 alpha_mask_3ch = np.stack([alpha_mask] * 3, axis=-1)
                 foreground = fg_bgr.astype(np.float32)
@@ -1678,18 +1671,24 @@ def main():
                     "composite": composite_frame,
                     "composite_raw": composite_raw,
                     "alpha": alpha_frame,
+                    "alpha_blend": alpha_blend,
                 }
 
             if args.save_replay_frames:
                 _root = Path(args.replay_export_root)
+                _episode_dir = f"episode_{args.episode:06d}"
                 for _ck, _rend in cam_renders.items():
                     cv2.imwrite(
-                        str(_root / "gs_render" / _ck / f"frame_{frame_idx:04d}.png"),
+                        str(_root / "gs_render" / _episode_dir / _ck / f"frame_{frame_idx:04d}.png"),
                         _rend["composite_raw"],
                     )
                     cv2.imwrite(
-                        str(_root / "real_captures" / _ck / f"frame_{frame_idx:04d}.png"),
+                        str(_root / "real_captures" / _episode_dir / _ck / f"frame_{frame_idx:04d}.png"),
                         _rend["recorded"],
+                    )
+                    cv2.imwrite(
+                        str(_root / "alpha blending" / _episode_dir / f"{_ck}_frame_{frame_idx:04d}.png"),
+                        _rend["alpha_blend"],
                     )
 
             # Save calibration pairs for wrist color calibration

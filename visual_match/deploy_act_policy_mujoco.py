@@ -37,8 +37,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_place_mug/checkpoints/last/pretrained_model"
-_DEFAULT_RECORD_TASK_ID = "place_mug"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/diffusion_hang_mug/checkpoints/last/pretrained_model"
+_DEFAULT_RECORD_TASK_ID = "hang_mug"
 _NUM_EPISODES = 10
 _MAX_PREDICTION_EVENTS_PER_TRAJECTORY = 6
 
@@ -79,7 +79,7 @@ from lerobot.policies.factory import get_policy_class
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.control_utils import predict_action, init_keyboard_listener
 from lerobot.utils.utils import get_safe_torch_device
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.policies.factory import make_pre_post_processors
 
 # ============================================================================
@@ -532,6 +532,21 @@ def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
     policy.eval()
     # print(f"[INFO] Policy loaded: {policy_type}")
     return policy, config_dict
+
+
+def policy_needs_prediction(policy: PreTrainedPolicy) -> bool:
+    """Return whether the policy has exhausted its cached action chunk."""
+    action_queue = getattr(policy, "_action_queue", None)
+    if action_queue is not None:
+        return len(action_queue) == 0
+
+    queues = getattr(policy, "_queues", None)
+    if isinstance(queues, dict):
+        action_queue = queues.get(ACTION)
+        if action_queue is not None:
+            return len(action_queue) == 0
+
+    return True
 
 
 def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco.Renderer,
@@ -2083,14 +2098,9 @@ def main():
                     if cam_cfg["config"].get("type", "stationary") == "stationary":
                         set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
-                # ACT action chunking: the policy only needs a new observation
-                # when its action queue is depleted. Skip expensive sim→real
-                # translation calls on intermediate steps where we just pop from
-                # the queue.
-                needs_prediction = (
-                    not hasattr(policy, '_action_queue')
-                    or len(policy._action_queue) == 0
-                )
+                # Chunked policies only need a fresh observation when their
+                # cached action queue is depleted.
+                needs_prediction = policy_needs_prediction(policy)
                 current_prediction_event_idx = prediction_events + 1 if needs_prediction else None
                 if needs_prediction and prediction_events >= _MAX_PREDICTION_EVENTS_PER_TRAJECTORY:
                     prediction_limit_reached = True

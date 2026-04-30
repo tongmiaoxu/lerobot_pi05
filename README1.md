@@ -278,6 +278,17 @@ python visual_match/temp_pixel_masks_overlay_10ep.py
 Saved under DATA_DIR.
 
 Align object for replay or color alignment:
+(--task-id place_mug   --episode 24   --save-auto-align-cache to overwrite the obj alignment optimization cache with manual adjustment; or give multiple episodes: --episode 0-4,95-99 gives autosave mode)
+(python visual_match/compare_recorded_vs_mujoco.py   --episode 24   --save-replay-frames   --auto-align-force(to recompute even cache exist))
+m        select mug
+Arrows   move selected object in X/Y
+w / s    move selected object up/down in Z
+j / l    rotate yaw left/right
+x        reset editable poses
++ / -    adjust alpha blend
+Space    replay from calibration frame
+q        save, or save and next episode in range mode
+Esc      discard/stop
 ```bash
 python tools/decomp_collision_mujoco.py
 python visual_match/obj_calibration_mujoco.py
@@ -289,8 +300,7 @@ python visual_match/compare_recorded_vs_mujoco.py
 ```
 
 Color Alignment:
-( --save-replay-frames: save every single frame under root/gs_render/stationary/frame_XXXX.png and {root}/gs_render/wrist/frame_XXXX.png; 
---save-replay-frames-all-episodes;
+( --save-replay-frames: save every single frame under root/gs_render/episode_*/stationary/frame_XXXX.png and {root}/gs_render/episode_*/wrist/frame_XXXX.png; 
 --auto-align-initial-objects)
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
@@ -362,8 +372,8 @@ python -m sim2real.img2img_turbo.inference_paired \
 ```
 ```bash
 python -m sim2real.img2img_turbo.inference_paired \
-  --model_path outputs/turbo_place_wrist/checkpoints/model_10001.pkl \
-  --input_image data_place_mug_copy/gs_render/wrist \
+  --model_path outputs/turbo_sim2real_wrist_dino/checkpoints/model_30001.pkl \
+  --input_image data_place_mug_copy/gs_render/episode_000011/wrist \
   --prompt "a real-world robot camera image" \
   --resolution 224 \
   --use_fp16
@@ -371,8 +381,8 @@ python -m sim2real.img2img_turbo.inference_paired \
 ```bash
 python visual_match/deploy_act_policy_mujoco.py \
   --turbo \
-  --turbo-checkpoint-stationary outputs/turbo_place_high/checkpoints/model_10001.pkl \
-  --turbo-checkpoint-wrist outputs/turbo_place_wrist/checkpoints/model_10001.pkl
+  --turbo-checkpoint-stationary outputs/turbo_sim2real_stationary_dino_hang/checkpoints/model_30001.pkl \
+  --turbo-checkpoint-wrist outputs/turbo_sim2real_wrist_dino_hang/checkpoints/model_30001.pkl
 ```
 ```bash
 python tools/query_gpt_image.py \
