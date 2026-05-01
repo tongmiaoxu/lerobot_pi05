@@ -44,12 +44,13 @@ Supported task ids:
 ```bash
 lerobot-record
 ```
-Other useful parameters:
+Other useful parameters: (--obs meaning taking dataset obs[imgae + states])
 ```bash
     --dataset.num_episodes=20 \
     --resume=true \
     --dataset.push_to_hub=false \
-    --display_data=true
+    --display_data=true \
+    --obs=true
 ```
 
 ### Teleoperation only (xArm + GELLO, no data recording)
@@ -378,11 +379,12 @@ python -m sim2real.img2img_turbo.inference_paired \
   --resolution 224 \
   --use_fp16
 ```
-```bash
+```bash( --fast-rollout-video-replay: only render the camera after all deployments)
 python visual_match/deploy_act_policy_mujoco.py \
   --turbo \
   --turbo-checkpoint-stationary outputs/turbo_sim2real_stationary_dino_hang/checkpoints/model_30001.pkl \
-  --turbo-checkpoint-wrist outputs/turbo_sim2real_wrist_dino_hang/checkpoints/model_30001.pkl
+  --turbo-checkpoint-wrist outputs/turbo_sim2real_wrist_dino_hang/checkpoints/model_30001.pkl \
+  --fast-rollout-video-replay
 ```
 ```bash
 python tools/query_gpt_image.py \

@@ -37,10 +37,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/diffusion_hang_mug/checkpoints/last/pretrained_model"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_hang_mug/checkpoints/last/pretrained_model"
 _DEFAULT_RECORD_TASK_ID = "hang_mug"
-_NUM_EPISODES = 10
-_MAX_PREDICTION_EVENTS_PER_TRAJECTORY = 6
+_NUM_EPISODES = 9
+_MAX_PREDICTION_EVENTS_PER_TRAJECTORY_BY_TASK = {
+    "hang_mug": 10,
+    "place_mug": 6,
+}
+
+
+def _max_prediction_events_per_trajectory(task_id: str) -> int:
+    return _MAX_PREDICTION_EVENTS_PER_TRAJECTORY_BY_TASK.get(task_id, 6)
 
 # Auto-detect display (for cv2.imshow, mujoco.viewer)
 def _detect_display():
@@ -483,6 +490,41 @@ def build_combined_window_frame(
     return np.vstack(row_frames)
 
 
+def _alpha_blend_rgb_images(
+    first: np.ndarray | None,
+    second: np.ndarray | None,
+    alpha: float = 0.5,
+) -> np.ndarray | None:
+    """Blend two RGB images at equal weight for side-by-side prediction comparison."""
+    if not (
+        isinstance(first, np.ndarray)
+        and isinstance(second, np.ndarray)
+        and first.ndim == 3
+        and second.ndim == 3
+        and first.shape[2] == 3
+        and second.shape[2] == 3
+    ):
+        return None
+
+    if first.shape[:2] != second.shape[:2]:
+        second = cv2.resize(second, (first.shape[1], first.shape[0]), interpolation=cv2.INTER_LINEAR)
+    return cv2.addWeighted(first, alpha, second, 1.0 - alpha, 0)
+
+
+def _build_alpha_blended_observation(
+    first_observation: dict | None,
+    second_observation: dict | None,
+    alpha: float = 0.5,
+) -> dict:
+    blended_observation = {}
+    for _cam_key, cam_cfg in CAMERA_CONFIG.items():
+        obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
+        first_img = None if first_observation is None else first_observation.get(obs_key)
+        second_img = None if second_observation is None else second_observation.get(obs_key)
+        blended_observation[obs_key] = _alpha_blend_rgb_images(first_img, second_img, alpha=alpha)
+    return blended_observation
+
+
 def build_prediction_event_panel(
     translated_row_name: str,
     composite_observation: dict | None,
@@ -490,11 +532,17 @@ def build_prediction_event_panel(
     tile_width: int = 400,
     tile_height: int = 300,
 ) -> np.ndarray:
-    """Build a paired 2x2 RGB panel for one prediction event."""
+    """Build a paired 3x2 RGB panel for one prediction event."""
+    blended_observation = _build_alpha_blended_observation(
+        composite_observation,
+        translated_observation,
+        alpha=0.5,
+    )
     return build_combined_window_frame(
         [
             ("Composite", composite_observation),
             (translated_row_name, translated_observation),
+            ("Blend", blended_observation),
         ],
         tile_width=tile_width,
         tile_height=tile_height,
@@ -549,6 +597,40 @@ def policy_needs_prediction(policy: PreTrainedPolicy) -> bool:
     return True
 
 
+def pop_cached_policy_action(policy: PreTrainedPolicy, postprocessor) -> torch.Tensor | None:
+    """Pop one cached raw policy action and run the normal postprocessor."""
+    action_queue = getattr(policy, "_action_queue", None)
+    if action_queue is None:
+        queues = getattr(policy, "_queues", None)
+        if isinstance(queues, dict):
+            action_queue = queues.get(ACTION)
+    if action_queue is None or len(action_queue) == 0:
+        return None
+    return postprocessor(action_queue.popleft())
+
+
+def build_state_from_mujoco(model: MjModel, data: MjData) -> np.ndarray:
+    """Build the LeRobot state vector from the current MuJoCo state."""
+    ld_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "left_driver_joint")
+    if ld_id < 0:
+        raise RuntimeError("MuJoCo model has no joint 'left_driver_joint' (gripper driver).")
+    g_adr = int(model.jnt_qposadr[ld_id])
+    g_rad = (float(model.jnt_range[ld_id, 0]), float(model.jnt_range[ld_id, 1]))
+    return mujoco_qpos_to_lerobot_state(
+        data.qpos, g_rad, gripper_qpos_adr=g_adr
+    )
+
+
+def capture_mujoco_snapshot(data: MjData) -> dict[str, np.ndarray | float]:
+    """Capture enough simulator state to render this frame later."""
+    return {
+        "qpos": data.qpos.copy(),
+        "qvel": data.qvel.copy(),
+        "ctrl": data.ctrl.copy(),
+        "time": float(data.time),
+    }
+
+
 def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco.Renderer,
                                   seg_renderer: mujoco.Renderer,
                                   robot_geom_ids: set,
@@ -560,15 +642,7 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
     Uses 2 cameras: cam_high (stationary) and cam_wrist, both with composite rendering.
     When obs_frames is provided (--obs mode), use real dataset images instead of rendered.
     """
-    ld_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "left_driver_joint")
-    if ld_id < 0:
-        raise RuntimeError("MuJoCo model has no joint 'left_driver_joint' (gripper driver).")
-    g_adr = int(model.jnt_qposadr[ld_id])
-    g_rad = (float(model.jnt_range[ld_id, 0]), float(model.jnt_range[ld_id, 1]))
-    state = mujoco_qpos_to_lerobot_state(
-        data.qpos, g_rad, gripper_qpos_adr=g_adr
-    )
-    observation = {OBS_STATE: state}
+    observation = {OBS_STATE: build_state_from_mujoco(model, data)}
 
     # Use real-world dataset images when --obs
     if obs_frames is not None:
@@ -1156,6 +1230,14 @@ def main():
         help="Save a single tiled MP4 of the displayed camera windows for each episode.",
     )
     parser.add_argument(
+        "--fast-rollout-video-replay",
+        action="store_true",
+        help=(
+            "Render camera observations only when the policy needs a fresh action chunk, "
+            "then replay saved MuJoCo states after each episode to write full videos."
+        ),
+    )
+    parser.add_argument(
         "--gpt",
         action="store_true",
         help="Use GPT-Image-2 sim→real style transfer on composite policy images when a new prediction is needed.",
@@ -1229,6 +1311,7 @@ def main():
     args = parser.parse_args()
     num_eval_episodes = args.num_eval_episodes
     task_profile = get_task_profile(_DEFAULT_RECORD_TASK_ID)
+    max_prediction_events_per_trajectory = _max_prediction_events_per_trajectory(_DEFAULT_RECORD_TASK_ID)
     # print(f"[INFO] Default task: {_DEFAULT_RECORD_TASK_ID}")
     if args.prompt is None:
         args.prompt = task_profile.single_task
@@ -1712,6 +1795,7 @@ def main():
     episode_idx = 0
     episode_window_writer: cv2.VideoWriter | None = None
     episode_window_tmp_path: Path | None = None
+    pending_fast_replay_dirs: list[Path] = []
 
     default_mug_pos = data.qpos[mug_qpos_addr:mug_qpos_addr + 3].copy() if mug_qpos_addr >= 0 else None
     default_mug_quat = data.qpos[mug_qpos_addr + 3:mug_qpos_addr + 7].copy() if mug_qpos_addr >= 0 else None
@@ -1794,6 +1878,100 @@ def main():
                 save_path.unlink()
             episode_window_tmp_path.replace(save_path)
         episode_window_tmp_path = None
+
+    def _restore_mujoco_snapshot(snapshot: dict[str, np.ndarray | float]) -> None:
+        data.qpos[:] = snapshot["qpos"]
+        data.qvel[:] = snapshot["qvel"]
+        data.ctrl[:] = snapshot["ctrl"]
+        data.time = float(snapshot["time"])
+        mujoco.mj_forward(model, data)
+
+    def _render_episode_videos_from_snapshots(
+        snapshots: list[dict[str, np.ndarray | float]],
+        ep_dir: Path,
+    ) -> None:
+        """Replay recorded sim states and write full per-frame camera videos."""
+        if not snapshots:
+            return
+        current_snapshot = capture_mujoco_snapshot(data)
+        writers: dict[str, cv2.VideoWriter] = {}
+        combined_writer: cv2.VideoWriter | None = None
+        combined_tmp_path = ep_dir / "combined_windows_tmp.mp4"
+        try:
+            for frame_idx, snapshot in enumerate(snapshots):
+                _restore_mujoco_snapshot(snapshot)
+                for cam_cfg in CAMERA_CONFIG.values():
+                    if cam_cfg["config"].get("type", "stationary") == "stationary":
+                        set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
+                composite_obs = build_observation_from_mujoco(
+                    model, data, renderer,
+                    seg_renderer=seg_renderer,
+                    robot_geom_ids=robot_geom_ids,
+                    gaussian_data=gaussian_data,
+                    obs_frames=None,
+                    frame_idx=frame_idx,
+                )
+                for cam_key, cam_cfg in CAMERA_CONFIG.items():
+                    obs_key = f"observation.images.{cam_cfg['dataset_cam']}"
+                    frame = composite_obs.get(obs_key)
+                    if not isinstance(frame, np.ndarray):
+                        continue
+                    writer = writers.get(cam_key)
+                    if writer is None:
+                        h, w = frame.shape[:2]
+                        video_path = ep_dir / f"{cam_cfg['dataset_cam']}.mp4"
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(str(video_path), fourcc, args.fps, (w, h))
+                        if not writer.isOpened():
+                            raise RuntimeError(f"Failed to open video writer for {video_path}")
+                        writers[cam_key] = writer
+                    writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                if args.record:
+                    combined_rgb = build_combined_window_frame(
+                        [("Composite", composite_obs)],
+                        tile_width=WINDOW_W,
+                        tile_height=WINDOW_H,
+                    )
+                    combined_bgr = cv2.cvtColor(combined_rgb, cv2.COLOR_RGB2BGR)
+                    if combined_writer is None:
+                        combined_tmp_path.unlink(missing_ok=True)
+                        frame_h, frame_w = combined_bgr.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        combined_writer = cv2.VideoWriter(
+                            str(combined_tmp_path),
+                            fourcc,
+                            args.fps,
+                            (frame_w, frame_h),
+                        )
+                        if not combined_writer.isOpened():
+                            raise RuntimeError(f"Failed to open video writer for {combined_tmp_path}")
+                    combined_writer.write(combined_bgr)
+        finally:
+            for writer in writers.values():
+                writer.release()
+            if combined_writer is not None:
+                combined_writer.release()
+                combined_path = ep_dir / "combined_windows.mp4"
+                combined_path.unlink(missing_ok=True)
+                combined_tmp_path.replace(combined_path)
+            else:
+                combined_tmp_path.unlink(missing_ok=True)
+            _restore_mujoco_snapshot(current_snapshot)
+
+    def _load_episode_snapshots(ep_dir: Path) -> list[dict[str, np.ndarray | float]]:
+        snapshot_path = ep_dir / "sim_snapshots.npz"
+        if not snapshot_path.exists():
+            raise FileNotFoundError(f"Snapshot file not found for offline replay: {snapshot_path}")
+        with np.load(str(snapshot_path)) as snapshot_data:
+            return [
+                {
+                    "qpos": snapshot_data["qpos"][idx].copy(),
+                    "qvel": snapshot_data["qvel"][idx].copy(),
+                    "ctrl": snapshot_data["ctrl"][idx].copy(),
+                    "time": float(snapshot_data["time"][idx]),
+                }
+                for idx in range(len(snapshot_data["time"]))
+            ]
 
     def _select_warmup_object(key: int, current_obj: str | None) -> str | None:
         key_to_obj = {
@@ -2074,6 +2252,7 @@ def main():
             episode_actions = []
             episode_states = []
             episode_frames = {cam_key: [] for cam_key in CAMERA_CONFIG}
+            episode_snapshots: list[dict[str, np.ndarray | float]] = []
             prediction_event_panels: list[tuple[str, int, int, np.ndarray]] = []
             last_gpt_policy_display_obs: dict | None = None
             last_turbo_policy_display_obs: dict | None = None
@@ -2098,209 +2277,243 @@ def main():
                     if cam_cfg["config"].get("type", "stationary") == "stationary":
                         set_mujoco_camera_from_config(data, model, cam_cfg["mujoco_cam"], cam_cfg["config"])
 
-                # Chunked policies only need a fresh observation when their
-                # cached action queue is depleted.
+                # Fast replay mode can skip camera rendering while a policy action
+                # chunk still has cached raw actions available.
                 needs_prediction = policy_needs_prediction(policy)
+                cached_action = None
+                used_cached_action = False
+                if args.fast_rollout_video_replay and not needs_prediction:
+                    with torch.inference_mode():
+                        cached_action = pop_cached_policy_action(policy, postprocessor)
+                    if cached_action is not None:
+                        used_cached_action = True
+                    else:
+                        needs_prediction = True
                 current_prediction_event_idx = prediction_events + 1 if needs_prediction else None
-                if needs_prediction and prediction_events >= _MAX_PREDICTION_EVENTS_PER_TRAJECTORY:
+                if needs_prediction and prediction_events >= max_prediction_events_per_trajectory:
                     prediction_limit_reached = True
                     break
 
-                need_real_obs = (
-                    args.obs or args.obs_eval
-                    or (obs_frames is not None and show_real_windows)
-                )
                 real_obs = None
-                if need_real_obs:
-                    real_obs = build_observation_from_mujoco(
-                        model, data, renderer,
-                        seg_renderer=seg_renderer,
-                        robot_geom_ids=robot_geom_ids,
-                        gaussian_data=gaussian_data,
-                        obs_frames=obs_frames,
-                        frame_idx=step,
-                    )
-
-                # Always build the raw composite first (fast, for display + video).
-                composite_obs = build_observation_from_mujoco(
-                    model, data, renderer,
-                    seg_renderer=seg_renderer,
-                    robot_geom_ids=robot_geom_ids,
-                    gaussian_data=gaussian_data,
-                    obs_frames=None,
-                    frame_idx=step,
-                )
-
+                composite_obs = None
                 resize_policy_images = (
                     not args.policy_no_resize
                     and args.policy_input_h > 0
                     and args.policy_input_w > 0
                 )
-                composite_display_obs = composite_obs
-                if resize_policy_images:
-                    composite_display_obs = copy_observation_frame_with_resized_images(
-                        composite_obs, args.policy_input_h, args.policy_input_w
-                    )
-
-                if not args.headless:
-                    if real_obs is not None and show_real_windows:
-                        display_camera_images(
-                            real_obs,
-                            policy_config=policy.config,
-                            window_name_prefix="Real",
-                            episode_idx=next_saved_episode_idx if output_dir is not None else None,
-                        )
-                    # Update the composite windows before any GPT/Turbo call so they
-                    # snap to policy resolution immediately after warmup confirm.
-                    display_camera_images(
-                        composite_display_obs,
-                        policy_config=policy.config,
-                        window_name_prefix="Composite",
-                        episode_idx=next_saved_episode_idx if output_dir is not None else None,
-                    )
-
-                # Policy input: real obs, GPT composite, turbo composite
-                # (when action queue empty), or raw composite.
+                composite_display_obs = None
+                observation = None
                 gpt_obs_refresh = False
                 turbo_obs_refresh = False
-                if args.obs or args.obs_eval:
-                    observation = real_obs
-                elif gpt_translators is not None and needs_prediction:
-                    _update_gpt_style_references(gpt_translators, gpt_style_dirs, _gpt_style_frame_cache, step)
-                    observation = apply_gpt_per_camera_parallel(gpt_translators, composite_obs, frame_idx=step)
-                    gpt_obs_refresh = True
-                elif turbo_translators is not None and needs_prediction:
-                    observation = apply_turbo_per_camera(turbo_translators, composite_obs)
-                    turbo_obs_refresh = True
+
+                if not used_cached_action:
+                    need_real_obs = (
+                        args.obs or args.obs_eval
+                        or (obs_frames is not None and show_real_windows)
+                    )
+                    if need_real_obs:
+                        real_obs = build_observation_from_mujoco(
+                            model, data, renderer,
+                            seg_renderer=seg_renderer,
+                            robot_geom_ids=robot_geom_ids,
+                            gaussian_data=gaussian_data,
+                            obs_frames=obs_frames,
+                            frame_idx=step,
+                        )
+
+                    need_composite_obs = not (args.obs or args.obs_eval)
+                    if not args.fast_rollout_video_replay:
+                        need_composite_obs = True
+                    if need_composite_obs:
+                        composite_obs = build_observation_from_mujoco(
+                            model, data, renderer,
+                            seg_renderer=seg_renderer,
+                            robot_geom_ids=robot_geom_ids,
+                            gaussian_data=gaussian_data,
+                            obs_frames=None,
+                            frame_idx=step,
+                        )
+                        composite_display_obs = composite_obs
+                        if resize_policy_images:
+                            composite_display_obs = copy_observation_frame_with_resized_images(
+                                composite_obs, args.policy_input_h, args.policy_input_w
+                            )
+
+                    if not args.headless:
+                        if real_obs is not None and show_real_windows:
+                            display_camera_images(
+                                real_obs,
+                                policy_config=policy.config,
+                                window_name_prefix="Real",
+                                episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                            )
+                        if composite_display_obs is not None:
+                            # Update composite windows before any GPT/Turbo call so
+                            # they snap to policy resolution after warmup confirm.
+                            display_camera_images(
+                                composite_display_obs,
+                                policy_config=policy.config,
+                                window_name_prefix="Composite",
+                                episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                            )
+
+                    # Policy input: real obs, GPT composite, turbo composite
+                    # (when action queue empty), or raw composite.
+                    if args.obs or args.obs_eval:
+                        observation = real_obs
+                    elif gpt_translators is not None and needs_prediction:
+                        if composite_obs is None:
+                            raise RuntimeError("GPT fast rollout needs a composite observation on prediction steps.")
+                        _update_gpt_style_references(gpt_translators, gpt_style_dirs, _gpt_style_frame_cache, step)
+                        observation = apply_gpt_per_camera_parallel(gpt_translators, composite_obs, frame_idx=step)
+                        gpt_obs_refresh = True
+                    elif turbo_translators is not None and needs_prediction:
+                        if composite_obs is None:
+                            raise RuntimeError("Turbo fast rollout needs a composite observation on prediction steps.")
+                        observation = apply_turbo_per_camera(turbo_translators, composite_obs)
+                        turbo_obs_refresh = True
+                    else:
+                        observation = composite_obs
+
+                    if observation is None:
+                        raise RuntimeError("No observation was built for a fresh policy prediction.")
+
+                    if hasattr(policy.config, 'language_features') and policy.config.language_features:
+                        observation["observation.language"] = args.prompt
+
+                    obs_for_policy = observation
+                    if resize_policy_images:
+                        obs_for_policy = copy_observation_frame_with_resized_images(
+                            observation, args.policy_input_h, args.policy_input_w
+                        )
+
+                    if gpt_translators is not None and gpt_obs_refresh:
+                        last_gpt_policy_display_obs = {
+                            k: np.ascontiguousarray(obs_for_policy[k].copy())
+                            for k in obs_for_policy
+                            if "image" in k.lower() and isinstance(obs_for_policy[k], np.ndarray)
+                        }
+                    if turbo_translators is not None and turbo_obs_refresh:
+                        last_turbo_policy_display_obs = {
+                            k: np.ascontiguousarray(obs_for_policy[k].copy())
+                            for k in obs_for_policy
+                            if "image" in k.lower() and isinstance(obs_for_policy[k], np.ndarray)
+                        }
+                    if output_dir is not None and current_prediction_event_idx is not None and composite_display_obs is not None:
+                        if gpt_obs_refresh and last_gpt_policy_display_obs is not None:
+                            prediction_event_panels.append(
+                                (
+                                    "gpt",
+                                    current_prediction_event_idx,
+                                    step,
+                                    build_prediction_event_panel(
+                                        "GPT",
+                                        composite_display_obs,
+                                        last_gpt_policy_display_obs,
+                                        tile_width=WINDOW_W,
+                                        tile_height=WINDOW_H,
+                                    ),
+                                )
+                            )
+                        if turbo_obs_refresh and last_turbo_policy_display_obs is not None:
+                            prediction_event_panels.append(
+                                (
+                                    "turbo",
+                                    current_prediction_event_idx,
+                                    step,
+                                    build_prediction_event_panel(
+                                        "Turbo",
+                                        composite_display_obs,
+                                        last_turbo_policy_display_obs,
+                                        tile_width=WINDOW_W,
+                                        tile_height=WINDOW_H,
+                                    ),
+                                )
+                            )
+
+                    # Display resized policy input (same tensor as predict_action)
+                    if not args.headless:
+                        if gpt_translators is not None and last_gpt_policy_display_obs is not None:
+                            display_camera_images(
+                                last_gpt_policy_display_obs,
+                                policy_config=policy.config,
+                                window_name_prefix="GPT",
+                                episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                            )
+                        if turbo_translators is not None and last_turbo_policy_display_obs is not None:
+                            display_camera_images(
+                                last_turbo_policy_display_obs,
+                                policy_config=policy.config,
+                                window_name_prefix="Turbo",
+                                episode_idx=next_saved_episode_idx if output_dir is not None else None,
+                            )
+                    if args.record and output_dir is not None and not args.fast_rollout_video_replay:
+                        display_rows: list[tuple[str, dict | None]] = []
+                        if real_obs is not None and show_real_windows:
+                            display_rows.append(("Real", real_obs))
+                        display_rows.append(("Composite", composite_display_obs))
+                        if gpt_translators is not None:
+                            display_rows.append(("GPT", last_gpt_policy_display_obs))
+                        if turbo_translators is not None:
+                            display_rows.append(("Turbo", last_turbo_policy_display_obs))
+                        combined_rgb = build_combined_window_frame(
+                            display_rows,
+                            tile_width=WINDOW_W,
+                            tile_height=WINDOW_H,
+                        )
+                        combined_bgr = cv2.cvtColor(combined_rgb, cv2.COLOR_RGB2BGR)
+                        if episode_window_writer is None:
+                            if current_episode_output_dir is None:
+                                raise RuntimeError("Episode output directory was not reserved before recording.")
+                            episode_window_tmp_path = current_episode_output_dir / "combined_windows_tmp.mp4"
+                            episode_window_tmp_path.unlink(missing_ok=True)
+                            frame_h, frame_w = combined_bgr.shape[:2]
+                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                            episode_window_writer = cv2.VideoWriter(
+                                str(episode_window_tmp_path),
+                                fourcc,
+                                args.fps,
+                                (frame_w, frame_h),
+                            )
+                            if not episode_window_writer.isOpened():
+                                raise RuntimeError(f"Failed to open video writer for {episode_window_tmp_path}")
+                        episode_window_writer.write(combined_bgr)
+
+                    with torch.inference_mode():
+                        if needs_prediction:
+                            prediction_events += 1
+                        action = predict_action(
+                            obs_for_policy,
+                            policy,
+                            device,
+                            preprocessor,
+                            postprocessor,
+                            policy.config.use_amp,
+                            task=args.prompt,
+                            robot_type="xarm_follower",
+                        )
                 else:
-                    observation = composite_obs
+                    action = cached_action
 
-                if hasattr(policy.config, 'language_features') and policy.config.language_features:
-                    observation["observation.language"] = args.prompt
+                snapshot = capture_mujoco_snapshot(data)
+                if args.fast_rollout_video_replay:
+                    episode_snapshots.append(snapshot)
 
-                # Record composite frames (fresh every step, shows actual sim state)
-                for _cam_key, _cam_cfg in CAMERA_CONFIG.items():
-                    _obs_key = f"observation.images.{_cam_cfg['dataset_cam']}"
-                    if _obs_key in composite_obs:
-                        episode_frames[_cam_key].append(composite_obs[_obs_key].copy())
+                if composite_obs is not None:
+                    # Record composite frames (fresh every step in normal mode).
+                    for _cam_key, _cam_cfg in CAMERA_CONFIG.items():
+                        _obs_key = f"observation.images.{_cam_cfg['dataset_cam']}"
+                        if _obs_key in composite_obs and not args.fast_rollout_video_replay:
+                            episode_frames[_cam_key].append(composite_obs[_obs_key].copy())
+                    state_for_episode = composite_obs[OBS_STATE]
+                else:
+                    state_for_episode = build_state_from_mujoco(model, data)
+                episode_states.append(
+                    state_for_episode.copy()
+                    if isinstance(state_for_episode, np.ndarray)
+                    else state_for_episode
+                )
 
-                episode_states.append(composite_obs[OBS_STATE].copy()
-                                      if isinstance(composite_obs[OBS_STATE], np.ndarray)
-                                      else composite_obs[OBS_STATE])
-
-                obs_for_policy = observation
-                if resize_policy_images:
-                    obs_for_policy = copy_observation_frame_with_resized_images(
-                        observation, args.policy_input_h, args.policy_input_w
-                    )
-
-                if gpt_translators is not None and gpt_obs_refresh:
-                    last_gpt_policy_display_obs = {
-                        k: np.ascontiguousarray(obs_for_policy[k].copy())
-                        for k in obs_for_policy
-                        if "image" in k.lower() and isinstance(obs_for_policy[k], np.ndarray)
-                    }
-                if turbo_translators is not None and turbo_obs_refresh:
-                    last_turbo_policy_display_obs = {
-                        k: np.ascontiguousarray(obs_for_policy[k].copy())
-                        for k in obs_for_policy
-                        if "image" in k.lower() and isinstance(obs_for_policy[k], np.ndarray)
-                    }
-                if output_dir is not None and current_prediction_event_idx is not None:
-                    if gpt_obs_refresh and last_gpt_policy_display_obs is not None:
-                        prediction_event_panels.append(
-                            (
-                                "gpt",
-                                current_prediction_event_idx,
-                                step,
-                                build_prediction_event_panel(
-                                    "GPT",
-                                    composite_display_obs,
-                                    last_gpt_policy_display_obs,
-                                    tile_width=WINDOW_W,
-                                    tile_height=WINDOW_H,
-                                ),
-                            )
-                        )
-                    if turbo_obs_refresh and last_turbo_policy_display_obs is not None:
-                        prediction_event_panels.append(
-                            (
-                                "turbo",
-                                current_prediction_event_idx,
-                                step,
-                                build_prediction_event_panel(
-                                    "Turbo",
-                                    composite_display_obs,
-                                    last_turbo_policy_display_obs,
-                                    tile_width=WINDOW_W,
-                                    tile_height=WINDOW_H,
-                                ),
-                            )
-                        )
-
-                # Display resized policy input (same tensor as predict_action)
-                if not args.headless:
-                    if gpt_translators is not None and last_gpt_policy_display_obs is not None:
-                        display_camera_images(
-                            last_gpt_policy_display_obs,
-                            policy_config=policy.config,
-                            window_name_prefix="GPT",
-                            episode_idx=next_saved_episode_idx if output_dir is not None else None,
-                        )
-                    if turbo_translators is not None and last_turbo_policy_display_obs is not None:
-                        display_camera_images(
-                            last_turbo_policy_display_obs,
-                            policy_config=policy.config,
-                            window_name_prefix="Turbo",
-                            episode_idx=next_saved_episode_idx if output_dir is not None else None,
-                        )
-                if args.record and output_dir is not None:
-                    display_rows: list[tuple[str, dict | None]] = []
-                    if real_obs is not None and show_real_windows:
-                        display_rows.append(("Real", real_obs))
-                    display_rows.append(("Composite", composite_display_obs))
-                    if gpt_translators is not None:
-                        display_rows.append(("GPT", last_gpt_policy_display_obs))
-                    if turbo_translators is not None:
-                        display_rows.append(("Turbo", last_turbo_policy_display_obs))
-                    combined_rgb = build_combined_window_frame(
-                        display_rows,
-                        tile_width=WINDOW_W,
-                        tile_height=WINDOW_H,
-                    )
-                    combined_bgr = cv2.cvtColor(combined_rgb, cv2.COLOR_RGB2BGR)
-                    if episode_window_writer is None:
-                        if current_episode_output_dir is None:
-                            raise RuntimeError("Episode output directory was not reserved before recording.")
-                        episode_window_tmp_path = current_episode_output_dir / "combined_windows_tmp.mp4"
-                        episode_window_tmp_path.unlink(missing_ok=True)
-                        frame_h, frame_w = combined_bgr.shape[:2]
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        episode_window_writer = cv2.VideoWriter(
-                            str(episode_window_tmp_path),
-                            fourcc,
-                            args.fps,
-                            (frame_w, frame_h),
-                        )
-                        if not episode_window_writer.isOpened():
-                            raise RuntimeError(f"Failed to open video writer for {episode_window_tmp_path}")
-                    episode_window_writer.write(combined_bgr)
-
-                with torch.inference_mode():
-                    if needs_prediction:
-                        prediction_events += 1
-                    # print(observation["observation.state"])
-                    action = predict_action(
-                        obs_for_policy,
-                        policy,
-                        device,
-                        preprocessor,
-                        postprocessor,
-                        policy.config.use_amp,
-                        task=args.prompt,
-                        robot_type="xarm_follower",
-                    )
-                # print(action)
                 episode_actions.append(action.cpu().numpy().copy())
 
                 ctrl = convert_action_to_mujoco(action, gripper_mj_range)
@@ -2315,7 +2528,7 @@ def main():
 
                 elapsed = time.perf_counter() - step_start
                 sleep_time = max(0, step_dt - elapsed)
-                if sleep_time > 0:
+                if sleep_time > 0 and not args.fast_rollout_video_replay:
                     time.sleep(sleep_time)
 
                 step += 1
@@ -2341,7 +2554,7 @@ def main():
                 events["right_arrow"] = False
                 events["exit_early"] = False
                 if prediction_limit_reached:
-                    reason = f"prediction limit reached ({_MAX_PREDICTION_EVENTS_PER_TRAJECTORY})"
+                    reason = f"prediction limit reached ({max_prediction_events_per_trajectory})"
                 else:
                     reason = "max steps reached" if step >= args.max_steps else "RIGHT pressed"
                 saved_episodes.append({
@@ -2357,6 +2570,14 @@ def main():
                     ep_dir = current_episode_output_dir
                     np.save(str(ep_dir / "states.npy"), np.array(episode_states))
                     np.save(str(ep_dir / "actions.npy"), np.array(episode_actions))
+                    if args.fast_rollout_video_replay and episode_snapshots:
+                        np.savez_compressed(
+                            str(ep_dir / "sim_snapshots.npz"),
+                            qpos=np.stack([snapshot["qpos"] for snapshot in episode_snapshots]),
+                            qvel=np.stack([snapshot["qvel"] for snapshot in episode_snapshots]),
+                            ctrl=np.stack([snapshot["ctrl"] for snapshot in episode_snapshots]),
+                            time=np.array([snapshot["time"] for snapshot in episode_snapshots], dtype=np.float64),
+                        )
                     if prediction_event_panels:
                         prediction_dir = ep_dir / "prediction_events"
                         prediction_dir.mkdir(parents=True, exist_ok=True)
@@ -2368,19 +2589,22 @@ def main():
                                 str(_panel_path),
                                 cv2.cvtColor(_panel_rgb, cv2.COLOR_RGB2BGR),
                             )
-                    for _cam_key, _frames in episode_frames.items():
-                        if not _frames:
-                            continue
-                        _dataset_cam = CAMERA_CONFIG[_cam_key]["dataset_cam"]
-                        _video_path = ep_dir / f"{_dataset_cam}.mp4"
-                        _h, _w = _frames[0].shape[:2]
-                        _fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        _writer = cv2.VideoWriter(str(_video_path), _fourcc, args.fps, (_w, _h))
-                        for _frame in _frames:
-                            _writer.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
-                        _writer.release()
-                        # print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
-                    if args.record:
+                    if args.fast_rollout_video_replay:
+                        pending_fast_replay_dirs.append(ep_dir)
+                    else:
+                        for _cam_key, _frames in episode_frames.items():
+                            if not _frames:
+                                continue
+                            _dataset_cam = CAMERA_CONFIG[_cam_key]["dataset_cam"]
+                            _video_path = ep_dir / f"{_dataset_cam}.mp4"
+                            _h, _w = _frames[0].shape[:2]
+                            _fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                            _writer = cv2.VideoWriter(str(_video_path), _fourcc, args.fps, (_w, _h))
+                            for _frame in _frames:
+                                _writer.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
+                            _writer.release()
+                            # print(f"[INFO] Saved {len(_frames)}-frame video: {_video_path}")
+                    if args.record and not args.fast_rollout_video_replay:
                         _finalize_episode_window_recording(ep_dir / "combined_windows.mp4")
                     print(f"[INFO] Episode data saved ({reason}) → {ep_dir.resolve()}", flush=True)
                     current_episode_output_dir = None
@@ -2394,6 +2618,16 @@ def main():
                       # f"({step} steps, {completed_episodes}/{num_eval_episodes} done){_save_note}")
 
             episode_idx += 1
+
+        if args.fast_rollout_video_replay and pending_fast_replay_dirs:
+            print(
+                f"[INFO] Rendering offline videos for {len(pending_fast_replay_dirs)} completed episode(s)...",
+                flush=True,
+            )
+            for replay_ep_dir in pending_fast_replay_dirs:
+                snapshots = _load_episode_snapshots(replay_ep_dir)
+                _render_episode_videos_from_snapshots(snapshots, replay_ep_dir)
+                print(f"[INFO] Offline videos rendered → {replay_ep_dir.resolve()}", flush=True)
 
     except KeyboardInterrupt:
         # print("\n[INFO] Interrupted by user")

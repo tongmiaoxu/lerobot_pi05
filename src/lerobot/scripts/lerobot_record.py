@@ -63,6 +63,7 @@ lerobot-record \
 """
 
 import logging
+import json
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -70,6 +71,7 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any
 from math import inf
+import numpy as np
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
@@ -155,10 +157,10 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
 # Set to None to require --policy.path to be passed explicitly on the CLI.
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/pi05_place_mug/checkpoints/100000/pretrained_model"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_hang_mug/checkpoints/last/pretrained_model"
 # _DEFAULT_RECORD_POLICY_CHECKPOINT = None
-_DEFAULT_RECORD_TASK_ID = "place_mug"
-_NUM_EPISODES = 10
+_DEFAULT_RECORD_TASK_ID = "hang_mug"
+_NUM_EPISODES = 9
 
 
 def _extract_checkpoint_name(policy_path: str | Path | None) -> str | None:
@@ -170,6 +172,111 @@ def _extract_checkpoint_name(policy_path: str | Path | None) -> str | None:
         if idx + 1 < len(parts):
             return parts[idx + 1]
     return None
+
+
+def _to_numpy_1d(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value, dtype=np.float32)
+    return arr.reshape(-1)
+
+
+def _dataset_image_to_hwc_uint8(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+        arr = np.moveaxis(arr, 0, -1)
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = np.clip(arr, 0.0, 1.0) * 255.0
+    return np.ascontiguousarray(arr.astype(np.uint8))
+
+
+def _source_item_to_observation_frame(
+    source_item: dict[str, Any],
+    target_features: dict[str, dict],
+) -> dict[str, np.ndarray]:
+    frame: dict[str, np.ndarray] = {}
+    for key, ft in target_features.items():
+        if not key.startswith(OBS_STR):
+            continue
+        if key not in source_item:
+            raise KeyError(f"Replay dataset frame is missing required key: {key}")
+        if ft["dtype"] in ["image", "video"]:
+            image = _dataset_image_to_hwc_uint8(source_item[key])
+            target_h, target_w = ft["shape"][:2]
+            if image.shape[:2] != (target_h, target_w):
+                import cv2
+
+                image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            frame[key] = image
+        else:
+            frame[key] = _to_numpy_1d(source_item[key])
+    return frame
+
+
+def _observation_frame_to_robot_observation(
+    observation_frame: dict[str, Any],
+    observation_features: dict[str, dict],
+) -> RobotObservation:
+    obs: RobotObservation = {}
+    state = _to_numpy_1d(observation_frame[f"{OBS_STR}.state"])
+    for name, value in zip(observation_features[f"{OBS_STR}.state"]["names"], state, strict=True):
+        obs[name] = float(value)
+    for key in observation_frame:
+        image_prefix = f"{OBS_STR}.images."
+        if key.startswith(image_prefix):
+            obs[key.removeprefix(image_prefix)] = observation_frame[key]
+    return obs
+
+
+def _action_dict_to_numpy(action: RobotAction, features: dict[str, dict]) -> np.ndarray:
+    names = features[ACTION]["names"]
+    return np.asarray([action[name] for name in names], dtype=np.float32)
+
+
+def _summarize_prediction_errors(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not records:
+        return {}
+    errors = np.asarray([r["error"] for r in records], dtype=np.float32)
+    abs_errors = np.abs(errors)
+    l2 = np.asarray([r["l2"] for r in records], dtype=np.float32)
+    return {
+        "num_frames": len(records),
+        "mean_abs_error": abs_errors.mean(axis=0).tolist(),
+        "max_abs_error": abs_errors.max(axis=0).tolist(),
+        "mean_l2": float(l2.mean()),
+        "max_l2": float(l2.max()),
+    }
+
+
+def _write_prediction_error_report(
+    output_root: Path,
+    output_episode_index: int,
+    source_episode_index: int,
+    action_names: list[str],
+    records: list[dict[str, Any]],
+) -> None:
+    report = {
+        "output_episode_index": output_episode_index,
+        "source_episode_index": source_episode_index,
+        "action_names": action_names,
+        "summary": _summarize_prediction_errors(records),
+        "frames": records,
+    }
+    out_path = output_root / (
+        f"obs_prediction_errors_episode_{output_episode_index:06d}"
+        f"_source_{source_episode_index:06d}.json"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    summary = report["summary"]
+    logging.info(
+        "Saved --obs prediction error report to %s (mean_l2=%.4f, max_l2=%.4f)",
+        out_path,
+        summary.get("mean_l2", float("nan")),
+        summary.get("max_l2", float("nan")),
+    )
 
 @dataclass
 class DatasetRecordConfig:
@@ -247,6 +354,12 @@ class RecordConfig:
     play_sounds: bool = False
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Use observations from the task dataset instead of live robot cameras/state.
+    obs: bool = False
+    # Dataset root used by --obs. Defaults to the selected task's training dataset (data_hang_mug).
+    obs_dataset_path: str | Path | None = None
+    # Source episode for --obs when no grid selection is used.
+    obs_episode: int = 0
     # Load initial-state contour overlays from initial_states_overlay.py output.
     select: bool = True
     # Dataset root containing initial_states_overlay.py output (e.g. data_place_mug/).
@@ -289,6 +402,8 @@ class RecordConfig:
                 self.dataset.root = task_profile.dataset_root
         if self.initial_states_dir is None:
             self.initial_states_dir = task_profile.dataset_root
+        if self.obs_dataset_path is None:
+            self.obs_dataset_path = task_profile.dataset_root
         if self.object_name is None:
             self.object_name = task_profile.selection_object_name
 
@@ -358,6 +473,9 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
     policy_input_resize: tuple[int, int] | None = None,
+    obs_source_dataset: LeRobotDataset | None = None,
+    obs_source_episode_index: int | None = None,
+    prediction_error_records: list[dict[str, Any]] | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -404,14 +522,34 @@ def record_loop(
             events["exit_early"] = False
             break
 
+        if obs_source_dataset is not None and loop_step >= len(obs_source_dataset):
+            logging.info(
+                "--obs replay source episode %s ended after %s frames",
+                obs_source_episode_index,
+                loop_step,
+            )
+            break
+
         # Get robot observation
         obs = robot.get_observation()
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
+        source_item = None
         if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            if obs_source_dataset is not None:
+                source_item = obs_source_dataset[loop_step]
+                observation_frame = _source_item_to_observation_frame(
+                    source_item,
+                    dataset.features,
+                )
+                obs_processed = _observation_frame_to_robot_observation(
+                    observation_frame,
+                    dataset.features,
+                )
+            else:
+                observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
@@ -462,6 +600,33 @@ def record_loop(
                 )
             # print(action_values)
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+            if (
+                source_item is not None
+                and prediction_error_records is not None
+                and ACTION in source_item
+            ):
+                pred_np = _action_dict_to_numpy(act_processed_policy, dataset.features)
+                gt_np = _to_numpy_1d(source_item[ACTION])
+                if pred_np.shape == gt_np.shape:
+                    error = pred_np - gt_np
+                    prediction_error_records.append(
+                        {
+                            "frame_index": loop_step,
+                            "source_episode_index": obs_source_episode_index,
+                            "predicted_action": pred_np.tolist(),
+                            "ground_truth_action": gt_np.tolist(),
+                            "error": error.tolist(),
+                            "abs_error": np.abs(error).tolist(),
+                            "l2": float(np.linalg.norm(error)),
+                        }
+                    )
+                else:
+                    logging.warning(
+                        "Skipping prediction error for frame %s: predicted shape %s != ground-truth shape %s",
+                        loop_step,
+                        pred_np.shape,
+                        gt_np.shape,
+                    )
 
         elif policy is None and isinstance(teleop, Teleoperator):
             act = teleop.get_action()
@@ -876,23 +1041,30 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+    task_profile = get_task_profile(cfg.dataset.task_id)
+    obs_reference_dataset = None
+    if cfg.obs:
+        obs_reference_dataset = LeRobotDataset(
+            task_profile.dataset_repo_id,
+            root=cfg.obs_dataset_path,
+            episodes=[cfg.obs_episode],
+        )
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
-    dataset_features = combine_feature_dicts(
-        aggregate_pipeline_dataset_features(
-            pipeline=teleop_action_processor,
-            initial_features=create_initial_features(
-                action=robot.action_features
-            ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
-            use_videos=cfg.dataset.video,
-        ),
-        aggregate_pipeline_dataset_features(
-            pipeline=robot_observation_processor,
-            initial_features=create_initial_features(observation=robot.observation_features),
-            use_videos=cfg.dataset.video,
-        ),
+    action_dataset_features = aggregate_pipeline_dataset_features(
+        pipeline=teleop_action_processor,
+        initial_features=create_initial_features(
+            action=robot.action_features
+        ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
+        use_videos=cfg.dataset.video,
     )
+    observation_dataset_features = aggregate_pipeline_dataset_features(
+        pipeline=robot_observation_processor,
+        initial_features=create_initial_features(observation=robot.observation_features),
+        use_videos=cfg.dataset.video,
+    )
+    dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
 
     dataset = None
     listener = None
@@ -949,10 +1121,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         preprocessor = None
         postprocessor = None
         if cfg.policy is not None:
+            policy_dataset_stats = (
+                obs_reference_dataset.meta.stats
+                if obs_reference_dataset is not None
+                else dataset.meta.stats
+            )
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
-                dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+                dataset_stats=rename_stats(policy_dataset_stats, cfg.dataset.rename_map),
                 preprocessor_overrides={
                     "device_processor": {"device": cfg.policy.device},
                     "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
@@ -996,6 +1173,28 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 selected_indices=selected_episode_indices,
                 output_path=dataset_root / "selected_states_grid.png",
             )
+
+        obs_source_cache: dict[int, LeRobotDataset] = {}
+        if obs_reference_dataset is not None:
+            obs_source_cache[cfg.obs_episode] = obs_reference_dataset
+
+        def _load_obs_source_episode(source_episode_idx: int) -> LeRobotDataset | None:
+            if not cfg.obs:
+                return None
+            if source_episode_idx not in obs_source_cache:
+                obs_source_cache[source_episode_idx] = LeRobotDataset(
+                    task_profile.dataset_repo_id,
+                    root=cfg.obs_dataset_path,
+                    episodes=[source_episode_idx],
+                )
+            source_dataset = obs_source_cache[source_episode_idx]
+            logging.info(
+                "--obs: using %s episode %s (%s frames) for policy images/state",
+                cfg.obs_dataset_path,
+                source_episode_idx,
+                len(source_dataset),
+            )
+            return source_dataset
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
@@ -1091,6 +1290,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                             cfg.dataset.policy_input_resize_height,
                             cfg.dataset.policy_input_resize_width,
                         )
+                    obs_source_episode_idx = cfg.obs_episode
+                    if selected_episode_indices is not None:
+                        obs_source_episode_idx = selected_episode_indices[recorded_episodes]
+                    obs_source_dataset = _load_obs_source_episode(obs_source_episode_idx)
+                    prediction_error_records: list[dict[str, Any]] = []
                     record_loop(
                         robot=robot,
                         events=events,
@@ -1108,6 +1312,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_data=cfg.display_data,
                         display_compressed_images=display_compressed_images,
                         policy_input_resize=_policy_resize,
+                        obs_source_dataset=obs_source_dataset,
+                        obs_source_episode_index=obs_source_episode_idx if obs_source_dataset is not None else None,
+                        prediction_error_records=prediction_error_records if obs_source_dataset is not None else None,
                     )
 
                     if events["stop_recording"]:
@@ -1127,7 +1334,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         saved_with_right_arrow = events["right_arrow"]
                         events["right_arrow"] = False
                         events["exit_early"] = False
+                        output_episode_index = dataset.num_episodes
                         dataset.save_episode()
+                        if obs_source_dataset is not None and prediction_error_records:
+                            _write_prediction_error_report(
+                                output_root=dataset_root,
+                                output_episode_index=output_episode_index,
+                                source_episode_index=obs_source_episode_idx,
+                                action_names=dataset.features[ACTION]["names"],
+                                records=prediction_error_records,
+                            )
                         recorded_episodes += 1
                         print(f">>> Episode saved ({recorded_episodes}/{cfg.dataset.num_episodes})")
                         if saved_with_right_arrow and move_to_initial_pose_on_right_arrow:
