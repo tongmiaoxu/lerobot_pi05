@@ -15,7 +15,7 @@ if str(SRC_ROOT) not in sys.path:
 from lerobot.tasks import get_task_profile, get_task_profiles
 
 
-SUPPORTED_POLICIES = ("act", "diffusion", "pi05", "groot")
+SUPPORTED_POLICIES = ("act", "diffusion", "pi0", "pi05", "groot")
 
 
 def has_flag(args: list[str], prefix: str) -> bool:

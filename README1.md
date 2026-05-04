@@ -164,6 +164,26 @@ python scripts/train_task.py \
 ```bash
 python scripts/train_task.py \
   --task-id=place_mug \
+  --policy-type=pi0 \
+  --policy.device=cuda \
+  --policy.pretrained_path=lerobot/pi0_base \
+  --policy.push_to_hub=false \
+  --policy.compile_model=false \
+  --policy.gradient_checkpointing=true \
+  --policy.dtype=bfloat16 \
+  --policy.train_expert_only=true \
+  --policy.scheduler_warmup_steps=1000 \
+  --policy.scheduler_decay_steps=50000 \
+  --dataset.use_imagenet_stats=false \
+  --dataset.image_transforms.enable=true \
+  --batch_size=16 \
+  --steps=100000 \
+  --save_freq=40000
+```
+
+```bash
+python scripts/train_task.py \
+  --task-id=place_mug \
   --policy-type=groot \
   --policy.device=cuda \
   --policy.push_to_hub=false \
