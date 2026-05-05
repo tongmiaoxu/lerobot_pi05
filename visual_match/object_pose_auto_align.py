@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,8 @@ class ObjectPoseAlignConfig:
     object_name: str
     cache_dir: str | Path | None = None
     camera_key: str = "stationary"
+    #: Maps calibration body name → MuJoCo free-joint name (from task profile).
+    free_joint_pairs: tuple[tuple[str, str], ...] | None = None
     optimize_z: bool = False
     xy_range_m: float = 0.12
     z_range_m: float = 0.03
@@ -128,6 +131,15 @@ def _geom_id_for_object(model: mujoco.MjModel, object_name: str) -> int:
         geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
         if geom_id >= 0:
             return int(geom_id)
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, object_name)
+    if body_id >= 0:
+        body_geom_ids = np.where(model.geom_bodyid == body_id)[0]
+        for geom_id in body_geom_ids:
+            geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(geom_id)) or ""
+            if "visual" in geom_name:
+                return int(geom_id)
+        if len(body_geom_ids) > 0:
+            return int(body_geom_ids[0])
     raise ValueError(f"Could not find visual geom for object {object_name!r}")
 
 
@@ -138,14 +150,30 @@ def _body_id_for_object(model: mujoco.MjModel, object_name: str) -> int:
     return int(body_id)
 
 
-def _mug_qpos_addr(model: mujoco.MjModel) -> int:
-    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
+def _free_joint_qpos_addr(model: mujoco.MjModel, joint_name: str) -> int:
+    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
     return int(model.jnt_qposadr[joint_id]) if joint_id >= 0 else -1
 
 
-def _capture_pose(model: mujoco.MjModel, data: mujoco.MjData, object_name: str) -> dict[str, np.ndarray]:
+def _joint_name_for_free_object(
+    object_name: str, free_joint_by_body: Mapping[str, str] | None
+) -> str | None:
+    if free_joint_by_body and object_name in free_joint_by_body:
+        return free_joint_by_body[object_name]
     if object_name == "mug":
-        qpos_addr = _mug_qpos_addr(model)
+        return "mug_joint"
+    return f"{object_name}_joint"
+
+
+def _capture_pose(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    object_name: str,
+    free_joint_by_body: Mapping[str, str] | None = None,
+) -> dict[str, np.ndarray]:
+    joint_name = _joint_name_for_free_object(object_name, free_joint_by_body)
+    if joint_name is not None:
+        qpos_addr = _free_joint_qpos_addr(model, joint_name)
         if qpos_addr >= 0:
             return {
                 "kind": np.array("freejoint"),
@@ -164,21 +192,26 @@ def capture_object_poses(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     object_names: list[str],
+    free_joint_by_body: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, np.ndarray]]:
-    return {name: _capture_pose(model, data, name) for name in object_names}
+    return {name: _capture_pose(model, data, name, free_joint_by_body) for name in object_names}
 
 
 def apply_object_poses(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     poses: dict[str, dict[str, np.ndarray]],
+    free_joint_by_body: Mapping[str, str] | None = None,
 ) -> None:
     for object_name, pose in poses.items():
         kind = str(pose.get("kind", "body"))
         pos = np.asarray(pose["pos"], dtype=np.float64)
         quat = quat_normalize(np.asarray(pose["quat"], dtype=np.float64))
         if kind == "freejoint":
-            qpos_addr = _mug_qpos_addr(model)
+            joint_name = _joint_name_for_free_object(object_name, free_joint_by_body)
+            if joint_name is None:
+                continue
+            qpos_addr = _free_joint_qpos_addr(model, joint_name)
             if qpos_addr < 0:
                 continue
             data.qpos[qpos_addr:qpos_addr + 3] = pos
@@ -373,10 +406,11 @@ def auto_align_object_poses(
 ) -> ObjectPoseAlignResult:
     object_names = selection_object_names(config.object_name)
     cache_path = cache_path_for_episode(config, episode_idx)
+    free_joint_by_body = dict(config.free_joint_pairs) if config.free_joint_pairs else None
     if cache_path.exists() and not config.force:
         result = load_result(cache_path)
         if apply:
-            apply_object_poses(model, data, result.poses)
+            apply_object_poses(model, data, result.poses, free_joint_by_body=free_joint_by_body)
         return result
 
     if config.camera_key not in camera_config:
@@ -385,7 +419,7 @@ def auto_align_object_poses(
     target_masks = load_target_masks(config.initial_states_dir, object_names, episode_idx)
     target_info = _target_precompute(target_masks)
     geom_ids = {name: _geom_id_for_object(model, name) for name in object_names}
-    base_poses = capture_object_poses(model, data, object_names)
+    base_poses = capture_object_poses(model, data, object_names, free_joint_by_body=free_joint_by_body)
     start, specs = _pack_params(base_poses, object_names, config.optimize_z)
 
     lower = start.copy()
@@ -408,7 +442,7 @@ def auto_align_object_poses(
 
     def evaluate(params: np.ndarray) -> tuple[float, dict[str, float]]:
         poses = _poses_from_params(base_poses, params, specs)
-        apply_object_poses(model, data, poses)
+        apply_object_poses(model, data, poses, free_joint_by_body=free_joint_by_body)
         sim_masks = _render_sim_masks(
             model,
             data,
@@ -428,7 +462,7 @@ def auto_align_object_poses(
 
     best_params, best_loss = _coordinate_search(evaluate, start, lower, upper, yaw_indices)
     best_poses = _poses_from_params(base_poses, best_params, specs)
-    apply_object_poses(model, data, best_poses)
+    apply_object_poses(model, data, best_poses, free_joint_by_body=free_joint_by_body)
     _, best_iou = evaluate(best_params)
 
     result = ObjectPoseAlignResult(
@@ -441,5 +475,5 @@ def auto_align_object_poses(
     )
     save_result(result, cache_path)
     if apply:
-        apply_object_poses(model, data, result.poses)
+        apply_object_poses(model, data, result.poses, free_joint_by_body=free_joint_by_body)
     return result

@@ -37,9 +37,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_hang_mug/checkpoints/last/pretrained_model"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/diffusion_hang_mug/checkpoints/last/pretrained_model"
 _DEFAULT_RECORD_TASK_ID = "hang_mug"
-_NUM_EPISODES = 9
+_NUM_EPISODES = 10
 _MAX_PREDICTION_EVENTS_PER_TRAJECTORY_BY_TASK = {
     "hang_mug": 10,
     "place_mug": 6,
@@ -1350,6 +1350,8 @@ def main():
     elif args.output_dir is None:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
         args.output_dir = task_profile.sim_eval_root_for_policy(policy.config.type, checkpoint_name)
+        if turbo_enabled and "data_sim_eval" in args.output_dir:
+            args.output_dir = args.output_dir.replace("data_sim_eval", "data_sim_turbo_eval", 1)
     else:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
 
