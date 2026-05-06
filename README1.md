@@ -177,8 +177,8 @@ python scripts/train_task.py \
   --dataset.use_imagenet_stats=false \
   --dataset.image_transforms.enable=true \
   --batch_size=16 \
-  --steps=100000 \
-  --save_freq=40000
+  --steps=50000 \
+  --save_freq=5000
 ```
 
 ```bash
