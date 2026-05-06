@@ -17,6 +17,7 @@ import sys
 import argparse
 import subprocess
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -62,15 +63,23 @@ CAMERA_CONFIG = {
 }
 
 PROJECT_ROOT = Path(__file__).parent.parent
-_DEFAULT_RECORD_TASK_ID = "hang_mug"
-_DEFAULT_EPISODE = 1
+_DEFAULT_RECORD_TASK_ID = "pick_shoe"
+_DEFAULT_EPISODE = 0
 _DEFAULT_FPS = 30.0
 _DEFAULT_ALPHA = 0.7
 _DEFAULT_CALIB_FRAME = 140
 _DEFAULT_DATASET_ROOT = None
 _SHOW_SOURCES = False
 _SHOW_MUJOCO_VIEWER = True
-_YAW_ROTATABLE_BODIES = {"rack", "saucer"}
+
+
+@dataclass
+class _FreeJointEdit:
+    joint_name: str
+    qpos_addr: int
+    pos: np.ndarray
+    quat: np.ndarray
+    euler: np.ndarray
 
 
 def normalize_cli_tokens(argv: list[str]) -> list[str]:
@@ -220,33 +229,44 @@ def replace_xml_attr(text: str, element: str, name: str, attr: str, value: str) 
     return updated
 
 
+def replace_body_rotation_from_euler(text: str, body_name: str, euler: np.ndarray) -> str:
+    """Patch a <body> orientation; MJCF may use euler= or quat= (w x y z)."""
+    euler_str = f"{euler[0]:.4f} {euler[1]:.4f} {euler[2]:.4f}"
+    quat = quat_from_euler_xyz(euler)
+    quat_str = f"{quat[0]:.4f} {quat[1]:.4f} {quat[2]:.4f} {quat[3]:.4f}"
+    for attr, val in (("euler", euler_str), ("quat", quat_str)):
+        pattern = rf'^([ \t]*<body name="{re.escape(body_name)}"[^>]*{attr}=")[^"]*(".*)$'
+        updated, count = re.subn(pattern, rf"\g<1>{val}\g<2>", text, count=1, flags=re.MULTILINE)
+        if count:
+            return updated
+    raise ValueError(
+        f"Could not find body {body_name!r} with attribute 'euler' or 'quat' to set orientation"
+    )
+
+
 def update_scene_files(
     scene_xml_path: Path,
     xarm7_xml_path: Path,
-    mug_pos: np.ndarray | None,
-    mug_euler: np.ndarray | None,
+    *,
+    free_joint_bodies_pos_euler: dict[str, tuple[np.ndarray, np.ndarray]],
+    xarm7_home_free_joint_body: str | None,
     body_positions: dict[str, np.ndarray],
     body_eulers: dict[str, np.ndarray],
     table_pos: np.ndarray | None,
     table_euler: np.ndarray | None,
 ) -> None:
     scene_text = scene_xml_path.read_text()
-    if mug_pos is not None:
+    for body_name, (pos, euler) in free_joint_bodies_pos_euler.items():
         scene_text = replace_xml_attr(
-            scene_text, "body", "mug", "pos", f"{mug_pos[0]:.4f} {mug_pos[1]:.4f} {mug_pos[2]:.4f}"
+            scene_text, "body", body_name, "pos", f"{pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f}"
         )
-    if mug_euler is not None:
-        scene_text = replace_xml_attr(
-            scene_text, "body", "mug", "euler", f"{mug_euler[0]:.4f} {mug_euler[1]:.4f} {mug_euler[2]:.4f}"
-        )
+        scene_text = replace_body_rotation_from_euler(scene_text, body_name, euler)
     for name, pos in body_positions.items():
         scene_text = replace_xml_attr(
             scene_text, "body", name, "pos", f"{pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f}"
         )
     for name, euler in body_eulers.items():
-        scene_text = replace_xml_attr(
-            scene_text, "body", name, "euler", f"{euler[0]:.4f} {euler[1]:.4f} {euler[2]:.4f}"
-        )
+        scene_text = replace_body_rotation_from_euler(scene_text, name, euler)
     if table_pos is not None:
         scene_text = replace_xml_attr(
             scene_text, "body", "table", "pos", f"{table_pos[0]:.4f} {table_pos[1]:.4f} {table_pos[2]:.4f}"
@@ -258,8 +278,13 @@ def update_scene_files(
     scene_xml_path.write_text(scene_text)
     print(f"[INFO] Updated scene XML: {scene_xml_path}")
 
-    if mug_pos is not None and mug_euler is not None and xarm7_xml_path.exists():
-        quat = quat_from_euler_xyz(mug_euler)
+    if (
+        xarm7_home_free_joint_body is not None
+        and xarm7_home_free_joint_body in free_joint_bodies_pos_euler
+        and xarm7_xml_path.exists()
+    ):
+        pos, euler = free_joint_bodies_pos_euler[xarm7_home_free_joint_body]
+        quat = quat_from_euler_xyz(euler)
         xarm_text = xarm7_xml_path.read_text()
         match = re.search(r'^([ \t]*<key name="home" qpos=")([^"]+)(" ctrl=")', xarm_text, flags=re.MULTILINE)
         if not match:
@@ -268,9 +293,9 @@ def update_scene_files(
         if len(qpos_tokens) < 7:
             raise ValueError(f"Unexpected home qpos in {xarm7_xml_path}: {match.group(2)}")
         qpos_tokens[-7:] = [
-            f"{mug_pos[0]:.4f}",
-            f"{mug_pos[1]:.4f}",
-            f"{mug_pos[2]:.4f}",
+            f"{pos[0]:.4f}",
+            f"{pos[1]:.4f}",
+            f"{pos[2]:.4f}",
             f"{quat[0]:.4f}",
             f"{quat[1]:.4f}",
             f"{quat[2]:.4f}",
@@ -279,7 +304,7 @@ def update_scene_files(
         new_qpos = " ".join(qpos_tokens)
         xarm_text = xarm_text[: match.start(2)] + new_qpos + xarm_text[match.end(2) :]
         xarm7_xml_path.write_text(xarm_text)
-        print(f"[INFO] Updated mug home pose in: {xarm7_xml_path}")
+        print(f"[INFO] Updated free-joint home pose ({xarm7_home_free_joint_body}) in: {xarm7_xml_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,8 +385,7 @@ def save_auto_align_cache(
     initial_states_dir: str | Path,
     object_name: str,
     cache_dir: str | Path | None,
-    mug_pos: np.ndarray | None,
-    mug_quat: np.ndarray | None,
+    free_joint_poses: dict[str, tuple[np.ndarray, np.ndarray]],
     body_positions: dict[str, np.ndarray],
     body_eulers: dict[str, np.ndarray],
     model: MjModel,
@@ -369,15 +393,20 @@ def save_auto_align_cache(
 ) -> Path:
     object_names = selection_object_names(object_name)
     poses: dict[str, dict[str, np.ndarray]] = {}
+    free_joint_bodies = frozenset(task_profile.calibration_free_joint_pair_dict())
 
     for name in object_names:
-        if name == "mug":
-            if mug_pos is None or mug_quat is None:
-                raise ValueError("Cannot save mug cache: mug pose is not available")
+        if name in free_joint_bodies:
+            if name not in free_joint_poses:
+                raise ValueError(
+                    f"Cannot save {name!r} cache: free-joint pose is not available "
+                    f"(task {task_profile.task_id!r})"
+                )
+            pos, quat = free_joint_poses[name]
             poses[name] = {
                 "kind": np.array("freejoint"),
-                "pos": np.asarray(mug_pos, dtype=np.float64).copy(),
-                "quat": quat_normalize(np.asarray(mug_quat, dtype=np.float64)),
+                "pos": np.asarray(pos, dtype=np.float64).copy(),
+                "quat": quat_normalize(np.asarray(quat, dtype=np.float64)),
             }
             continue
 
@@ -556,12 +585,25 @@ def main():
     seg_renderer.enable_segmentation_rendering()
     robot_geom_ids = get_robot_geom_ids(model)
 
-    mug_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "mug")
-    mug_joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
-    mug_qpos_addr = model.jnt_qposadr[mug_joint_id] if mug_joint_id >= 0 else -1
-    mug_pos = data.qpos[mug_qpos_addr : mug_qpos_addr + 3].copy() if mug_qpos_addr >= 0 else None
-    mug_quat = data.qpos[mug_qpos_addr + 3 : mug_qpos_addr + 7].copy() if mug_qpos_addr >= 0 else None
-    mug_euler = euler_xyz_from_quat(mug_quat) if mug_quat is not None else None
+    yaw_rotatable = frozenset(task_profile.calibration_body_yaw_rotatable_names)
+    free_edits: dict[str, _FreeJointEdit] = {}
+    for body_name, joint_name in task_profile.calibration_free_joint_pairs:
+        if body_name not in adjustable_objects:
+            continue
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if jid < 0:
+            print(
+                f"[ERROR] Joint {joint_name!r} for body {body_name!r} not found "
+                f"in {scene_xml_path.name}"
+            )
+            sys.exit(1)
+        addr = int(model.jnt_qposadr[jid])
+        pos = data.qpos[addr : addr + 3].copy()
+        quat = data.qpos[addr + 3 : addr + 7].copy()
+        euler = euler_xyz_from_quat(quat)
+        free_edits[body_name] = _FreeJointEdit(
+            joint_name=joint_name, qpos_addr=addr, pos=pos, quat=quat, euler=euler
+        )
 
     body_positions: dict[str, np.ndarray] = {}
     body_eulers: dict[str, np.ndarray] = {}
@@ -570,13 +612,7 @@ def main():
     table_pos = None
     table_euler = None
 
-    if "mug" in adjustable_objects and mug_qpos_addr < 0:
-        print(f"[ERROR] 'mug_joint' not found in {scene_xml_path.name}")
-        sys.exit(1)
-
     for name in adjustable_objects:
-        if name == "mug":
-            continue
         if name == "table":
             if table_body_id < 0:
                 print(f"[ERROR] 'table' body not found in {scene_xml_path.name}")
@@ -584,13 +620,15 @@ def main():
             table_pos = model.body_pos[table_body_id].copy()
             table_euler = euler_xyz_from_quat(model.body_quat[table_body_id].copy())
             continue
+        if name in free_edits:
+            continue
         body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
         if body_id < 0:
             print(f"[ERROR] '{name}' body not found in {scene_xml_path.name}")
             sys.exit(1)
         body_ids[name] = body_id
         body_positions[name] = model.body_pos[body_id].copy()
-        if name in _YAW_ROTATABLE_BODIES:
+        if name in yaw_rotatable:
             body_eulers[name] = euler_xyz_from_quat(model.body_quat[body_id].copy())
 
     cache_path = cache_path_for_episode(preview_cache_config, args.episode)
@@ -600,10 +638,11 @@ def main():
             for name, pose in cached_result.poses.items():
                 pos = np.asarray(pose["pos"], dtype=np.float64).copy()
                 quat = quat_normalize(np.asarray(pose["quat"], dtype=np.float64))
-                if name == "mug" and mug_pos is not None and mug_quat is not None:
-                    mug_pos = pos
-                    mug_quat = quat.copy()
-                    mug_euler = euler_xyz_from_quat(mug_quat)
+                if name in free_edits:
+                    fe = free_edits[name]
+                    fe.pos[:] = pos
+                    fe.quat[:] = quat.copy()
+                    fe.euler[:] = euler_xyz_from_quat(fe.quat)
                 elif name == "table" and table_pos is not None:
                     table_pos = pos
                     table_euler = euler_xyz_from_quat(quat)
@@ -624,9 +663,16 @@ def main():
     current_obj = adjustable_objects[0]
     viewer_handle = None
 
-    mug_pos_init = mug_pos.copy() if mug_pos is not None else None
-    mug_quat_init = mug_quat.copy() if mug_quat is not None else None
-    mug_euler_init = mug_euler.copy() if mug_euler is not None else None
+    free_edits_init = {
+        name: _FreeJointEdit(
+            joint_name=fe.joint_name,
+            qpos_addr=fe.qpos_addr,
+            pos=fe.pos.copy(),
+            quat=fe.quat.copy(),
+            euler=fe.euler.copy(),
+        )
+        for name, fe in free_edits.items()
+    }
     body_positions_init = {k: v.copy() for k, v in body_positions.items()}
     body_eulers_init = {k: v.copy() for k, v in body_eulers.items()}
     table_pos_init = table_pos.copy() if table_pos is not None else None
@@ -653,9 +699,9 @@ def main():
     def apply_pose_changes():
         viewer_lock = viewer_handle.lock() if viewer_handle is not None else nullcontext()
         with viewer_lock:
-            if "mug" in adjustable_objects and mug_qpos_addr >= 0 and mug_pos is not None and mug_quat is not None:
-                data.qpos[mug_qpos_addr : mug_qpos_addr + 3] = mug_pos
-                data.qpos[mug_qpos_addr + 3 : mug_qpos_addr + 7] = quat_normalize(mug_quat)
+            for fe in free_edits.values():
+                data.qpos[fe.qpos_addr : fe.qpos_addr + 3] = fe.pos
+                data.qpos[fe.qpos_addr + 3 : fe.qpos_addr + 7] = quat_normalize(fe.quat)
             for name, pos in body_positions.items():
                 model.body_pos[body_ids[name]] = pos
                 if name in body_eulers:
@@ -692,10 +738,12 @@ def main():
         apply_pose_changes()
 
     def reset_adjustments():
-        nonlocal mug_pos, mug_quat, mug_euler, table_pos, table_euler
-        mug_pos = mug_pos_init.copy() if mug_pos_init is not None else None
-        mug_quat = mug_quat_init.copy() if mug_quat_init is not None else None
-        mug_euler = mug_euler_init.copy() if mug_euler_init is not None else None
+        nonlocal table_pos, table_euler
+        for name, fe in free_edits.items():
+            ini = free_edits_init[name]
+            fe.pos[:] = ini.pos
+            fe.quat[:] = ini.quat
+            fe.euler[:] = ini.euler
         body_positions.clear()
         for name, pos in body_positions_init.items():
             body_positions[name] = pos.copy()
@@ -707,10 +755,11 @@ def main():
         apply_pose_changes()
 
     def move_current(dx: float, dy: float, dz: float):
-        if current_obj == "mug" and mug_pos is not None:
-            mug_pos[0] += dx
-            mug_pos[1] += dy
-            mug_pos[2] += dz
+        if current_obj in free_edits:
+            fe = free_edits[current_obj]
+            fe.pos[0] += dx
+            fe.pos[1] += dy
+            fe.pos[2] += dz
         elif current_obj in body_positions:
             body_positions[current_obj][0] += dx
             body_positions[current_obj][1] += dy
@@ -721,10 +770,11 @@ def main():
             table_pos[2] += dz
 
     def rotate_current_yaw(delta: float):
-        nonlocal mug_euler, mug_quat, table_euler
-        if current_obj == "mug" and mug_euler is not None:
-            mug_euler[2] += delta
-            mug_quat = quat_from_euler_xyz(mug_euler)
+        nonlocal table_euler
+        if current_obj in free_edits:
+            fe = free_edits[current_obj]
+            fe.euler[2] += delta
+            fe.quat[:] = quat_from_euler_xyz(fe.euler)
             return True
         if current_obj in body_eulers:
             body_eulers[current_obj][2] += delta
@@ -735,8 +785,9 @@ def main():
         return False
 
     def current_status() -> str:
-        if current_obj == "mug":
-            return f"mug pos={fmt_xyz(mug_pos)} euler={fmt_euler_deg(mug_euler)}"
+        if current_obj in free_edits:
+            fe = free_edits[current_obj]
+            return f"{current_obj} pos={fmt_xyz(fe.pos)} euler={fmt_euler_deg(fe.euler)}"
         if current_obj in body_positions:
             status = f"{current_obj} pos={fmt_xyz(body_positions[current_obj])}"
             if current_obj in body_eulers:
@@ -790,8 +841,8 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
             if show_help:
                 help_text = (
-                    "Arrows: XY | w/s: Z | j/l: yaw (mug/rack/saucer/table) | "
-                    "m/r/p/t/b: select | a/d: frame -/+1 | Space: replay | x: reset | +/-: alpha"
+                    "Arrows: XY | w/s: Z | j/l: yaw (free-joint + yaw bodies + table) | "
+                    "letter keys: select object | a/d: frame -/+1 | Space: replay | x: reset | +/-: alpha"
                 )
                 cv2.putText(blended, help_text, (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
@@ -846,12 +897,14 @@ def main():
         "saucer": "p",
         "sticker": "t",
         "table": "b",
+        "left_shoe": "f",
+        "right_shoe": "g",
     }
     select_help = " ".join(
         f"{selection_key_by_object[obj]}={obj}" for obj in adjustable_objects if obj in selection_key_by_object
     )
     print("[INFO] Position calibration mode")
-    print("[INFO] Arrows: XY | w/s: Z | j/l: yaw (mug/rack/saucer/table)")
+    print("[INFO] Arrows: XY | w/s: Z | j/l: yaw (free-joint objects, yaw-tracked bodies, table)")
     q_help = "save and next episode" if os.environ.get("OBJ_CALIB_RANGE_CHILD") == "1" else "save"
     print(
         f"[INFO] Select: {select_help} | a/d=frame -/+1 | "
@@ -1002,8 +1055,13 @@ def main():
         if moved or rotated:
             apply_pose_changes()
             print(f"[INFO] {current_status()}")
+        select_key_codes = [
+            ord(selection_key_by_object[obj])
+            for obj in adjustable_objects
+            if obj in selection_key_by_object
+        ]
         if moved or rotated or key in (
-            ord("m"), ord("r"), ord("p"), ord("t"), ord("b"),
+            *select_key_codes,
             ord("+"), ord("="), ord("-"), ord("_")
         ):
             refresh()
@@ -1013,6 +1071,9 @@ def main():
     cv2.destroyAllWindows()
     body_updates = {name: pos for name, pos in body_positions.items()}
     body_euler_updates = {name: euler for name, euler in body_eulers.items()}
+    free_joint_poses_save = {name: (fe.pos.copy(), fe.quat.copy()) for name, fe in free_edits.items()}
+    free_joint_scene_pos_euler = {name: (fe.pos.copy(), fe.euler.copy()) for name, fe in free_edits.items()}
+    xarm7_home_body = task_profile.calibration_xarm7_home_free_joint_body_resolved()
     if args.save_auto_align_cache:
         cache_path = save_auto_align_cache(
             task_profile=task_profile,
@@ -1020,8 +1081,7 @@ def main():
             initial_states_dir=args.initial_states_dir or task_profile.dataset_root,
             object_name=args.object_name or task_profile.selection_object_name,
             cache_dir=args.auto_align_cache_dir,
-            mug_pos=mug_pos,
-            mug_quat=mug_quat,
+            free_joint_poses=free_joint_poses_save,
             body_positions=body_updates,
             body_eulers=body_euler_updates,
             model=model,
@@ -1033,14 +1093,15 @@ def main():
         update_scene_files(
             scene_xml_path=scene_xml_path,
             xarm7_xml_path=xarm7_xml_path,
-            mug_pos=mug_pos if "mug" in adjustable_objects else None,
-            mug_euler=mug_euler if "mug" in adjustable_objects else None,
+            free_joint_bodies_pos_euler=free_joint_scene_pos_euler,
+            xarm7_home_free_joint_body=xarm7_home_body,
             body_positions=body_updates,
             body_eulers=body_euler_updates,
             table_pos=table_pos if "table" in adjustable_objects else None,
             table_euler=table_euler if "table" in adjustable_objects else None,
         )
-    print(f"[INFO] Final mug pose: pos={fmt_xyz(mug_pos)} euler={fmt_euler_deg(mug_euler)}")
+    for name, fe in free_edits.items():
+        print(f"[INFO] Final {name} pose: pos={fmt_xyz(fe.pos)} euler={fmt_euler_deg(fe.euler)}")
     for name, pos in body_updates.items():
         suffix = f" euler={fmt_euler_deg(body_euler_updates[name])}" if name in body_euler_updates else ""
         print(f"[INFO] Final {name} position: {fmt_xyz(pos)}{suffix}")

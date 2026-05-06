@@ -30,8 +30,10 @@ from segmentation_utils import segment_object_mask
 
 
 ROOT = Path(__file__).resolve().parent.parent          # lerobot_pi05
-TEXT_PROMPTS = ["mug"]   # Comma-separated entries are split into separate objects
-DATA_DIR = ROOT / "data_hang_mug_copy"
+TEXT_PROMPTS = ["shoe"]   # Comma-separated entries are split into separate objects
+OUTPUT_OBJECT_NAMES = {"shoe": "right_shoe"}
+DATA_DIR = ROOT / "data_pick_shoe_copy"
+COMPONENT_SELECTION_MODE = "leftmost"  # "leftmost", "interactive_each", or "track_neighbors"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -60,56 +62,79 @@ def _expand_text_prompts(prompt_list):
 def _sanitize_object_name(name: str) -> str:
     return name.strip().replace("/", "_").replace(" ", "_")
 
+
+def _component_centroids(mask):
+    n_components, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    centroids = {}
+    for lbl in range(1, n_components):
+        ys, xs = np.where(labels == lbl)
+        if len(xs) > 0 and len(ys) > 0:
+            centroids[lbl] = np.array([xs.mean(), ys.mean()])
+    return labels, centroids
+
+
+def _select_component_interactively(labels, centroids, window_name):
+    n_components = int(labels.max()) + 1
+    display = np.zeros((*labels.shape, 3), dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for lbl, centroid in centroids.items():
+        color = tuple(int(x) for x in np.random.randint(0, 255, 3))
+        display[labels == lbl] = color
+        cx, cy = int(centroid[0]), int(centroid[1])
+        cv2.putText(display, str(lbl), (cx, cy), font, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.imshow(window_name, display)
+    print(f"Multiple components detected ({n_components - 1}). Press key 1-{n_components - 1} to select, or q to skip.")
+    key = cv2.waitKey(0)
+    cv2.destroyWindow(window_name)
+    if key in [ord(str(i)) for i in range(1, n_components)]:
+        chosen = int(chr(key))
+        return labels == chosen
+
+    print("No valid selection, returning full mask.")
+    return labels > 0
+
+
 def _filter_mask_by_neighbor_centroids(mask, neighbor_centroids):
     """If a mask has multiple disconnected components, keep only the one
     whose centroid is closest to the mean of *neighbor_centroids*.
     If there's only one component, return it unchanged.
     """
-    n_components, labels = cv2.connectedComponents(mask.astype(np.uint8))
-    if n_components <= 2:          # background (0) + one component
+    labels, component_centroids = _component_centroids(mask)
+    if len(component_centroids) <= 1:
         return mask
+
+    if COMPONENT_SELECTION_MODE == "leftmost":
+        # Camera image coordinates increase to the right; the desired right shoe
+        # appears on the left side of the image.
+        best_label = min(component_centroids, key=lambda lbl: component_centroids[lbl][0])
+        return labels == best_label
+
+    if COMPONENT_SELECTION_MODE == "interactive_each":
+        return _select_component_interactively(
+            labels,
+            component_centroids,
+            "Select component: press 1, 2, ...",
+        )
 
     # Compute reference point from nearby episodes
     valid_neighbors = [c for c in neighbor_centroids if c is not None]
     if not valid_neighbors:
-        # Interactive selection if multiple components and no neighbors
-        
-        n_components, labels = cv2.connectedComponents(mask.astype(np.uint8))
-        if n_components <= 2:
-            return mask
-        # Show all components and let user pick one
-        display = np.zeros((*mask.shape, 3), dtype=np.uint8)
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        for lbl in range(1, n_components):
-            color = tuple(int(x) for x in np.random.randint(0, 255, 3))
-            display[labels == lbl] = color
-            # Find centroid for label
-            ys, xs = np.where(labels == lbl)
-            if len(xs) > 0 and len(ys) > 0:
-                cx, cy = int(xs.mean()), int(ys.mean())
-                cv2.putText(display, str(lbl), (cx, cy), font, 1, (255,255,255), 2, cv2.LINE_AA)
-        cv2.imshow("Select component: press 1, 2, ...", display)
-        print(f"Multiple components detected ({n_components-1}). Press key 1-{n_components-1} to select, or q to skip.")
-        key = cv2.waitKey(0)
-        cv2.destroyWindow("Select component: press 1, 2, ...")
-        if key in [ord(str(i)) for i in range(1, n_components)]:
-            chosen = int(chr(key))
-            return (labels == chosen)
-        else:
-            print("No valid selection, returning full mask.")
-            return mask
+        return _select_component_interactively(
+            labels,
+            component_centroids,
+            "Select component: press 1, 2, ...",
+        )
     ref = np.array(valid_neighbors).mean(axis=0)  # (cx, cy)
 
     best_label, best_dist = None, float("inf")
-    for lbl in range(1, n_components):
-        ys, xs = np.where(labels == lbl)
-        centroid = np.array([xs.mean(), ys.mean()])
+    for lbl, centroid in component_centroids.items():
         dist = np.linalg.norm(centroid - ref)
         if dist < best_dist:
             best_dist = dist
             best_label = lbl
 
-    return (labels == best_label)
+    return labels == best_label
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -225,7 +250,7 @@ for text_prompt in object_prompts:
     print(f"  Processing object: '{text_prompt}'")
     print(f"{'='*60}")
 
-    object_name = _sanitize_object_name(text_prompt)
+    object_name = OUTPUT_OBJECT_NAMES.get(text_prompt, _sanitize_object_name(text_prompt))
     obj_dir = OUT_DIR / object_name
     obj_masks_dir = obj_dir / "individual_masks"
     obj_masks_dir.mkdir(parents=True, exist_ok=True)

@@ -89,6 +89,16 @@ CAMERA_CONFIG = {
 }
 
 
+def should_export_replay_frame(frame_idx: int, frame_stride: int) -> bool:
+    return frame_idx > 0 and frame_idx % frame_stride == 0
+
+
+def replay_export_sample_count(frame_count: int, frame_stride: int) -> int:
+    if frame_count <= 0:
+        return 0
+    return (frame_count - 1) // frame_stride
+
+
 def parse_episode_selector(value: int | str) -> list[int]:
     """Parse episode selectors like 3, 0-9, or 0-4,95-99."""
     value_str = str(value).strip()
@@ -161,7 +171,7 @@ from object_pose_auto_align import (
     selection_object_names,
 )
 
-_DEFAULT_RECORD_TASK_ID ="hang_mug"  # Keep in sync with lerobot-record defaults.
+_DEFAULT_RECORD_TASK_ID ="pick_shoe"  # Keep in sync with lerobot-record defaults.
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -643,6 +653,7 @@ def render_camera_frames(
 def export_selected_episode_replay_frames(args, task_profile, episode_indices: list[int] | None = None):
     render_w, render_h = 640, 480
     export_frame_stride = args.replay_export_frame_stride
+    free_joint_by_body = task_profile.calibration_free_joint_pair_dict()
     first_episode = load_episode(args.dataset_path, 0, dataset_root=args.dataset_root)
     total_episodes = first_episode["dataset"].meta.total_episodes
     if episode_indices is None:
@@ -707,11 +718,15 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
         if cma_delay_frames is not None:
             print(f"[INFO] CMA result best_delay_frames={cma_delay_frames}")
 
-    mug_jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "mug_joint")
-    if mug_jnt_id >= 0:
-        mug_dof_addr = model.jnt_dofadr[mug_jnt_id]
-        model.dof_damping[mug_dof_addr:mug_dof_addr + 6] = 100
-        print(f"[INFO] Set mug freejoint dof_damping=100 (DOFs {mug_dof_addr}:{mug_dof_addr+6})")
+    for _body_name, joint_name in task_profile.calibration_free_joint_pairs:
+        jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if jnt_id >= 0:
+            dof_addr = model.jnt_dofadr[jnt_id]
+            model.dof_damping[dof_addr:dof_addr + 6] = 100
+            print(
+                f"[INFO] Set freejoint {joint_name!r} dof_damping=100 "
+                f"(DOFs {dof_addr}:{dof_addr + 6})"
+            )
 
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
         K = cam_cfg["config"]["intrinsics"]
@@ -740,11 +755,13 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
             cache_dir=args.auto_align_cache_dir,
             optimize_z=args.auto_align_optimize_z,
             force=args.auto_align_force,
+            free_joint_pairs=task_profile.calibration_free_joint_pairs,
         )
         default_auto_object_poses = capture_object_poses(
             model,
             data,
             selection_object_names(args.object_name),
+            free_joint_by_body=free_joint_by_body,
         )
 
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
@@ -838,7 +855,7 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
             except Exception:
                 mujoco.mj_resetData(model, data)
             if default_auto_object_poses is not None:
-                apply_object_poses(model, data, default_auto_object_poses)
+                apply_object_poses(model, data, default_auto_object_poses, free_joint_by_body=free_joint_by_body)
             set_robot_to_ctrl_frame(model, data, initial_ctrl)
             for cam_key, cam_cfg in CAMERA_CONFIG.items():
                 if cam_cfg["config"].get("type", "stationary") == "stationary":
@@ -880,12 +897,12 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
         except Exception:
             mujoco.mj_resetData(model, data)
         if aligned_pose_result is not None:
-            apply_object_poses(model, data, aligned_pose_result.poses)
+            apply_object_poses(model, data, aligned_pose_result.poses, free_joint_by_body=free_joint_by_body)
         elif default_auto_object_poses is not None:
-            apply_object_poses(model, data, default_auto_object_poses)
+            apply_object_poses(model, data, default_auto_object_poses, free_joint_by_body=free_joint_by_body)
         set_robot_to_ctrl_frame(model, data, initial_ctrl)
 
-        sampled_frame_count = (frame_count + export_frame_stride - 1) // export_frame_stride
+        sampled_frame_count = replay_export_sample_count(frame_count, export_frame_stride)
         print(
             f"[INFO] Exporting episode {episode_idx}/{total_episodes - 1}: {sampled_frame_count}/{frame_count} frames "
             f"(original physics replay, replay_source={args.replay_source}, "
@@ -898,7 +915,7 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
             while data.time < sim_target:
                 mujoco.mj_step(model, data)
 
-            if frame_idx % export_frame_stride != 0:
+            if not should_export_replay_frame(frame_idx, export_frame_stride):
                 continue
 
             for cam_key, cam_cfg in CAMERA_CONFIG.items():
@@ -977,7 +994,7 @@ def parse_args():
     p.add_argument("--save-calibration-pairs", action="store_true",
                    help="Save frames 0,5,10,15,20 to calibration_pairs_*/ for color calibration")
     p.add_argument("--save-replay-frames", action="store_true",
-                   help="Single episode: save every replay frame under "
+                   help="Single episode: save sampled replay frames under "
                         "<root>/gs_render/episode_*/{stationary,wrist}/ and "
                         "<root>/real_captures/episode_*/{stationary,wrist}/, plus "
                         "<root>/alpha blending/episode_*/. "
@@ -989,8 +1006,8 @@ def parse_args():
                    help="Root directory used with --save-replay-frames "
                         "(default: selected task's dataset_root_480640 from task_profiles)")
     p.add_argument("--replay-export-frame-stride", type=int, default=DEFAULT_REPLAY_EXPORT_FRAME_STRIDE,
-                   help="Frame sampling stride for multi-episode --save-replay-frames. "
-                        "Default saves frames 0, 20, 40, ...")
+                   help="Frame sampling stride for --save-replay-frames. "
+                        "Default saves frames 20, 40, ...")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
@@ -1060,7 +1077,9 @@ def main():
     if args.dataset_path is None:
         args.dataset_path = task_profile.dataset_root_480640
     if args.initial_states_dir is None:
-        args.initial_states_dir = task_profile.dataset_root
+        args.initial_states_dir = task_profile.dataset_root_480640
+    if args.auto_align_cache_dir is None:
+        args.auto_align_cache_dir = str(Path(__file__).parent.parent / task_profile.dataset_root / "auto_object_poses")
     if args.object_name is None:
         args.object_name = task_profile.selection_object_name
 
@@ -1350,6 +1369,7 @@ def main():
                 optimize_z=args.auto_align_optimize_z,
                 force=args.auto_align_force,
                 camera_adjust_delta=_loaded_delta,
+                free_joint_pairs=task_profile.calibration_free_joint_pairs,
             )
             align_result = auto_align_object_poses(
                 model=model,
@@ -1491,6 +1511,7 @@ def main():
             f"and {_export}/real_captures/{_episode_dir}/{{stationary,wrist}}/ "
             f"and {_alpha_root}/{_episode_dir}/"
         )
+        print(f"[INFO] Saving one replay frame every {args.replay_export_frame_stride} frame(s), starting at frame {args.replay_export_frame_stride}")
 
     # --- MuJoCo 3D Viewer Setup ---
     viewer = None
@@ -1674,7 +1695,7 @@ def main():
                     "alpha_blend": alpha_blend,
                 }
 
-            if args.save_replay_frames:
+            if args.save_replay_frames and should_export_replay_frame(frame_idx, args.replay_export_frame_stride):
                 _root = Path(args.replay_export_root)
                 _episode_dir = f"episode_{args.episode:06d}"
                 for _ck, _rend in cam_renders.items():
