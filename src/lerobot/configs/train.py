@@ -13,7 +13,9 @@
 # limitations under the License.
 import builtins
 import datetime as dt
+import logging
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,31 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 
 TRAIN_CONFIG_NAME = "train_config.json"
+
+
+def find_resume_train_config(output_dir: Path) -> Path | None:
+    last_config_path = output_dir / "checkpoints" / "last" / "pretrained_model" / TRAIN_CONFIG_NAME
+    if last_config_path.is_file():
+        return last_config_path
+
+    checkpoints_dir = output_dir / "checkpoints"
+    if not checkpoints_dir.is_dir():
+        return None
+
+    latest_checkpoint: tuple[int, Path] | None = None
+    for checkpoint_dir in checkpoints_dir.iterdir():
+        if not checkpoint_dir.is_dir() or not checkpoint_dir.name.isdigit():
+            continue
+
+        config_path = checkpoint_dir / "pretrained_model" / TRAIN_CONFIG_NAME
+        if not config_path.is_file():
+            continue
+
+        checkpoint_step = int(checkpoint_dir.name)
+        if latest_checkpoint is None or checkpoint_step > latest_checkpoint[0]:
+            latest_checkpoint = (checkpoint_step, config_path)
+
+    return latest_checkpoint[1] if latest_checkpoint else None
 
 
 @dataclass
@@ -118,10 +145,18 @@ class TrainPipelineConfig(HubMixin):
                 self.job_name = f"{self.env.type}_{self.policy.type}"
 
         if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
-            raise FileExistsError(
-                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
-            )
+            if find_resume_train_config(self.output_dir) is None:
+                logging.warning(
+                    "Output directory %s already exists but no resumable checkpoint config was found. "
+                    "Removing it before starting a fresh run.",
+                    self.output_dir,
+                )
+                shutil.rmtree(self.output_dir)
+            else:
+                raise FileExistsError(
+                    f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
+                    f"Please change your output directory so that {self.output_dir} is not overwritten."
+                )
         elif not self.output_dir:
             now = dt.datetime.now()
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
