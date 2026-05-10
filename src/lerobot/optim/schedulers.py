@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+import json
 import logging
 import math
 from dataclasses import asdict, dataclass
@@ -25,7 +26,6 @@ from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
 from lerobot.datasets.utils import write_json
 from lerobot.utils.constants import SCHEDULER_STATE
-from lerobot.utils.io_utils import deserialize_json_into_object
 
 
 @dataclass
@@ -138,6 +138,14 @@ def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
 
 
 def load_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> LRScheduler:
-    state_dict = deserialize_json_into_object(save_dir / SCHEDULER_STATE, scheduler.state_dict())
+    with open(save_dir / SCHEDULER_STATE, encoding="utf-8") as f:
+        saved_state_dict = json.load(f)
+
+    state_dict = scheduler.state_dict()
+    # PyTorch scheduler state dicts can gain/drop internal bookkeeping keys
+    # between versions. Keep the current scheduler defaults for missing keys.
+    for key in state_dict:
+        if key in saved_state_dict:
+            state_dict[key] = saved_state_dict[key]
     scheduler.load_state_dict(state_dict)
     return scheduler
