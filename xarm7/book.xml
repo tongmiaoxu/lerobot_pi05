@@ -1,0 +1,38 @@
+<!-- Shared book mesh assets and collision defaults.
+     Include at the <mujoco> level in any scene that uses the book. -->
+<mujoco>
+  <default>
+    <default class="book_collision">
+      <geom material="book_collision_mat" mass="0.35"
+            friction="4.0 0.5 0.05" condim="6" priority="1"
+            solref="0.002 1" solimp="0.99 0.9999 0.001" group="3"/>
+    </default>
+    <default class="book_target_collision">
+      <geom material="book_collision_mat" mass="0"
+            friction="2 0.05 0.01" condim="4" priority="1"
+            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture type="2d" name="book_texture" file="assets/book/material_0.png"/>
+    <material name="book_visual_mat" texture="book_texture" specular="0.1" shininess="0.1"/>
+    <texture type="2d" name="i_book_texture" file="assets/i_book/material_0.png"/>
+    <material name="i_book_visual_mat" texture="i_book_texture" specular="0.1" shininess="0.1"/>
+    <texture type="2d" name="l_book_texture" file="assets/l_book/material_0.png"/>
+    <material name="l_book_visual_mat" texture="l_book_texture" specular="0.1" shininess="0.1"/>
+    <texture type="2d" name="d_book_texture" file="assets/d_book/material_0.png"/>
+    <material name="d_book_visual_mat" texture="d_book_texture" specular="0.1" shininess="0.1"/>
+    <material name="bookend_visual_mat" rgba="0.05 0.32 0.85 1" specular="0.2" shininess="0.2"/>
+    <material name="book_collision_mat" rgba="0.2 0.2 0.2 1"/>
+    <mesh name="book_visual" file="book/textured_mesh_center_aligned.obj"/>
+    <mesh name="book_collision" file="book/textured_mesh_center_aligned_convex.obj"/>
+    <mesh name="i_book_visual" file="i_book/textured_mesh_center_aligned.obj"/>
+    <mesh name="i_book_collision" file="i_book/textured_mesh_center_aligned_convex.obj"/>
+    <mesh name="l_book_visual" file="l_book/textured_mesh_center_aligned.obj"/>
+    <mesh name="l_book_collision" file="l_book/textured_mesh_center_aligned_convex.obj"/>
+    <mesh name="d_book_visual" file="d_book/textured_mesh_center_aligned.obj"/>
+    <mesh name="d_book_collision" file="d_book/textured_mesh_center_aligned_convex.obj"/>
+    <mesh name="bookend" file="bookend.STL" scale="0.001 0.001 0.001"/>
+  </asset>
+</mujoco>

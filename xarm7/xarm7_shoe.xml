@@ -71,24 +71,24 @@
         <default class="pad_box1">
           <!-- <geom type="box" friction="3.0 0.1 0.02" condim="4" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.0015 0.014" rgba="0.0 0.1 0.7 1"/> -->
            <geom type="box" 
-        friction="5.0 1 0.05" 
+        friction="6.0 0.8 0.08" 
         condim="6" 
         solimp="0.99 0.9999 0.001" 
         solref="0.002 1" 
         mass="0" priority="2" 
-        size="0.015 0.0055 0.014" 
+        size="0.015 0.0035 0.014" 
         group="3"
-        rgba="1.0 0.1 0.7 1"/>
+        rgba="0.0 0.1 0.7 1"/>
         </default>
         <default class="pad_box2">
           <!-- <geom type="box" friction="3.0 0.1 0.02" condim="4" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.0015 0.011" rgba="0.0 0.5 0.5 1"/> -->
           <geom type="box" 
-        friction="4.0 0.5 0.05" 
+        friction="6.0 0.8 0.08" 
         condim="6" 
         solimp="0.99 0.9999 0.001" 
         solref="0.002 1" 
         mass="0" priority="2" 
-        size="0.015 0.0055 0.011" 
+        size="0.015 0.0035 0.011" 
         group="3"
         rgba="0.0 0.5 0.5 1"/>
         </default>
@@ -159,8 +159,8 @@
                             mass="0.048304" diaginertia="1.88037e-05 1.7493e-05 3.56792e-06"/>
                           <joint name="left_finger_joint" axis="-1 0 0" class="follower"/>
                           <geom class="visual" material="black" mesh="left_finger"/>
-                          <geom class="pad_box1" name="left_finger_pad_1" pos="0 -0.024003 0.032"/>
-                          <geom class="pad_box2" name="left_finger_pad_2" pos="0 -0.024003 0.050"/>
+                          <geom class="pad_box1" name="left_finger_pad_1" pos="0 -0.024003 0.035"/>
+                          <geom class="pad_box2" name="left_finger_pad_2" pos="0 -0.024003 0.051"/>
                           <geom class="pad_visual1" name="left_finger_pad_vis_1" pos="0 -0.024003 0.035"/>
                           <geom class="pad_visual2" name="left_finger_pad_vis_2" pos="0 -0.024003 0.051"/>
                         </body>
@@ -183,8 +183,8 @@
                           <geom class="visual" material="black" mesh="right_finger"/>
                           <geom class="pad_box1" name="right_finger_pad_1" pos="0 0.024003 0.032"/>
                           <geom class="pad_box2" name="right_finger_pad_2" pos="0 0.024003 0.050"/>
-                          <geom class="pad_visual1" name="right_finger_pad_vis_1" pos="0 0.024003 0.035"/>
-                          <geom class="pad_visual2" name="right_finger_pad_vis_2" pos="0 0.024003 0.051"/>
+                          <geom class="pad_visual1" name="right_finger_pad_vis_1" pos="0 0.024003 0.032"/>
+                          <geom class="pad_visual2" name="right_finger_pad_vis_2" pos="0 0.024003 0.050"/>
                         </body>
                       </body>
                       <body name="right_inner_knuckle" pos="0 -0.02 0.074098">
@@ -242,8 +242,7 @@
   </actuator>
 
   <keyframe>
-    <!-- <key name="home" qpos="0 -.247 0 .909 0 1.15644 0.4284 -0.1984 -0.0439 -0.7373 0.0000 -0.0000 -0.6756" ctrl="0 -.247 0 .909 0 1.15644 0 0"/> -->
-    <!-- 13 robot DoFs + 7 cube freejoint (pos xyz + quat wxyz) -->
-    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0 0.4684 -0.1984 -0.0439 0.7253 0.0000 0.0000 0.6884" ctrl="0 0 0 1.57 0 1.57 0 0"/>
+    <!-- 13 robot DoFs + 7 shoe freejoint values (pos xyz + quat wxyz). -->
+    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0 0.4885 -0.1863 0.0077 0.4828 -0.5259 0.4798 -0.5100" ctrl="0 0 0 1.57 0 1.57 0 0"/>
   </keyframe>
 </mujoco>

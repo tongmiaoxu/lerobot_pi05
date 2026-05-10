@@ -1,0 +1,7 @@
+<!-- Book visual + single convex-hull collision geom.
+     Include inside <body name="book"> in any scene file. -->
+<mujoco>
+  <geom name="book_visual" type="mesh" mesh="book_visual" material="book_visual_mat"
+        contype="0" conaffinity="0" mass="0"/>
+  <geom name="book_col" type="mesh" mesh="book_collision" class="book_collision"/>
+</mujoco>

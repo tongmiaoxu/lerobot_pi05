@@ -1,0 +1,7 @@
+<!-- Left-shoe target visual + single convex-hull collision geom.
+     Include inside <body name="left_shoe"> in any scene file. -->
+<mujoco>
+  <geom name="left_shoe_visual" type="mesh" mesh="left_shoe_visual" material="left_shoe_visual_mat"
+        contype="0" conaffinity="0" mass="0"/>
+  <geom name="left_shoe_col" type="mesh" mesh="left_shoe_collision" class="shoe_target_collision"/>
+</mujoco>

@@ -1,0 +1,28 @@
+<!-- Shared shoe mesh assets and collision defaults.
+     Include at the <mujoco> level in any scene that uses the shoes. -->
+<mujoco>
+  <default>
+    <default class="shoe_collision">
+      <geom material="shoe_collision_mat" mass="0.18"
+            friction="4.0 0.5 0.05" condim="6" priority="1"
+            solref="0.002 1" solimp="0.99 0.9999 0.001" group="3"/>
+    </default>
+    <default class="shoe_target_collision">
+      <geom material="shoe_collision_mat" mass="0"
+            friction="2 0.05 0.01" condim="4" priority="1"
+            solref="0.004 1" solimp="0.95 0.99 0.001" group="3"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture type="2d" name="right_shoe_texture" file="assets/shoes/right_shoe/material_0_clean.png"/>
+    <material name="shoe_visual_mat" texture="right_shoe_texture" specular="0.1" shininess="0.1"/>
+    <texture type="2d" name="left_shoe_texture" file="assets/shoes/left_shoe/material_0_color_matched.png"/>
+    <material name="left_shoe_visual_mat" texture="left_shoe_texture" specular="0.1" shininess="0.1"/>
+    <material name="shoe_collision_mat" rgba="0.2 0.2 0.2 1"/>
+    <mesh name="right_shoe_visual" file="shoes/right_shoe/textured_mesh_center_aligned.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="right_shoe_collision" file="shoes/right_shoe/textured_mesh_center_aligned_convex.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="left_shoe_visual" file="shoes/left_shoe/textured_mesh_center_aligned.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="left_shoe_collision" file="shoes/left_shoe/textured_mesh_center_aligned_convex.obj" scale="0.9 0.9 0.9"/>
+  </asset>
+</mujoco>
