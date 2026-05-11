@@ -24,6 +24,8 @@ class TaskProfile:
     calibration_body_yaw_rotatable_names: tuple[str, ...] = ()
     #: Body whose free-joint pose matches trailing qpos in `<key name="home">`; None = infer if exactly one pair.
     calibration_xarm7_home_free_joint_body: str | None = None
+    #: Semantic object/mask name -> MuJoCo body name when they differ.
+    object_body_name_aliases: dict[str, str] = field(default_factory=dict)
     output_dirs_by_policy: dict[str, str] = field(default_factory=dict)
 
     def calibration_free_joint_pair_dict(self) -> dict[str, str]:
@@ -145,6 +147,43 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         calibration_adjustable_object_names=("left_shoe", "right_shoe", "table"),
         calibration_free_joint_pairs=(("right_shoe", "right_shoe_joint"),),
         calibration_body_yaw_rotatable_names=("left_shoe",),
+    ),
+    "book_shelving": TaskProfile(
+        task_id="book_shelving",
+        single_task="Place the book on the shelf",
+        dataset_repo_id="book_shelving",
+        dataset_root="data_book_shelving",
+        dataset_root_480640="data_book_shelving_copy",
+        eval_dataset_repo_id="eval_book_shelving",
+        eval_dataset_root="data_eval_book_shelving",
+        sim_eval_dataset_root="data_sim_eval_book_shelving",
+        selection_object_name="book, shelf",
+        wandb_project="book_shelving",
+        scene_xml_candidates=("scene_book.xml",),
+        xarm7_xml="xarm7_book.xml",
+        deploy_adjustable_object_names=("book",),
+        calibration_adjustable_object_names=("book", "book_shelf_target", "table"),
+        calibration_free_joint_pairs=(("book", "book_joint"),),
+        calibration_body_yaw_rotatable_names=("book","book_shelf_target"),
+        object_body_name_aliases={"shelf": "book_shelf_target"},
+    ),
+    "pouring": TaskProfile(
+        task_id="pouring",
+        single_task="Pour the carton into the mug",
+        dataset_repo_id="pouring",
+        dataset_root="data_pouring",
+        dataset_root_480640="data_pouring_copy",
+        eval_dataset_repo_id="eval_pouring",
+        eval_dataset_root="data_eval_pouring",
+        sim_eval_dataset_root="data_sim_eval_pouring",
+        selection_object_name="carton, mug",
+        wandb_project="pouring",
+        scene_xml_candidates=("scene_carton.xml",),
+        xarm7_xml="xarm7_carton.xml",
+        deploy_adjustable_object_names=("carton", "mug"),
+        calibration_adjustable_object_names=("carton", "mug", "table"),
+        calibration_free_joint_pairs=(("carton", "carton_joint"),),
+        calibration_body_yaw_rotatable_names=("carton",),
     ),
 }
 
