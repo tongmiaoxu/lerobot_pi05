@@ -13,7 +13,7 @@ Usage:
     # Uses the hardcoded default task profile for scene/object warmup defaults:
     python visual_match/deploy_act_policy_mujoco.py
 
-    # Same as --obs but fixed to episode 0 of the eval dataset (default: data_eval):
+    # Same as --obs but fixed to episode 0 of the real eval dataset (default under data_real/):
     python visual_match/deploy_act_policy_mujoco.py --obs-eval
 
     # Faster sim: skip replay load and "Real:" windows unless --obs / --obs-eval (those keep Real):
@@ -26,6 +26,7 @@ import re
 import math
 import argparse
 import shutil
+import subprocess
 from pathlib import Path
 import time
 import json
@@ -37,12 +38,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/diffusion_hang_mug/checkpoints/last/pretrained_model"
-_DEFAULT_RECORD_TASK_ID = "hang_mug"
+###############################################
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_place_mug/checkpoints/009000/pretrained_model"
+_DEFAULT_RECORD_TASK_ID = "place_mug"
+###############################################
 _NUM_EPISODES = 10
+_PICK_SHOE_GRIPPER_OBS_OFFSET_MM = 244.68428556068324
+_PICK_SHOE_GRIPPER_OFFSET_THRESHOLD_MM = 750.0
+_GRIPPER_CONTACT_GEOM_PREFIXES = ("left_finger_pad_", "right_finger_pad_")
+_PICK_SHOE_CONTACT_GEOM_NAMES = ("right_shoe_col",)
 _MAX_PREDICTION_EVENTS_PER_TRAJECTORY_BY_TASK = {
     "hang_mug": 10,
-    "place_mug": 6,
+    "place_mug": 8,
+    "pick_shoe": 10,
 }
 
 
@@ -111,7 +119,7 @@ from lerobot_mujoco_utils import (
 from object_pose_auto_align import ObjectPoseAlignConfig, auto_align_object_poses
 from lerobot.datasets.utils import copy_observation_frame_with_resized_images
 from lerobot.datasets.video_utils import decode_video_frames
-from lerobot.tasks import get_task_profile, resolve_task_scene_xml
+from lerobot.tasks import get_task_profile, get_task_profiles, resolve_task_scene_xml
 
 # Arrow key codes for cv2.waitKeyEx (platform-dependent)
 _KEY_LEFT  = (65361, 81, 2)
@@ -573,9 +581,7 @@ def load_policy(policy_path: str) -> tuple[PreTrainedPolicy, dict]:
     policy_type = config_dict.get("type", "act")
     policy_class = get_policy_class(policy_type)
     policy = policy_class.from_pretrained(policy_path)
-    if policy_type != "act":
-        # print(f"[WARN] Policy type is {policy_type}, expected 'act'")
-        pass
+
 
     policy.eval()
     # print(f"[INFO] Policy loaded: {policy_type}")
@@ -609,16 +615,91 @@ def pop_cached_policy_action(policy: PreTrainedPolicy, postprocessor) -> torch.T
     return postprocessor(action_queue.popleft())
 
 
-def build_state_from_mujoco(model: MjModel, data: MjData) -> np.ndarray:
+def geom_ids_by_name_or_prefix(
+    model: MjModel,
+    *,
+    names: tuple[str, ...] = (),
+    prefixes: tuple[str, ...] = (),
+) -> set[int]:
+    geom_ids = set()
+    names_set = set(names)
+    for geom_id in range(model.ngeom):
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if geom_name is None:
+            continue
+        if geom_name in names_set or any(geom_name.startswith(prefix) for prefix in prefixes):
+            geom_ids.add(geom_id)
+    return geom_ids
+
+
+def has_contact_between_geom_sets(
+    data: MjData,
+    geom_ids_a: set[int],
+    geom_ids_b: set[int],
+) -> bool:
+    if not geom_ids_a or not geom_ids_b:
+        return False
+    for contact_idx in range(data.ncon):
+        contact = data.contact[contact_idx]
+        geom1 = int(contact.geom1)
+        geom2 = int(contact.geom2)
+        if (geom1 in geom_ids_a and geom2 in geom_ids_b) or (geom2 in geom_ids_a and geom1 in geom_ids_b):
+            return True
+    return False
+
+
+def should_apply_gripper_observation_offset(
+    state: np.ndarray,
+    data: MjData,
+    *,
+    mode: str,
+    contact_geom_ids: tuple[set[int], set[int]] | None,
+    threshold_mm: float,
+) -> bool:
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if mode == "threshold":
+        return state[7] <= threshold_mm
+    if mode == "contact":
+        if contact_geom_ids is None:
+            return False
+        gripper_geom_ids, shoe_geom_ids = contact_geom_ids
+        return has_contact_between_geom_sets(data, gripper_geom_ids, shoe_geom_ids)
+    raise ValueError(f"Unsupported gripper offset mode: {mode}")
+
+
+def build_state_from_mujoco(
+    model: MjModel,
+    data: MjData,
+    gripper_observation_offset_mm: float = 0.0,
+    gripper_observation_offset_mode: str = "never",
+    gripper_observation_contact_geom_ids: tuple[set[int], set[int]] | None = None,
+    gripper_observation_threshold_mm: float = _PICK_SHOE_GRIPPER_OFFSET_THRESHOLD_MM,
+) -> np.ndarray:
     """Build the LeRobot state vector from the current MuJoCo state."""
     ld_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "left_driver_joint")
     if ld_id < 0:
         raise RuntimeError("MuJoCo model has no joint 'left_driver_joint' (gripper driver).")
     g_adr = int(model.jnt_qposadr[ld_id])
     g_rad = (float(model.jnt_range[ld_id, 0]), float(model.jnt_range[ld_id, 1]))
-    return mujoco_qpos_to_lerobot_state(
+    state = mujoco_qpos_to_lerobot_state(
         data.qpos, g_rad, gripper_qpos_adr=g_adr
     )
+    if gripper_observation_offset_mm and should_apply_gripper_observation_offset(
+        state,
+        data,
+        mode=gripper_observation_offset_mode,
+        contact_geom_ids=gripper_observation_contact_geom_ids,
+        threshold_mm=gripper_observation_threshold_mm,
+    ):
+        state[7] = np.clip(
+            state[7] - gripper_observation_offset_mm,
+            0.0,
+            GRIPPER_OPEN_MM,
+        )
+    return state
 
 
 def capture_mujoco_snapshot(data: MjData) -> dict[str, np.ndarray | float]:
@@ -636,13 +717,26 @@ def build_observation_from_mujoco(model: MjModel, data: MjData, renderer: mujoco
                                   robot_geom_ids: set,
                                   gaussian_data: dict | None,
                                   obs_frames: dict | None = None,
-                                  frame_idx: int = 0) -> dict:
+                                  frame_idx: int = 0,
+                                  gripper_observation_offset_mm: float = 0.0,
+                                  gripper_observation_offset_mode: str = "never",
+                                  gripper_observation_contact_geom_ids: tuple[set[int], set[int]] | None = None,
+                                  gripper_observation_threshold_mm: float = _PICK_SHOE_GRIPPER_OFFSET_THRESHOLD_MM) -> dict:
     """
     Build observation dict for xArm policy from MuJoCo state.
     Uses 2 cameras: cam_high (stationary) and cam_wrist, both with composite rendering.
     When obs_frames is provided (--obs mode), use real dataset images instead of rendered.
     """
-    observation = {OBS_STATE: build_state_from_mujoco(model, data)}
+    observation = {
+        OBS_STATE: build_state_from_mujoco(
+            model,
+            data,
+            gripper_observation_offset_mm=gripper_observation_offset_mm,
+            gripper_observation_offset_mode=gripper_observation_offset_mode,
+            gripper_observation_contact_geom_ids=gripper_observation_contact_geom_ids,
+            gripper_observation_threshold_mm=gripper_observation_threshold_mm,
+        )
+    }
 
     # Use real-world dataset images when --obs
     if obs_frames is not None:
@@ -798,6 +892,40 @@ def load_initial_state_contours(
     # print(f"[INFO] Loaded contours for {len(list_of_contours)} episodes "
           # f"(eps {min(ep_ids)}–{max(ep_ids)}) from {', '.join(str(d[1]) for d in object_dirs)}")
     return list_of_contours
+
+
+def select_contours_auto(
+    list_of_contours: list,
+    num_eval_episodes: int,
+) -> tuple[list, list[int]]:
+    """
+    Deterministically pick which training-episode contours to evaluate: the
+    first ceil(num_eval_episodes/2) and last floor(num_eval_episodes/2)
+    episode indices (by index order) among those with a valid contour.
+
+    Deterministic (no UI, no randomness) so repeated runs — e.g. the three
+    --all baselines — always evaluate the same set of episodes.
+
+    Returns:
+        (selected_contours, selected_indices), both sorted in ascending
+        episode order, mirroring select_contours_ui's return shape.
+    """
+    valid_indices = [i for i, contours in enumerate(list_of_contours) if contours]
+    if len(valid_indices) < num_eval_episodes:
+        raise ValueError(
+            f"Only {len(valid_indices)} episodes have a valid initial-state contour, "
+            f"but --num_eval_episodes={num_eval_episodes} were requested."
+        )
+
+    first_half = (num_eval_episodes + 1) // 2
+    second_half = num_eval_episodes - first_half
+    selected_indices = valid_indices[:first_half]
+    if second_half:
+        selected_indices = selected_indices + valid_indices[-second_half:]
+    selected_indices = sorted(set(selected_indices))
+
+    selected_contours = [list_of_contours[i] for i in selected_indices]
+    return selected_contours, selected_indices
 
 
 def select_contours_ui(
@@ -987,6 +1115,98 @@ def save_selection_grid(
     # print(f"[INFO] Saved selection grid → {output_path}")
 
 
+_COMPOSITE_PREDICTION_EVENT_FILE_RE = re.compile(
+    r"^composite_prediction_event_(?P<event>\d+)_step_(?P<step>\d+)\.png$"
+)
+
+
+def _last_composite_prediction_event_path(prediction_events_dir: Path) -> Path | None:
+    """Return the composite_prediction_event_*.png with the highest (event_idx, step_idx)."""
+    best_path = None
+    best_key = None
+    for path in prediction_events_dir.glob("composite_prediction_event_*_step_*.png"):
+        match = _COMPOSITE_PREDICTION_EVENT_FILE_RE.match(path.name)
+        if match is None:
+            continue
+        key = (int(match.group("event")), int(match.group("step")))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_path = path
+    return best_path
+
+
+def build_last_episode_state_grid(output_dir: str | Path) -> Path | None:
+    """
+    Build a grid montage of each episode's last composite state — the
+    highest-numbered episode_*/prediction_events/composite_prediction_event_*.png
+    (cam_high + cam_wrist, no translation/blend) — saved the same way for
+    every baseline (raw sim, --color-calibrate, --turbo, --gpt), so results
+    are directly comparable.
+
+    Read-only with respect to episode_*/prediction_events/: files there are
+    only read, never modified. Writes one new file,
+    output_dir/last_episode_state_grid.png. Safe to call repeatedly.
+
+    Returns the path to the saved grid, or None if no episode had a
+    composite_prediction_event_*.png to show.
+    """
+    output_dir = Path(output_dir)
+    episode_dirs = sorted(
+        (d for d in output_dir.iterdir() if d.is_dir() and re.fullmatch(r"episode_\d+", d.name)),
+        key=lambda d: int(d.name.split("_")[1]),
+    )
+    if not episode_dirs:
+        return None
+
+    composite_images = []
+    tile_shape = None
+    for ep_dir in episode_dirs:
+        composite_img = None
+        prediction_events_dir = ep_dir / "prediction_events"
+        if prediction_events_dir.is_dir():
+            last_path = _last_composite_prediction_event_path(prediction_events_dir)
+            if last_path is not None:
+                composite_img = cv2.imread(str(last_path))
+                if composite_img is not None:
+                    tile_shape = composite_img.shape
+        composite_images.append((ep_dir.name, composite_img))
+
+    if tile_shape is None:
+        return None
+
+    title_h = 26
+    tile_h, tile_w = tile_shape[0], tile_shape[1]
+    tiles = []
+    for ep_name, composite_img in composite_images:
+        tile = np.full((title_h + tile_h, tile_w, 3), 18, dtype=np.uint8)
+        if composite_img is not None:
+            tile[title_h:, :, :] = composite_img
+        else:
+            cv2.putText(
+                tile, "no data", (10, title_h + tile_h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1, cv2.LINE_AA,
+            )
+        cv2.rectangle(tile, (0, 0), (tile_w, title_h), (44, 44, 44), -1)
+        cv2.putText(
+            tile, ep_name, (8, title_h - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (235, 235, 235), 1, cv2.LINE_AA,
+        )
+        tiles.append(tile)
+
+    n = len(tiles)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    grid_tile_h, grid_tile_w = tiles[0].shape[:2]
+    grid = np.full((rows * grid_tile_h, cols * grid_tile_w, 3), 18, dtype=np.uint8)
+    for idx, tile in enumerate(tiles):
+        r, c = divmod(idx, cols)
+        grid[r * grid_tile_h:(r + 1) * grid_tile_h, c * grid_tile_w:(c + 1) * grid_tile_w] = tile
+
+    grid_path = output_dir / "last_episode_state_grid.png"
+    cv2.imwrite(str(grid_path), grid)
+    return grid_path
+
+
 def convert_action_to_mujoco(action: torch.Tensor, gripper_mj_range: tuple) -> np.ndarray:
     """
     Convert policy action (8-dim: 7 joints degrees + gripper mm) to MuJoCo ctrl (8-dim).
@@ -1053,6 +1273,80 @@ def _fmt_euler_deg(euler: np.ndarray | None) -> str:
     return f"[{deg[0]:.1f}, {deg[1]:.1f}, {deg[2]:.1f}] deg"
 
 
+# Flags that select a visual-input baseline; --all drives these itself, one per
+# subprocess run, so they are stripped from the forwarded argv.
+_ALL_VARIANT_FLAGS = ("--all", "--color-calibrate", "--turbo")
+_ALL_VARIANTS = (
+    ("raw sim", ()),
+    ("color-calibrate", ("--color-calibrate",)),
+    ("turbo", ("--turbo",)),
+)
+
+
+def _run_all_variants() -> None:
+    """Re-run this script once per --all baseline (raw sim / color-calibrate / turbo).
+
+    Each run is a fresh subprocess with the same CLI args (minus the variant
+    flags) plus its own variant flag, so each writes to the task profile's own
+    output directory for that sim_variant and can be compared side by side.
+    """
+    base_argv = [a for a in sys.argv[1:] if a not in _ALL_VARIANT_FLAGS]
+    script_path = str(Path(__file__).resolve())
+
+    for label, extra_flags in _ALL_VARIANTS:
+        print(f"\n{'=' * 70}\n[ALL] Running variant: {label}\n{'=' * 70}\n", flush=True)
+        cmd = [sys.executable, script_path, *base_argv, *extra_flags]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(
+                f"[ALL] Variant '{label}' exited with code {result.returncode}; stopping remaining variants.",
+                flush=True,
+            )
+            sys.exit(result.returncode)
+
+    print("\n[ALL] All three variants (raw sim, color-calibrate, turbo) completed.\n", flush=True)
+
+
+def _run_all_checkpoints(policy_paths: list[str]) -> None:
+    """Re-run this script once per --policy-paths checkpoint, one subprocess each.
+
+    Mirrors _run_all_variants: strips --policy-path(s) from the forwarded argv and
+    sets --policy-path explicitly for each checkpoint, so each run derives its own
+    checkpoint-specific output directory (via _extract_checkpoint_name / policy.config.type).
+    """
+    base_argv = []
+    skip_next = False
+    for a in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("--policy-path", "--policy-paths"):
+            skip_next = True
+            continue
+        if a.startswith("--policy-path=") or a.startswith("--policy-paths="):
+            continue
+        base_argv.append(a)
+    script_path = str(Path(__file__).resolve())
+
+    for i, policy_path in enumerate(policy_paths, start=1):
+        print(
+            f"\n{'=' * 70}\n[CHECKPOINTS] Running checkpoint {i}/{len(policy_paths)}: "
+            f"{policy_path}\n{'=' * 70}\n",
+            flush=True,
+        )
+        cmd = [sys.executable, script_path, *base_argv, "--policy-path", policy_path]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(
+                f"[CHECKPOINTS] Checkpoint {policy_path!r} exited with code "
+                f"{result.returncode}; stopping remaining checkpoints.",
+                flush=True,
+            )
+            sys.exit(result.returncode)
+
+    print(f"\n[CHECKPOINTS] All {len(policy_paths)} checkpoints completed.\n", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Deploy ACT policy in MuJoCo xArm simulation"
@@ -1062,6 +1356,26 @@ def main():
         type=str,
         default=_DEFAULT_RECORD_POLICY_CHECKPOINT,
         help="Path to policy checkpoint directory"
+    )
+    parser.add_argument(
+        "--policy-paths",
+        type=str,
+        default=None,
+        help=(
+            "Evaluate multiple policy checkpoints back-to-back, one per subprocess run. "
+            "Separate paths with ',' or ';', e.g. "
+            "--policy-paths 'outputs/act_place_mug/checkpoints/006000/pretrained_model;"
+            "outputs/act_place_mug/checkpoints/003000/pretrained_model'. Takes priority "
+            "over --policy-path. Each run re-invokes this script with --policy-path set to "
+            "one checkpoint, so each writes to that checkpoint's own output directory."
+        ),
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=_DEFAULT_RECORD_TASK_ID,
+        choices=sorted(get_task_profiles()),
+        help="Task profile (scene, datasets, default turbo checkpoint dirs).",
     )
     parser.add_argument(
         "--prompt",
@@ -1099,8 +1413,19 @@ def main():
     )
     parser.add_argument(
         "--color-calibrate", action="store_true",
-        default=True,
+        default=False,
         help="Apply per-camera color calibration YAML files when available."
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Run the deployment three times back-to-back, once per visual-input baseline: "
+            "raw sim (no color calibration / translation), --color-calibrate, and --turbo. "
+            "Each variant re-invokes this script with the same arguments (minus --all/"
+            "--color-calibrate/--turbo) plus its own variant flag, so each writes to its own "
+            "task-profile output directory."
+        ),
     )
     obs_mode = parser.add_mutually_exclusive_group()
     obs_mode.add_argument(
@@ -1176,6 +1501,17 @@ def main():
         help="Load initial-state contour overlays generated by initial_states_overlay.py"
     )
     parser.add_argument(
+        "--select-interactive",
+        action="store_true",
+        default=False,
+        help=(
+            "Pick --num_eval_episodes initial states by hand in a click UI. Default is "
+            "automatic: the first ceil(N/2) and last floor(N/2) episodes (by index) that "
+            "have a valid contour, so repeated runs (e.g. --all) always evaluate the same "
+            "episodes."
+        ),
+    )
+    parser.add_argument(
         "--initial-states-dir",
         type=str,
         default=None,
@@ -1238,6 +1574,32 @@ def main():
         ),
     )
     parser.add_argument(
+        "--sim-gripper-observation-offset-mm",
+        type=float,
+        default=_PICK_SHOE_GRIPPER_OBS_OFFSET_MM,
+        help=(
+            "Subtract this many millimeters from the MuJoCo qpos-derived gripper "
+            "observation before policy inference. Default is measured for pick_shoe "
+            "from data_pick_shoe action vs rigid-shoe replay qpos."
+        ),
+    )
+    parser.add_argument(
+        "--sim-gripper-observation-offset-mode",
+        choices=("contact", "threshold", "always", "never"),
+        default="contact",
+        help=(
+            "When to apply --sim-gripper-observation-offset-mm. 'contact' checks "
+            "finger pad contact with right_shoe_col; 'threshold' uses "
+            "--sim-gripper-observation-threshold-mm."
+        ),
+    )
+    parser.add_argument(
+        "--sim-gripper-observation-threshold-mm",
+        type=float,
+        default=_PICK_SHOE_GRIPPER_OFFSET_THRESHOLD_MM,
+        help="Threshold used when --sim-gripper-observation-offset-mode=threshold.",
+    )
+    parser.add_argument(
         "--gpt",
         action="store_true",
         help="Use GPT-Image-2 sim→real style transfer on composite policy images when a new prediction is needed.",
@@ -1245,7 +1607,10 @@ def main():
     parser.add_argument(
         "--turbo",
         action="store_true",
-        help="Pix2pix-turbo on composite policy images when a new prediction is needed.",
+        help=(
+            "Pix2pix-turbo on composite policy images when a new prediction is needed. "
+            "If --turbo-checkpoint* are omitted, uses TaskProfile turbo_output_* for this --task."
+        ),
     )
     parser.add_argument(
         "--turbo-checkpoint",
@@ -1309,10 +1674,29 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.policy_paths:
+        policy_paths = [p.strip() for p in re.split(r"[;,]", args.policy_paths) if p.strip()]
+        if not policy_paths:
+            raise ValueError("--policy-paths was given but contained no non-empty paths")
+        _run_all_checkpoints(policy_paths)
+        return
+
+    if args.all:
+        _run_all_variants()
+        return
+
     num_eval_episodes = args.num_eval_episodes
-    task_profile = get_task_profile(_DEFAULT_RECORD_TASK_ID)
-    max_prediction_events_per_trajectory = _max_prediction_events_per_trajectory(_DEFAULT_RECORD_TASK_ID)
-    # print(f"[INFO] Default task: {_DEFAULT_RECORD_TASK_ID}")
+    task_id = args.task
+    task_profile = get_task_profile(task_id)
+    max_prediction_events_per_trajectory = _max_prediction_events_per_trajectory(task_id)
+    # print(f"[INFO] Default task: {task_id}")
+    if args.sim_gripper_observation_offset_mm:
+        print(
+            "[INFO] Applying sim gripper observation offset: "
+            f"-{args.sim_gripper_observation_offset_mm:.3f} mm "
+            f"(mode={args.sim_gripper_observation_offset_mode})"
+        )
     if args.prompt is None:
         args.prompt = task_profile.single_task
     if args.initial_states_dir is None:
@@ -1349,9 +1733,15 @@ def main():
         args.output_dir = None
     elif args.output_dir is None:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
-        args.output_dir = task_profile.sim_eval_root_for_policy(policy.config.type, checkpoint_name)
-        if turbo_enabled and "data_sim_eval" in args.output_dir:
-            args.output_dir = args.output_dir.replace("data_sim_eval", "data_sim_turbo_eval", 1)
+        if turbo_enabled:
+            sim_variant = "turbo"
+        elif args.color_calibrate:
+            sim_variant = "kaifeng"
+        else:
+            sim_variant = "default"
+        args.output_dir = task_profile.sim_eval_root_for_policy(
+            policy.config.type, checkpoint_name, sim_variant=sim_variant
+        )
     else:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
 
@@ -1382,12 +1772,23 @@ def main():
             initial_states_dir=args.initial_states_dir,
             object_name=args.object_name,
         )
-        selected_contours, selected_episode_indices = select_contours_ui(
-            list_of_contours,
-            num_eval_episodes,
-            initial_states_dir=args.initial_states_dir,
-            object_name=args.object_name,
-        )
+        if args.select_interactive:
+            selected_contours, selected_episode_indices = select_contours_ui(
+                list_of_contours,
+                num_eval_episodes,
+                initial_states_dir=args.initial_states_dir,
+                object_name=args.object_name,
+            )
+        else:
+            selected_contours, selected_episode_indices = select_contours_auto(
+                list_of_contours,
+                num_eval_episodes,
+            )
+            print(
+                f"[INFO] Auto-selected {len(selected_episode_indices)} initial-state episodes "
+                f"(first/last half): {selected_episode_indices}",
+                flush=True,
+            )
         if not selected_contours:
             # print("[INFO] No episodes selected, exiting.")
             sys.exit(0)
@@ -1441,8 +1842,8 @@ def main():
     # Load MuJoCo xArm model
     project_root = Path(__file__).parent.parent
     xarm_dir = project_root / "xarm7"
-    scene_xml_path = resolve_task_scene_xml(_DEFAULT_RECORD_TASK_ID, xarm_dir)
-    # print(f"[INFO] Using MuJoCo scene for task {_DEFAULT_RECORD_TASK_ID!r}: {scene_xml_path.name}")
+    scene_xml_path = resolve_task_scene_xml(task_id, xarm_dir)
+    # print(f"[INFO] Using MuJoCo scene for task {task_id!r}: {scene_xml_path.name}")
     original_cwd = os.getcwd()
     try:
         os.chdir(str(xarm_dir))
@@ -1463,6 +1864,17 @@ def main():
         model.actuator_ctrlrange[gripper_act_id, 1],
     )
     # print(f"[INFO] Gripper ctrl range: [{gripper_mj_range[0]}, {gripper_mj_range[1]}]")
+    gripper_observation_contact_geom_ids = (
+        geom_ids_by_name_or_prefix(model, prefixes=_GRIPPER_CONTACT_GEOM_PREFIXES),
+        geom_ids_by_name_or_prefix(model, names=_PICK_SHOE_CONTACT_GEOM_NAMES),
+    )
+    if args.sim_gripper_observation_offset_mode == "contact" and (
+        not gripper_observation_contact_geom_ids[0] or not gripper_observation_contact_geom_ids[1]
+    ):
+        print(
+            "[WARN] Contact-gated gripper offset cannot find expected gripper/shoe geoms; "
+            "offset will not be applied."
+        )
 
     adjustable_object_names = tuple(dict.fromkeys(task_profile.deploy_adjustable_object_names))
 
@@ -1518,6 +1930,8 @@ def main():
             cache_dir=args.auto_align_cache_dir,
             optimize_z=args.auto_align_optimize_z,
             force=args.auto_align_force,
+            free_joint_pairs=task_profile.calibration_free_joint_pairs,
+            body_name_aliases=task_profile.object_body_name_aliases,
         )
 
     # Apply camera calibration
@@ -1616,12 +2030,15 @@ def main():
     if turbo_enabled:
         from sim2real import SimToRealTranslator
 
+        turbo_task_defaults = task_profile.turbo_default_checkpoint_paths(project_root)
+
         def _ckpt_stationary() -> str | None:
             return (
                 _resolve_path_under_project(args.turbo_checkpoint_stationary, project_root)
                 or _resolve_path_under_project(turbo_cfg.get("checkpoint_stationary"), project_root)
                 or _resolve_path_under_project(args.turbo_checkpoint, project_root)
                 or _resolve_path_under_project(turbo_cfg.get("checkpoint"), project_root)
+                or (turbo_task_defaults[0] if turbo_task_defaults else None)
             )
 
         def _ckpt_wrist() -> str | None:
@@ -1630,13 +2047,15 @@ def main():
                 or _resolve_path_under_project(turbo_cfg.get("checkpoint_wrist"), project_root)
                 or _resolve_path_under_project(args.turbo_checkpoint, project_root)
                 or _resolve_path_under_project(turbo_cfg.get("checkpoint"), project_root)
+                or (turbo_task_defaults[1] if turbo_task_defaults else None)
             )
 
         ckpt_stationary = _ckpt_stationary()
         ckpt_wrist = _ckpt_wrist()
         if not ckpt_stationary or not ckpt_wrist:
             raise ValueError(
-                "Turbo needs checkpoints for both cameras (--turbo-checkpoint-* or policy turbo.*)."
+                "Turbo needs checkpoints for both cameras (--turbo-checkpoint-* or policy turbo.*), "
+                "or set turbo_output_stationary / turbo_output_wrist on the task profile for this --task."
             )
         if ckpt_stationary == ckpt_wrist:
             tr = SimToRealTranslator(
@@ -2321,6 +2740,10 @@ def main():
                             gaussian_data=gaussian_data,
                             obs_frames=obs_frames,
                             frame_idx=step,
+                            gripper_observation_offset_mm=args.sim_gripper_observation_offset_mm,
+                            gripper_observation_offset_mode=args.sim_gripper_observation_offset_mode,
+                            gripper_observation_contact_geom_ids=gripper_observation_contact_geom_ids,
+                            gripper_observation_threshold_mm=args.sim_gripper_observation_threshold_mm,
                         )
 
                     need_composite_obs = not (args.obs or args.obs_eval)
@@ -2334,6 +2757,10 @@ def main():
                             gaussian_data=gaussian_data,
                             obs_frames=None,
                             frame_idx=step,
+                            gripper_observation_offset_mm=args.sim_gripper_observation_offset_mm,
+                            gripper_observation_offset_mode=args.sim_gripper_observation_offset_mode,
+                            gripper_observation_contact_geom_ids=gripper_observation_contact_geom_ids,
+                            gripper_observation_threshold_mm=args.sim_gripper_observation_threshold_mm,
                         )
                         composite_display_obs = composite_obs
                         if resize_policy_images:
@@ -2432,6 +2859,23 @@ def main():
                                     ),
                                 )
                             )
+                        # Always also save a plain composite-only image (cam_high + cam_wrist,
+                        # no translation/blend) so every baseline — raw sim, --color-calibrate,
+                        # --turbo, --gpt — has a directly comparable per-prediction snapshot for
+                        # the cross-baseline last-state grid, without touching the gpt_*/turbo_*
+                        # panels above.
+                        prediction_event_panels.append(
+                            (
+                                "composite",
+                                current_prediction_event_idx,
+                                step,
+                                build_combined_window_frame(
+                                    [("Composite", composite_display_obs)],
+                                    tile_width=WINDOW_W,
+                                    tile_height=WINDOW_H,
+                                ),
+                            )
+                        )
 
                     # Display resized policy input (same tensor as predict_action)
                     if not args.headless:
@@ -2484,6 +2928,20 @@ def main():
                     with torch.inference_mode():
                         if needs_prediction:
                             prediction_events += 1
+                            raw_state_for_debug = build_state_from_mujoco(model, data)
+                            policy_state_for_debug = obs_for_policy.get(OBS_STATE)
+                            if isinstance(policy_state_for_debug, torch.Tensor):
+                                policy_state_for_debug = policy_state_for_debug.detach().cpu().numpy()
+                            policy_state_for_debug = np.asarray(policy_state_for_debug)
+                            raw_gripper = float(raw_state_for_debug[7])
+                            policy_gripper = float(policy_state_for_debug.reshape(-1)[7])
+                            offset_applied = abs(policy_gripper - raw_gripper) > 1e-6
+                            print(
+                                f"[GRIPPER OBS] prediction={prediction_events} step={step} "
+                                f"raw_qpos_mm={raw_gripper:.3f} "
+                                f"policy_mm={policy_gripper:.3f} "
+                                f"offset_applied={offset_applied}"
+                            )
                         action = predict_action(
                             obs_for_policy,
                             policy,
@@ -2509,7 +2967,14 @@ def main():
                             episode_frames[_cam_key].append(composite_obs[_obs_key].copy())
                     state_for_episode = composite_obs[OBS_STATE]
                 else:
-                    state_for_episode = build_state_from_mujoco(model, data)
+                    state_for_episode = build_state_from_mujoco(
+                        model,
+                        data,
+                        gripper_observation_offset_mm=args.sim_gripper_observation_offset_mm,
+                        gripper_observation_offset_mode=args.sim_gripper_observation_offset_mode,
+                        gripper_observation_contact_geom_ids=gripper_observation_contact_geom_ids,
+                        gripper_observation_threshold_mm=args.sim_gripper_observation_threshold_mm,
+                    )
                 episode_states.append(
                     state_for_episode.copy()
                     if isinstance(state_for_episode, np.ndarray)
@@ -2648,6 +3113,16 @@ def main():
             cv2.destroyAllWindows()
         _fin = "episodes saved" if output_dir is not None else "episodes completed (no sim eval data saved)"
         # print(f"[INFO] Evaluation finished: {completed_episodes}/{num_eval_episodes} {_fin}")
+
+    if output_dir is not None:
+        try:
+            grid_path = build_last_episode_state_grid(output_dir)
+            if grid_path is not None:
+                print(f"[INFO] Saved last-episode-state grid → {grid_path.resolve()}", flush=True)
+            else:
+                print("[WARN] No episode videos found; skipped last-episode-state grid.", flush=True)
+        except Exception as e:
+            print(f"[WARN] Failed to build last-episode-state grid: {e}", flush=True)
 
 
 if __name__ == "__main__":

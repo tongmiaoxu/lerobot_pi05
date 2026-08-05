@@ -26,6 +26,12 @@ class TaskProfile:
     calibration_xarm7_home_free_joint_body: str | None = None
     #: Semantic object/mask name -> MuJoCo body name when they differ.
     object_body_name_aliases: dict[str, str] = field(default_factory=dict)
+    #: Pix2pix-turbo training run dir under ``outputs/<subdir>/checkpoints/`` (stationary / high cam).
+    turbo_output_stationary: str | None = None
+    #: Pix2pix-turbo training run dir under ``outputs/<subdir>/checkpoints/`` (wrist cam).
+    turbo_output_wrist: str | None = None
+    #: Default checkpoint file inside each run's ``checkpoints/`` folder.
+    turbo_checkpoint_filename: str = "model_30001.pkl"
     output_dirs_by_policy: dict[str, str] = field(default_factory=dict)
 
     def calibration_free_joint_pair_dict(self) -> dict[str, str]:
@@ -62,9 +68,43 @@ class TaskProfile:
         return f"{self.eval_dataset_root}{self._policy_suffix(policy_type, checkpoint_name)}"
 
     def sim_eval_root_for_policy(
-        self, policy_type: str | None = None, checkpoint_name: str | None = None
+        self,
+        policy_type: str | None = None,
+        checkpoint_name: str | None = None,
+        *,
+        sim_variant: str = "default",
     ) -> str:
-        return f"{self.sim_eval_dataset_root}{self._policy_suffix(policy_type, checkpoint_name)}"
+        """Default sim eval under ``data_sim/``; ``kaifeng`` / ``turbo`` use sibling roots (see deploy script)."""
+        base = f"{self.sim_eval_dataset_root}{self._policy_suffix(policy_type, checkpoint_name)}"
+        if sim_variant == "default":
+            return base
+        if sim_variant == "kaifeng":
+            if "data_sim/data_sim_eval" not in base:
+                raise ValueError(
+                    f"sim_variant='kaifeng' expects path containing 'data_sim/data_sim_eval', got {base!r}"
+                )
+            return base.replace("data_sim/data_sim_eval", "data_sim_kaifeng/data_sim_kaifeng_eval", 1)
+        if sim_variant == "turbo":
+            if "data_sim/data_sim_eval" not in base:
+                raise ValueError(
+                    f"sim_variant='turbo' expects path containing 'data_sim/data_sim_eval', got {base!r}"
+                )
+            return base.replace("data_sim/data_sim_eval", "data_sim_turbo/data_sim_eval", 1)
+        raise ValueError(f"Unknown sim_variant {sim_variant!r}; expected 'default', 'kaifeng', or 'turbo'.")
+
+    def turbo_default_checkpoint_paths(self, project_root: str | Path) -> tuple[str, str] | None:
+        """Absolute paths to default pix2pix-turbo checkpoints for stationary and wrist cameras.
+
+        Returns ``None`` when this task does not define ``turbo_output_stationary`` /
+        ``turbo_output_wrist`` (caller must pass ``--turbo-checkpoint-*`` or policy config).
+        """
+        if self.turbo_output_stationary is None or self.turbo_output_wrist is None:
+            return None
+        root = Path(project_root).resolve()
+        ck = self.turbo_checkpoint_filename
+        stationary = root / "outputs" / self.turbo_output_stationary / "checkpoints" / ck
+        wrist = root / "outputs" / self.turbo_output_wrist / "checkpoints" / ck
+        return (str(stationary), str(wrist))
 
 
 DEFAULT_TASK_ID = "pick_mug"
@@ -77,8 +117,8 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         dataset_root="data_pick_mug",
         dataset_root_480640 = "data_pick_mug_copy",
         eval_dataset_repo_id="eval_xarm_pick_mug",
-        eval_dataset_root="data_eval_pick_mug",
-        sim_eval_dataset_root="data_sim_eval_pick_mug",
+        eval_dataset_root="data_real/data_real_eval_pick_mug",
+        sim_eval_dataset_root="data_sim/data_sim_eval_pick_mug",
         selection_object_name="mug",
         wandb_project="pick_mug",
         scene_xml_candidates=("scene.xml",),
@@ -101,8 +141,8 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         dataset_root="data_place_mug",
         dataset_root_480640 = "data_place_mug_copy",
         eval_dataset_repo_id="eval_place_mug",
-        eval_dataset_root="data_eval_place_mug",
-        sim_eval_dataset_root="data_sim_eval_place_mug",
+        eval_dataset_root="data_real/data_real_eval_place_mug",
+        sim_eval_dataset_root="data_sim/data_sim_eval_place_mug",
         selection_object_name="mug, saucer",
         wandb_project="place_mug",
         scene_xml_candidates=("scene_saucer.xml",),
@@ -111,6 +151,8 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         calibration_adjustable_object_names=("mug", "saucer","table"),
         calibration_free_joint_pairs=(("mug", "mug_joint"),),
         calibration_body_yaw_rotatable_names=("saucer",),
+        turbo_output_stationary="turbo_sim2real_stationary_dino",
+        turbo_output_wrist="turbo_sim2real_wrist_dino",
     ),
     "hang_mug": TaskProfile(
         task_id="hang_mug",
@@ -119,8 +161,8 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         dataset_root="data_hang_mug",
         dataset_root_480640 = "data_hang_mug_copy",
         eval_dataset_repo_id="eval_hang_mug",
-        eval_dataset_root="data_eval_hang_mug",
-        sim_eval_dataset_root="data_sim_eval_hang_mug",
+        eval_dataset_root="data_real/data_real_eval_hang_mug",
+        sim_eval_dataset_root="data_sim/data_sim_eval_hang_mug",
         selection_object_name="mug",
         wandb_project="hang_mug",
         scene_xml_candidates=("scene_hang.xml",),
@@ -129,6 +171,8 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         calibration_adjustable_object_names=("mug", "rack","table"),
         calibration_free_joint_pairs=(("mug", "mug_joint"),),
         calibration_body_yaw_rotatable_names=("rack",),
+        turbo_output_stationary="turbo_sim2real_stationary_dino_hang",
+        turbo_output_wrist="turbo_sim2real_wrist_dino_hang",
     ),
     "pick_shoe": TaskProfile(
         task_id="pick_shoe",
@@ -137,8 +181,8 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         dataset_root="data_pick_shoe",
         dataset_root_480640="data_pick_shoe_copy",
         eval_dataset_repo_id="eval_xarm_pick_shoe",
-        eval_dataset_root="data_eval_pick_shoe",
-        sim_eval_dataset_root="data_sim_eval_pick_shoe",
+        eval_dataset_root="data_real/data_real_eval_pick_shoe",
+        sim_eval_dataset_root="data_sim/data_sim_eval_pick_shoe",
         selection_object_name="right_shoe",
         wandb_project="pick_shoe",
         scene_xml_candidates=("scene_shoe.xml",),
@@ -147,17 +191,19 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         calibration_adjustable_object_names=("left_shoe", "right_shoe", "table"),
         calibration_free_joint_pairs=(("right_shoe", "right_shoe_joint"),),
         calibration_body_yaw_rotatable_names=("left_shoe",),
+        turbo_output_stationary="turbo_sim2real_stationary_dino_shoe",
+        turbo_output_wrist="turbo_sim2real_wrist_dino_shoe",
     ),
     "book_shelving": TaskProfile(
         task_id="book_shelving",
-        single_task="Place the book on the shelf",
+        single_task="Insert book into bounded pile",
         dataset_repo_id="book_shelving",
         dataset_root="data_book_shelving",
         dataset_root_480640="data_book_shelving_copy",
         eval_dataset_repo_id="eval_book_shelving",
-        eval_dataset_root="data_eval_book_shelving",
-        sim_eval_dataset_root="data_sim_eval_book_shelving",
-        selection_object_name="book, shelf",
+        eval_dataset_root="data_real/data_real_eval_book_shelving",
+        sim_eval_dataset_root="data_sim/data_sim_eval_book_shelving",
+        selection_object_name="book",
         wandb_project="book_shelving",
         scene_xml_candidates=("scene_book.xml",),
         xarm7_xml="xarm7_book.xml",
@@ -174,8 +220,8 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         dataset_root="data_pouring",
         dataset_root_480640="data_pouring_copy",
         eval_dataset_repo_id="eval_pouring",
-        eval_dataset_root="data_eval_pouring",
-        sim_eval_dataset_root="data_sim_eval_pouring",
+        eval_dataset_root="data_real/data_real_eval_pouring",
+        sim_eval_dataset_root="data_sim/data_sim_eval_pouring",
         selection_object_name="carton, mug",
         wandb_project="pouring",
         scene_xml_candidates=("scene_carton.xml",),

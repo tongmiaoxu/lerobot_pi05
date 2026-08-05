@@ -92,8 +92,9 @@ python visual_match/compare_recorded_vs_mujoco.py --cma
 ```
 
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py --no-mujoco-view --no_stack
+python visual_match/compare_recorded_vs_mujoco.py --no-mujoco-view --no_stack --headless
 ```
+
 
 ### load model in mujoco
 ```bash
@@ -116,15 +117,15 @@ python scripts/train_task.py \
   --policy.push_to_hub=false \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --batch_size=32 \
-  --steps=90000 \
-  --save_freq=30000 \
+  --steps=20000 \
+  --save_freq=5000 \
   --policy.chunk_size=50 \
   --policy.n_action_steps=50 \
   --dataset.image_transforms.enable=true
 ```
 ```bash
 python scripts/train_task.py \
-  --task-id=hang_mug \
+  --task-id=place_mug \
   --policy-type=diffusion \
   --policy.device=cuda \
   --policy.push_to_hub=false \
@@ -133,7 +134,7 @@ python scripts/train_task.py \
   --policy.horizon=56 \
   --policy.n_action_steps=50 \
   --batch_size=128 \
-  --save_freq=30000 \
+  --save_freq=20000 \
   --steps=90000 \
   --config_path=outputs/diffusion_xarm_training/checkpoints/010000/pretrained_model/train_config.json \
   --resume=true
@@ -248,11 +249,17 @@ python visual_match/calibrate_color.py
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --color-calibrate
 ```
-**deployment**:(use --select to select windows for different distributions) (--obs means replace obs with real world images;--obs_eval means replace with real world eval images)(-no_obs means deploy faster)
+**deployment**:(use --select to select windows for different distributions) (--obs means replace obs with real world images;--obs_eval means replace with real world eval images)(--no_obs means deploy faster)
 ```bash
 python visual_match/deploy_act_policy_mujoco.py --select --gemini
 ```
-
+(deploy multiple checkpoints at the same time; --all means raw_sim; kaifeng; and sim)
+```bash
+python visual_match/deploy_act_policy_mujoco.py \
+--task pick_shoe \
+--policy-paths "outputs/diffusion_pick_shoe/checkpoints/002000/pretrained_model;outputs/diffusion_pick_shoe/checkpoints/004000/pretrained_model;/home/tina/Documents/lerobot_pi05/outputs/diffusion_pick_shoe/checkpoints/006000/pretrained_model;/home/tina/Documents/lerobot_pi05/outputs/diffusion_pick_shoe/checkpoints/008000/pretrained_model" \
+--headless --no-mujoco-view --all
+```
 
 ```bash
 newgrp dialout
@@ -294,12 +301,14 @@ set DATA_DIR = copy before DS
 set TEXT_PROMPTS
 ```bash
 python visual_match/initial_states_overlay.py
-python visual_match/temp_pixel_masks_overlay_10ep.py
+# python visual_match/temp_pixel_masks_overlay_10ep.py
+python visual_match/obj_calibration_mujoco.py --episode 0-4,95-99
+python visual_match/compare_recorded_vs_mujoco.py --save-replay-frames
 ```
 Saved under DATA_DIR.
 
 Align object for replay or color alignment:
-(--task-id place_mug   --episode 24   --save-auto-align-cache to overwrite the obj alignment optimization cache with manual adjustment; or give multiple episodes: --episode 0-4,95-99 gives autosave mode)
+(python visual_match/obj_calibration_mujoco.py --task-id place_mug   --episode 24   --save-auto-align-cache to overwrite the obj alignment optimization cache with manual adjustment; or give multiple episodes: --episode 0-4,95-99 gives autosave mode)
 (python visual_match/compare_recorded_vs_mujoco.py   --episode 24   --save-replay-frames   --auto-align-force(to recompute even cache exist))
 m        select mug
 Arrows   move selected object in X/Y
@@ -312,12 +321,12 @@ q        save, or save and next episode in range mode
 Esc      discard/stop
 ```bash
 python tools/decomp_collision_mujoco.py
-python visual_match/obj_calibration_mujoco.py
+python visual_match/obj_calibration_mujoco.py --episode 0-4,95-99
 ```
 
 Replay:
 ```bash
-python visual_match/compare_recorded_vs_mujoco.py
+python visual_match/compare_recorded_vs_mujoco.py --save-replay-frames
 ```
 
 Color Alignment:
@@ -325,6 +334,7 @@ Color Alignment:
 --auto-align-initial-objects)
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
+python visual_match/generate_color_calibrate_file.py --data_book_shelving_copy --clean
 python visual_match/calibrate_color.py
 ```
 Deployment:
@@ -332,7 +342,7 @@ Deployment:
 Set policy checkpoint, run
 ```bash
 lerobot-record
-python visual_match/deploy_act_policy_mujoco.py
+python visual_match/deploy_act_policy_mujoco.py --color-calibrate
 ```
 Then deployment selection defaults come from the task_profiles.py:
 pick_mug -> mug
@@ -402,8 +412,8 @@ python -m sim2real.img2img_turbo.inference_paired \
 ```bash( --fast-rollout-video-replay: only render the camera after all deployments)
 python visual_match/deploy_act_policy_mujoco.py \
   --turbo \
-  --turbo-checkpoint-stationary outputs/turbo_sim2real_stationary_dino_hang/checkpoints/model_30001.pkl \
-  --turbo-checkpoint-wrist outputs/turbo_sim2real_wrist_dino_hang/checkpoints/model_30001.pkl \
+  --turbo-checkpoint-stationary outputs/turbo_sim2real_stationary_dino_shoe/checkpoints/model_30001.pkl \
+  --turbo-checkpoint-wrist outputs/turbo_sim2real_wrist_dino_shoe/checkpoints/model_30001.pkl \
   --fast-rollout-video-replay
 ```
 ```bash

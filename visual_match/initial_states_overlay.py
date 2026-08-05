@@ -26,14 +26,15 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from segmentation_utils import segment_object_mask
+from segmentation_utils import segment_object_mask, segment_point_mask
 
 
 ROOT = Path(__file__).resolve().parent.parent          # lerobot_pi05
-TEXT_PROMPTS = ["shoe"]   # Comma-separated entries are split into separate objects
-OUTPUT_OBJECT_NAMES = {"shoe": "right_shoe"}
-DATA_DIR = ROOT / "data_pick_shoe_copy"
-COMPONENT_SELECTION_MODE = "leftmost"  # "leftmost", "interactive_each", or "track_neighbors"
+TEXT_PROMPTS = ["book"]   # Comma-separated entries are split into separate objects
+OUTPUT_OBJECT_NAMES = {"book": "book"}
+DATA_DIR = ROOT / "data_book_shelving_copy"
+COMPONENT_SELECTION_MODE = "farthest_from_center"  # "leftmost", "farthest_from_center", "interactive_each", or "track_neighbors"
+REVIEW_GRID_MAX_DISPLAY = (1400, 900)  # Width, height for on-screen review window.
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -83,11 +84,15 @@ def _select_component_interactively(labels, centroids, window_name):
         cx, cy = int(centroid[0]), int(centroid[1])
         cv2.putText(display, str(lbl), (cx, cy), font, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
+    max_selectable = min(n_components - 1, 9)
     cv2.imshow(window_name, display)
-    print(f"Multiple components detected ({n_components - 1}). Press key 1-{n_components - 1} to select, or q to skip.")
-    key = cv2.waitKey(0)
+    print(
+        f"Multiple components detected ({n_components - 1}). "
+        f"Press key 1-{max_selectable} to select, or q to skip."
+    )
+    key = cv2.waitKey(0) & 0xFF
     cv2.destroyWindow(window_name)
-    if key in [ord(str(i)) for i in range(1, n_components)]:
+    if key in [ord(str(i)) for i in range(1, max_selectable + 1)]:
         chosen = int(chr(key))
         return labels == chosen
 
@@ -108,6 +113,15 @@ def _filter_mask_by_neighbor_centroids(mask, neighbor_centroids):
         # Camera image coordinates increase to the right; the desired right shoe
         # appears on the left side of the image.
         best_label = min(component_centroids, key=lambda lbl: component_centroids[lbl][0])
+        return labels == best_label
+
+    if COMPONENT_SELECTION_MODE == "farthest_from_center":
+        height, width = labels.shape
+        image_center = np.array([(width - 1) / 2, (height - 1) / 2])
+        best_label = max(
+            component_centroids,
+            key=lambda lbl: np.linalg.norm(component_centroids[lbl] - image_center),
+        )
         return labels == best_label
 
     if COMPONENT_SELECTION_MODE == "interactive_each":
@@ -135,6 +149,147 @@ def _filter_mask_by_neighbor_centroids(mask, neighbor_centroids):
             best_label = lbl
 
     return labels == best_label
+
+
+def _mask_centroid(mask):
+    if mask is None or not mask.any():
+        return None
+    ys, xs = np.where(mask)
+    return (xs.mean(), ys.mean())
+
+
+def _make_episode_grid(frames, masks, ep_indices, cols, rows, thumb_w, thumb_h):
+    grid = np.zeros((rows * thumb_h, cols * thumb_w, 3), dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for idx, fr in enumerate(frames):
+        r, c = divmod(idx, cols)
+        thumb = cv2.resize(fr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+        if masks[idx] is not None:
+            m_small = cv2.resize(
+                masks[idx].astype(np.uint8), (thumb_w, thumb_h),
+                interpolation=cv2.INTER_NEAREST
+            )
+            cnts, _ = cv2.findContours(m_small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(thumb, cnts, -1, (0, 255, 0), 1)
+        else:
+            cv2.rectangle(thumb, (0, 0), (thumb_w - 1, thumb_h - 1), (255, 0, 0), 2)
+        cv2.putText(
+            thumb, f"ep {ep_indices[idx]}", (6, 18), font, 0.5,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            thumb, f"ep {ep_indices[idx]}", (6, 18), font, 0.5,
+            (0, 0, 0), 1, cv2.LINE_AA,
+        )
+        grid[r * thumb_h:(r + 1) * thumb_h, c * thumb_w:(c + 1) * thumb_w] = thumb
+    return grid
+
+
+def _pick_grid_episode(grid_rgb, cols, thumb_w, thumb_h, n_episodes, object_name):
+    window_name = f"Review {object_name}: click bad tile, q when done"
+    state = {"idx": None}
+    grid_h, grid_w = grid_rgb.shape[:2]
+    max_w, max_h = REVIEW_GRID_MAX_DISPLAY
+    scale = min(max_w / grid_w, max_h / grid_h, 1.0)
+    display_w, display_h = int(grid_w * scale), int(grid_h * scale)
+
+    def on_mouse(event, x, y, _flags, _param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        grid_x = int(x / scale)
+        grid_y = int(y / scale)
+        col, row = grid_x // thumb_w, grid_y // thumb_h
+        idx = row * cols + col
+        if 0 <= idx < n_episodes:
+            state["idx"] = idx
+
+    display_bgr = cv2.cvtColor(grid_rgb, cv2.COLOR_RGB2BGR)
+    if scale < 1.0:
+        display_bgr = cv2.resize(display_bgr, (display_w, display_h), interpolation=cv2.INTER_AREA)
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, display_w, display_h)
+    cv2.imshow(window_name, display_bgr)
+    cv2.setMouseCallback(window_name, on_mouse)
+    print(
+        f"Review '{object_name}': click a wrong grid tile to fix it, or press q when done. "
+        f"Displayed at {scale:.2f}x scale."
+    )
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+        if key == ord("q"):
+            cv2.destroyWindow(window_name)
+            return None
+        if state["idx"] is not None:
+            cv2.destroyWindow(window_name)
+            return state["idx"]
+
+
+def _pick_segmentation_point(frame_rgb, mask, ep_idx, object_name):
+    window_name = f"Pick {object_name} point: ep {ep_idx}"
+    display = frame_rgb.copy()
+    if mask is not None:
+        overlay = display.copy()
+        overlay[mask] = (0, 255, 0)
+        display = cv2.addWeighted(overlay, 0.35, display, 0.65, 0)
+    cv2.putText(
+        display,
+        "Click the book point. Press q to skip.",
+        (10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    state = {"point": None}
+
+    def on_mouse(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            state["point"] = (x, y)
+
+    cv2.imshow(window_name, cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
+    cv2.setMouseCallback(window_name, on_mouse)
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+        if key == ord("q"):
+            cv2.destroyWindow(window_name)
+            return None
+        if state["point"] is not None:
+            cv2.destroyWindow(window_name)
+            return state["point"]
+
+
+def _review_masks_from_grid(frames, masks, ep_indices, obj_masks_dir, object_name):
+    n = len(frames)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    h, w = frames[0].shape[:2]
+    thumb_w, thumb_h = w // 2, h // 2
+
+    while True:
+        grid = _make_episode_grid(frames, masks, ep_indices, cols, rows, thumb_w, thumb_h)
+        idx = _pick_grid_episode(grid, cols, thumb_w, thumb_h, n, object_name)
+        if idx is None:
+            break
+
+        ep_idx = ep_indices[idx]
+        point = _pick_segmentation_point(frames[idx], masks[idx], ep_idx, object_name)
+        if point is None:
+            print(f"  Episode {ep_idx:3d}  [manual correction skipped]")
+            continue
+
+        frame_bgr = cv2.cvtColor(frames[idx], cv2.COLOR_RGB2BGR)
+        corrected_mask = segment_point_mask(frame_bgr, point)
+        if corrected_mask is None or not corrected_mask.any():
+            print(f"  Episode {ep_idx:3d}  [manual point produced no mask]")
+            continue
+
+        masks[idx] = corrected_mask
+        mask_img = (corrected_mask.astype(np.uint8) * 255)
+        Image.fromarray(mask_img).save(obj_masks_dir / f"ep_{ep_idx:03d}_mask.png")
+        print(f"  Episode {ep_idx:3d}  [manual mask updated from point {point}]")
+
+    return masks
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -272,14 +427,14 @@ for text_prompt in object_prompts:
             masks.append(mask)
             mask_img = (mask.astype(np.uint8) * 255)
             Image.fromarray(mask_img).save(obj_masks_dir / f"ep_{ep_idx:03d}_mask.png")
-            ys, xs = np.where(mask)
-            cx, cy = xs.mean(), ys.mean()
-            centroids.append((cx, cy))
+            centroids.append(_mask_centroid(mask))
         else:
             masks.append(None)
             centroids.append(None)
             print(f"  Episode {ep_idx:3d}  [no mask found]")
 
+    masks = _review_masks_from_grid(frames, masks, ep_indices, obj_masks_dir, object_name)
+    centroids = [_mask_centroid(mask) for mask in masks]
     valid = sum(1 for m in masks if m is not None)
     print(f"Segmented {valid} / {len(frames)} episodes for '{text_prompt}'")
 
@@ -350,18 +505,7 @@ for text_prompt in object_prompts:
     h, w = frames[0].shape[:2]
     thumb_w, thumb_h = w // 2, h // 2
 
-    grid = np.zeros((rows * thumb_h, cols * thumb_w, 3), dtype=np.uint8)
-    for idx, fr in enumerate(frames):
-        r, c = divmod(idx, cols)
-        thumb = cv2.resize(fr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
-        if masks[idx] is not None:
-            m_small = cv2.resize(
-                masks[idx].astype(np.uint8), (thumb_w, thumb_h),
-                interpolation=cv2.INTER_NEAREST
-            )
-            cnts, _ = cv2.findContours(m_small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(thumb, cnts, -1, (0, 255, 0), 1)
-        grid[r * thumb_h:(r + 1) * thumb_h, c * thumb_w:(c + 1) * thumb_w] = thumb
+    grid = _make_episode_grid(frames, masks, ep_indices, cols, rows, thumb_w, thumb_h)
 
     Image.fromarray(grid).save(obj_dir / "all_episodes_grid.png")
     print(f"  Saved {object_name}/all_episodes_grid.png")

@@ -63,11 +63,11 @@ CAMERA_CONFIG = {
 }
 
 PROJECT_ROOT = Path(__file__).parent.parent
-_DEFAULT_RECORD_TASK_ID = "pick_shoe"
+_DEFAULT_RECORD_TASK_ID = "book_shelving"
 _DEFAULT_EPISODE = 0
 _DEFAULT_FPS = 30.0
 _DEFAULT_ALPHA = 0.7
-_DEFAULT_CALIB_FRAME = 140
+_DEFAULT_CALIB_FRAME = 0
 _DEFAULT_DATASET_ROOT = None
 _SHOW_SOURCES = False
 _SHOW_MUJOCO_VIEWER = True
@@ -239,8 +239,18 @@ def replace_body_rotation_from_euler(text: str, body_name: str, euler: np.ndarra
         updated, count = re.subn(pattern, rf"\g<1>{val}\g<2>", text, count=1, flags=re.MULTILINE)
         if count:
             return updated
+    pattern = rf'^([ \t]*<body name="{re.escape(body_name)}"(?=[ \t>/])[^>]*)(/?>.*)$'
+    updated, count = re.subn(
+        pattern,
+        rf'\g<1> euler="{euler_str}"\g<2>',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count:
+        return updated
     raise ValueError(
-        f"Could not find body {body_name!r} with attribute 'euler' or 'quat' to set orientation"
+        f"Could not find body {body_name!r} to set orientation"
     )
 
 
@@ -394,15 +404,17 @@ def save_auto_align_cache(
     object_names = selection_object_names(object_name)
     poses: dict[str, dict[str, np.ndarray]] = {}
     free_joint_bodies = frozenset(task_profile.calibration_free_joint_pair_dict())
+    body_aliases = task_profile.object_body_name_aliases
 
     for name in object_names:
-        if name in free_joint_bodies:
-            if name not in free_joint_poses:
+        body_name = body_aliases.get(name, name)
+        if body_name in free_joint_bodies:
+            if body_name not in free_joint_poses:
                 raise ValueError(
                     f"Cannot save {name!r} cache: free-joint pose is not available "
                     f"(task {task_profile.task_id!r})"
                 )
-            pos, quat = free_joint_poses[name]
+            pos, quat = free_joint_poses[body_name]
             poses[name] = {
                 "kind": np.array("freejoint"),
                 "pos": np.asarray(pos, dtype=np.float64).copy(),
@@ -410,18 +422,18 @@ def save_auto_align_cache(
             }
             continue
 
-        if name not in body_positions or name not in body_ids:
+        if body_name not in body_positions or body_name not in body_ids:
             raise ValueError(
                 f"Cannot save {name!r} cache: object is not editable for task {task_profile.task_id!r}"
             )
         quat = (
-            quat_from_euler_xyz(body_eulers[name])
-            if name in body_eulers
-            else model.body_quat[body_ids[name]].copy()
+            quat_from_euler_xyz(body_eulers[body_name])
+            if body_name in body_eulers
+            else model.body_quat[body_ids[body_name]].copy()
         )
         poses[name] = {
             "kind": np.array("body"),
-            "pos": np.asarray(body_positions[name], dtype=np.float64).copy(),
+            "pos": np.asarray(body_positions[body_name], dtype=np.float64).copy(),
             "quat": quat_normalize(np.asarray(quat, dtype=np.float64)),
         }
 
@@ -429,6 +441,7 @@ def save_auto_align_cache(
         initial_states_dir=initial_states_dir,
         object_name=object_name,
         cache_dir=cache_dir,
+        body_name_aliases=body_aliases,
     )
     cache_path = cache_path_for_episode(config, episode_idx)
     result = ObjectPoseAlignResult(
@@ -529,6 +542,7 @@ def main():
         initial_states_dir=cache_initial_states_dir,
         object_name=cache_object_name,
         cache_dir=args.auto_align_cache_dir,
+        body_name_aliases=task_profile.object_body_name_aliases,
     )
     if args.save_auto_align_cache:
         print(f"[INFO] Auto-align cache mode for objects: {cache_object_name}")
@@ -636,22 +650,23 @@ def main():
         try:
             cached_result = load_result(cache_path)
             for name, pose in cached_result.poses.items():
+                body_name = task_profile.object_body_name_aliases.get(name, name)
                 pos = np.asarray(pose["pos"], dtype=np.float64).copy()
                 quat = quat_normalize(np.asarray(pose["quat"], dtype=np.float64))
-                if name in free_edits:
-                    fe = free_edits[name]
+                if body_name in free_edits:
+                    fe = free_edits[body_name]
                     fe.pos[:] = pos
                     fe.quat[:] = quat.copy()
                     fe.euler[:] = euler_xyz_from_quat(fe.quat)
-                elif name == "table" and table_pos is not None:
+                elif body_name == "table" and table_pos is not None:
                     table_pos = pos
                     table_euler = euler_xyz_from_quat(quat)
-                elif name in body_positions:
-                    body_positions[name] = pos
-                    if name in body_eulers:
-                        body_eulers[name] = euler_xyz_from_quat(quat)
-                    elif name in body_ids:
-                        model.body_quat[body_ids[name]] = quat
+                elif body_name in body_positions:
+                    body_positions[body_name] = pos
+                    if body_name in body_eulers:
+                        body_eulers[body_name] = euler_xyz_from_quat(quat)
+                    elif body_name in body_ids:
+                        model.body_quat[body_ids[body_name]] = quat
             print(f"[INFO] Loaded auto-align cache for initial pose: {cache_path}")
         except Exception as exc:
             print(f"[WARN] Failed to load auto-align cache {cache_path}: {exc}")
@@ -897,6 +912,8 @@ def main():
         "saucer": "p",
         "sticker": "t",
         "table": "b",
+        "book": "o",
+        "book_shelf_target": "h",
         "left_shoe": "f",
         "right_shoe": "g",
     }

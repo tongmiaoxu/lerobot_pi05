@@ -29,6 +29,7 @@ class ObjectPoseAlignConfig:
     min_iou: float = 0.08
     force: bool = False
     camera_adjust_delta: np.ndarray | None = None
+    body_name_aliases: Mapping[str, str] | None = None
 
 
 @dataclass
@@ -126,12 +127,22 @@ def _target_precompute(target_masks: dict[str, np.ndarray]) -> dict[str, dict[st
     return precomp
 
 
-def _geom_id_for_object(model: mujoco.MjModel, object_name: str) -> int:
-    for geom_name in (f"{object_name}_visual", object_name):
+def _body_name_for_object(object_name: str, body_name_aliases: Mapping[str, str] | None = None) -> str:
+    return body_name_aliases.get(object_name, object_name) if body_name_aliases else object_name
+
+
+def _geom_id_for_object(
+    model: mujoco.MjModel,
+    object_name: str,
+    body_name_aliases: Mapping[str, str] | None = None,
+) -> int:
+    body_name = _body_name_for_object(object_name, body_name_aliases)
+    geom_names = (f"{object_name}_visual", object_name, f"{body_name}_visual", body_name)
+    for geom_name in dict.fromkeys(geom_names):
         geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
         if geom_id >= 0:
             return int(geom_id)
-    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, object_name)
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
     if body_id >= 0:
         body_geom_ids = np.where(model.geom_bodyid == body_id)[0]
         for geom_id in body_geom_ids:
@@ -170,8 +181,10 @@ def _capture_pose(
     data: mujoco.MjData,
     object_name: str,
     free_joint_by_body: Mapping[str, str] | None = None,
+    body_name_aliases: Mapping[str, str] | None = None,
 ) -> dict[str, np.ndarray]:
-    joint_name = _joint_name_for_free_object(object_name, free_joint_by_body)
+    body_name = _body_name_for_object(object_name, body_name_aliases)
+    joint_name = _joint_name_for_free_object(body_name, free_joint_by_body)
     if joint_name is not None:
         qpos_addr = _free_joint_qpos_addr(model, joint_name)
         if qpos_addr >= 0:
@@ -180,7 +193,7 @@ def _capture_pose(
                 "pos": data.qpos[qpos_addr:qpos_addr + 3].copy(),
                 "quat": quat_normalize(data.qpos[qpos_addr + 3:qpos_addr + 7].copy()),
             }
-    body_id = _body_id_for_object(model, object_name)
+    body_id = _body_id_for_object(model, body_name)
     return {
         "kind": np.array("body"),
         "pos": model.body_pos[body_id].copy(),
@@ -193,8 +206,12 @@ def capture_object_poses(
     data: mujoco.MjData,
     object_names: list[str],
     free_joint_by_body: Mapping[str, str] | None = None,
+    body_name_aliases: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, np.ndarray]]:
-    return {name: _capture_pose(model, data, name, free_joint_by_body) for name in object_names}
+    return {
+        name: _capture_pose(model, data, name, free_joint_by_body, body_name_aliases)
+        for name in object_names
+    }
 
 
 def apply_object_poses(
@@ -202,13 +219,15 @@ def apply_object_poses(
     data: mujoco.MjData,
     poses: dict[str, dict[str, np.ndarray]],
     free_joint_by_body: Mapping[str, str] | None = None,
+    body_name_aliases: Mapping[str, str] | None = None,
 ) -> None:
     for object_name, pose in poses.items():
+        body_name = _body_name_for_object(object_name, body_name_aliases)
         kind = str(pose.get("kind", "body"))
         pos = np.asarray(pose["pos"], dtype=np.float64)
         quat = quat_normalize(np.asarray(pose["quat"], dtype=np.float64))
         if kind == "freejoint":
-            joint_name = _joint_name_for_free_object(object_name, free_joint_by_body)
+            joint_name = _joint_name_for_free_object(body_name, free_joint_by_body)
             if joint_name is None:
                 continue
             qpos_addr = _free_joint_qpos_addr(model, joint_name)
@@ -217,7 +236,7 @@ def apply_object_poses(
             data.qpos[qpos_addr:qpos_addr + 3] = pos
             data.qpos[qpos_addr + 3:qpos_addr + 7] = quat
         else:
-            body_id = _body_id_for_object(model, object_name)
+            body_id = _body_id_for_object(model, body_name)
             model.body_pos[body_id] = pos
             model.body_quat[body_id] = quat
     mujoco.mj_forward(model, data)
@@ -410,7 +429,13 @@ def auto_align_object_poses(
     if cache_path.exists() and not config.force:
         result = load_result(cache_path)
         if apply:
-            apply_object_poses(model, data, result.poses, free_joint_by_body=free_joint_by_body)
+            apply_object_poses(
+                model,
+                data,
+                result.poses,
+                free_joint_by_body=free_joint_by_body,
+                body_name_aliases=config.body_name_aliases,
+            )
         return result
 
     if config.camera_key not in camera_config:
@@ -418,8 +443,17 @@ def auto_align_object_poses(
 
     target_masks = load_target_masks(config.initial_states_dir, object_names, episode_idx)
     target_info = _target_precompute(target_masks)
-    geom_ids = {name: _geom_id_for_object(model, name) for name in object_names}
-    base_poses = capture_object_poses(model, data, object_names, free_joint_by_body=free_joint_by_body)
+    geom_ids = {
+        name: _geom_id_for_object(model, name, config.body_name_aliases)
+        for name in object_names
+    }
+    base_poses = capture_object_poses(
+        model,
+        data,
+        object_names,
+        free_joint_by_body=free_joint_by_body,
+        body_name_aliases=config.body_name_aliases,
+    )
     start, specs = _pack_params(base_poses, object_names, config.optimize_z)
 
     lower = start.copy()
@@ -442,7 +476,13 @@ def auto_align_object_poses(
 
     def evaluate(params: np.ndarray) -> tuple[float, dict[str, float]]:
         poses = _poses_from_params(base_poses, params, specs)
-        apply_object_poses(model, data, poses, free_joint_by_body=free_joint_by_body)
+        apply_object_poses(
+            model,
+            data,
+            poses,
+            free_joint_by_body=free_joint_by_body,
+            body_name_aliases=config.body_name_aliases,
+        )
         sim_masks = _render_sim_masks(
             model,
             data,
@@ -462,7 +502,13 @@ def auto_align_object_poses(
 
     best_params, best_loss = _coordinate_search(evaluate, start, lower, upper, yaw_indices)
     best_poses = _poses_from_params(base_poses, best_params, specs)
-    apply_object_poses(model, data, best_poses, free_joint_by_body=free_joint_by_body)
+    apply_object_poses(
+        model,
+        data,
+        best_poses,
+        free_joint_by_body=free_joint_by_body,
+        body_name_aliases=config.body_name_aliases,
+    )
     _, best_iou = evaluate(best_params)
 
     result = ObjectPoseAlignResult(
@@ -475,5 +521,11 @@ def auto_align_object_poses(
     )
     save_result(result, cache_path)
     if apply:
-        apply_object_poses(model, data, result.poses, free_joint_by_body=free_joint_by_body)
+        apply_object_poses(
+            model,
+            data,
+            result.poses,
+            free_joint_by_body=free_joint_by_body,
+            body_name_aliases=config.body_name_aliases,
+        )
     return result

@@ -157,10 +157,10 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
 # Set to None to require --policy.path to be passed explicitly on the CLI.
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_hang_mug/checkpoints/last/pretrained_model"
+_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_pick_shoe/checkpoints/006000/pretrained_model"
 # _DEFAULT_RECORD_POLICY_CHECKPOINT = None
-_DEFAULT_RECORD_TASK_ID = "hang_mug"
-_NUM_EPISODES = 9
+_DEFAULT_RECORD_TASK_ID = "pick_shoe"
+_NUM_EPISODES = 10
 
 
 def _extract_checkpoint_name(policy_path: str | Path | None) -> str | None:
@@ -343,7 +343,7 @@ class RecordConfig:
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
     # Display all cameras on screen
-    display_data: bool = False
+    display_data: bool = True
     # Display data on a remote Rerun server
     display_ip: str | None = None
     # Port of the remote Rerun server

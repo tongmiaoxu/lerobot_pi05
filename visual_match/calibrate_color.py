@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -11,8 +12,23 @@ from lerobot.tasks import get_task_profile
 from segmentation_utils import segment_object_mask
 
 
-_DEFAULT_RECORD_TASK_ID = "place_mug"  # Keep in sync with compare/deploy defaults.
+_DEFAULT_RECORD_TASK_ID = "book_shelving"  # Keep in sync with compare/deploy defaults.
 CAMERA = "wrist"
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Fit per-camera sim-to-real color calibration.")
+    parser.add_argument("--task-id", default=_DEFAULT_RECORD_TASK_ID)
+    parser.add_argument("--camera", choices=("stationary", "wrist"), default=CAMERA)
+    parser.add_argument("--segment-prompt", default="floor,book,gripper")
+    parser.add_argument("--segment-weight", default="0.99,0.99,0.99")
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="Use a deterministic uniform sample of at most this many paired frames.",
+    )
+    return parser.parse_args()
 
 def _collect_calibration_frame_paths(gs_dir: Path, real_dir: Path) -> tuple[list[Path], list[Path]]:
     src_img_paths = sorted(gs_dir.glob("frame_*.png"))
@@ -138,12 +154,18 @@ def _apply_transform(img: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.ndarra
 
 
 def main():
-    task_profile = get_task_profile(_DEFAULT_RECORD_TASK_ID)
-    base_dir = task_profile.calibration_pairs_dir(CAMERA)
+    args = _parse_args()
+    task_profile = get_task_profile(args.task_id)
+    base_dir = task_profile.calibration_pairs_dir(args.camera)
     gs_dir = base_dir / "gs_renders"
     real_dir = base_dir / "real_captures"
     out_dir = str(base_dir / "calibrated")
     src_img_paths, ref_img_paths = _collect_calibration_frame_paths(gs_dir, real_dir)
+    if args.max_images is not None and args.max_images > 0 and len(src_img_paths) > args.max_images:
+        sample_indices = np.linspace(0, len(src_img_paths) - 1, args.max_images, dtype=int)
+        src_img_paths = [src_img_paths[i] for i in sample_indices]
+        ref_img_paths = [ref_img_paths[i] for i in sample_indices]
+        print(f"[INFO] Using {len(src_img_paths)} uniformly sampled pairs from {len(sample_indices)} requested.")
 
     pixel_src = []
     pixel_ref = []
@@ -165,8 +187,8 @@ def main():
     pixel_ref = np.concatenate(pixel_ref, axis=0)
 
     # Spatial weight: downweight segmented pixels using Grounding-DINO + SAM2 (one forward per prompt)
-    SEGMENT_PROMPT = "floor,mug,gripper"
-    SEGMENT_WEIGHT = [0.99, 0.99, 0.99]
+    SEGMENT_PROMPT = args.segment_prompt
+    SEGMENT_WEIGHT = [float(w.strip()) for w in args.segment_weight.split(",") if w.strip()]
     prompts = [p.strip() for p in SEGMENT_PROMPT.split(",") if p.strip()]
     if len(prompts) != len(SEGMENT_WEIGHT):
         raise ValueError(

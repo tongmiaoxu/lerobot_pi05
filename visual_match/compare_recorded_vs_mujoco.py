@@ -19,6 +19,7 @@ import os
 import re
 import argparse
 import atexit
+import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -137,6 +138,45 @@ def format_episode_selector(episode_indices: list[int]) -> str:
         return f"{episode_indices[0]}-{episode_indices[-1]}"
     return ",".join(str(idx) for idx in episode_indices)
 
+
+def _argv_for_single_episode_replay(episode_idx: int) -> list[str]:
+    """Preserve CLI options while replacing any multi-episode selector."""
+    child_args = []
+    skip_next = False
+    for arg in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--episode":
+            skip_next = True
+            continue
+        if arg.startswith("--episode="):
+            continue
+        if arg == "--headless":
+            continue
+        child_args.append(arg)
+    return child_args + ["--episode", str(episode_idx)]
+
+
+def replay_selected_episodes_with_viewer(episode_indices: list[int]) -> int:
+    script_path = Path(__file__).resolve()
+    for replay_idx, episode_idx in enumerate(episode_indices, start=1):
+        print(
+            f"[INFO] Visual replay {replay_idx}/{len(episode_indices)}: "
+            f"episode {episode_idx}"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script_path), *_argv_for_single_episode_replay(episode_idx)],
+            check=False,
+        )
+        if result.returncode != 0:
+            print(
+                f"[WARN] Stopping multi-episode visual replay after episode {episode_idx} "
+                f"exited with code {result.returncode}"
+            )
+            return result.returncode
+    return 0
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -171,7 +211,7 @@ from object_pose_auto_align import (
     selection_object_names,
 )
 
-_DEFAULT_RECORD_TASK_ID ="pick_shoe"  # Keep in sync with lerobot-record defaults.
+_DEFAULT_RECORD_TASK_ID ="book_shelving"  # Keep in sync with lerobot-record defaults.
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -756,12 +796,14 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
             optimize_z=args.auto_align_optimize_z,
             force=args.auto_align_force,
             free_joint_pairs=task_profile.calibration_free_joint_pairs,
+            body_name_aliases=task_profile.object_body_name_aliases,
         )
         default_auto_object_poses = capture_object_poses(
             model,
             data,
             selection_object_names(args.object_name),
             free_joint_by_body=free_joint_by_body,
+            body_name_aliases=task_profile.object_body_name_aliases,
         )
 
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
@@ -855,7 +897,13 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
             except Exception:
                 mujoco.mj_resetData(model, data)
             if default_auto_object_poses is not None:
-                apply_object_poses(model, data, default_auto_object_poses, free_joint_by_body=free_joint_by_body)
+                apply_object_poses(
+                    model,
+                    data,
+                    default_auto_object_poses,
+                    free_joint_by_body=free_joint_by_body,
+                    body_name_aliases=task_profile.object_body_name_aliases,
+                )
             set_robot_to_ctrl_frame(model, data, initial_ctrl)
             for cam_key, cam_cfg in CAMERA_CONFIG.items():
                 if cam_cfg["config"].get("type", "stationary") == "stationary":
@@ -897,9 +945,21 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
         except Exception:
             mujoco.mj_resetData(model, data)
         if aligned_pose_result is not None:
-            apply_object_poses(model, data, aligned_pose_result.poses, free_joint_by_body=free_joint_by_body)
+            apply_object_poses(
+                model,
+                data,
+                aligned_pose_result.poses,
+                free_joint_by_body=free_joint_by_body,
+                body_name_aliases=task_profile.object_body_name_aliases,
+            )
         elif default_auto_object_poses is not None:
-            apply_object_poses(model, data, default_auto_object_poses, free_joint_by_body=free_joint_by_body)
+            apply_object_poses(
+                model,
+                data,
+                default_auto_object_poses,
+                free_joint_by_body=free_joint_by_body,
+                body_name_aliases=task_profile.object_body_name_aliases,
+            )
         set_robot_to_ctrl_frame(model, data, initial_ctrl)
 
         sampled_frame_count = replay_export_sample_count(frame_count, export_frame_stride)
@@ -1047,13 +1107,6 @@ def main():
     args.episode_indices = args.episode
     multiple_episodes_selected = len(args.episode_indices) > 1
     args.episode = args.episode_indices[0]
-    if multiple_episodes_selected:
-        args.save_replay_frames = True
-        args.headless = True
-        print(
-            f"[INFO] Multiple episodes selected ({format_episode_selector(args.episode_indices)}); "
-            "using headless replay-frame export"
-        )
     task_profile = get_task_profile(args.task_id)
     if args.replay_export_frame_stride < 1:
         print("[ERROR] --replay-export-frame-stride must be >= 1")
@@ -1084,7 +1137,19 @@ def main():
         args.object_name = task_profile.selection_object_name
 
     if multiple_episodes_selected:
-        export_selected_episode_replay_frames(args, task_profile, episode_indices=args.episode_indices)
+        if args.headless:
+            args.save_replay_frames = True
+            print(
+                f"[INFO] Multiple episodes selected ({format_episode_selector(args.episode_indices)}); "
+                "using headless replay-frame export"
+            )
+            export_selected_episode_replay_frames(args, task_profile, episode_indices=args.episode_indices)
+        else:
+            print(
+                f"[INFO] Multiple episodes selected ({format_episode_selector(args.episode_indices)}); "
+                "replaying each episode with visualization"
+            )
+            sys.exit(replay_selected_episodes_with_viewer(args.episode_indices))
         return
 
     # Load dataset
@@ -1370,6 +1435,7 @@ def main():
                 force=args.auto_align_force,
                 camera_adjust_delta=_loaded_delta,
                 free_joint_pairs=task_profile.calibration_free_joint_pairs,
+                body_name_aliases=task_profile.object_body_name_aliases,
             )
             align_result = auto_align_object_poses(
                 model=model,
