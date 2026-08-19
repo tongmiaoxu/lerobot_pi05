@@ -346,7 +346,7 @@ def main(args):
                         for k in log_dict:
                             logs[k] = log_dict[k]
 
-                    if global_step % args.checkpointing_steps == 1:
+                    if 0 < args.checkpointing_steps <= args.max_train_steps and global_step % args.checkpointing_steps == 1:
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
                         accelerator.unwrap_model(net_pix2pix).save_model(outf)
 
@@ -420,6 +420,10 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
+
+    if accelerator.is_main_process:
+        outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
+        accelerator.unwrap_model(net_pix2pix).save_model(outf)
 
 
 if __name__ == "__main__":
