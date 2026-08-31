@@ -101,31 +101,27 @@ python visual_match/compare_recorded_vs_mujoco.py --no-mujoco-view --no_stack --
 python visual_match/load_model_xarm.py
 ```
 
-### extract initial states
-```bash
-python visual_match/initial_states_overlay.py
-```
-
 ### Policy Training for xarm
-`python scripts/train_task.py` auto-fills `dataset.repo_id`, `dataset.root`, `output_dir`, `wandb.enable`, and `wandb.project` from `--task-id`.
+`python scripts/train_task.py` auto-fills `dataset.repo_id`, `dataset.root`, `output_dir`, `wandb.enable`, and `wandb.project` from `--task`.
 
 ```bash
 python scripts/train_task.py \
-  --task-id=place_mug \
+  --task=place_mug \
   --policy-type=act \
   --policy.device=cuda \
   --policy.push_to_hub=false \
   --policy.image_keys_filter='["cam_high", "cam_wrist"]' \
   --batch_size=32 \
   --steps=20000 \
-  --save_freq=5000 \
+  --save_freq=999999999 \
+  --save_steps='[3000, 10000, 15000, 20000]' \
   --policy.chunk_size=50 \
   --policy.n_action_steps=50 \
   --dataset.image_transforms.enable=true
 ```
 ```bash
 python scripts/train_task.py \
-  --task-id=place_mug \
+  --task=place_mug \
   --policy-type=diffusion \
   --policy.device=cuda \
   --policy.push_to_hub=false \
@@ -134,9 +130,10 @@ python scripts/train_task.py \
   --policy.horizon=56 \
   --policy.n_action_steps=50 \
   --batch_size=128 \
-  --save_freq=20000 \
-  --steps=90000 \
-  --config_path=outputs/diffusion_xarm_training/checkpoints/010000/pretrained_model/train_config.json \
+  --save_freq=100000 \
+  --save_steps='[15000]' \
+  --steps=15000 \
+  --config_path=outputs/diffusion_place_mug/checkpoints/010000/pretrained_model/train_config.json \
   --resume=true
 ```
 (diffusion n_obs_steps = 2;n_action_steps <= horizon - n_obs_steps + 1; horizon divisible by 8)
@@ -144,7 +141,7 @@ python scripts/train_task.py \
 
 ```bash
 python scripts/train_task.py \
-  --task-id=place_mug \
+  --task=place_mug \
   --policy-type=pi05 \
   --policy.device=cuda \
   --policy.pretrained_path=lerobot/pi05_base \
@@ -164,7 +161,7 @@ python scripts/train_task.py \
 
 ```bash
 python scripts/train_task.py \
-  --task-id=place_mug \
+  --task=place_mug \
   --policy-type=pi0 \
   --policy.device=cuda \
   --policy.pretrained_path=lerobot/pi0_base \
@@ -184,7 +181,7 @@ python scripts/train_task.py \
 
 ```bash
 python scripts/train_task.py \
-  --task-id=place_mug \
+  --task=place_mug \
   --policy-type=groot \
   --policy.device=cuda \
   --policy.push_to_hub=false \
@@ -239,28 +236,96 @@ load camera config:
 python tools/load_camera_config.py
 ```
 
-**Run calibration** to learn affine transforms:
-```bash
-python visual_match/calibrate_color.py
-```
- **Verify**: check `calibration_pairs_wrist/calibrated/combined_*.png` (sim | real | calibrated side-by-side).
+### Data collection & prep
 
- **implement**: color calibration during replay: 
+Go to `task_profiles.py` to edit task configs.
+
+Collect dataset (`_DEFAULT_RECORD_POLICY_CHECKPOINT = None` in `lerobot_record.py`):
+```bash
+python tools/gello_get_offset.py --port /dev/ttyUSB0
+lerobot-record
+```
+Make a copy of the raw dataset before downsampling (DS), then copy it to the training cluster:
+```bash
+python scripts/prepare_lerobot_dataset_224.py /path/to/your_dataset_name
+```
+
+Initial distribution check (set `DATA_DIR` to the copy made before DS, and set `TEXT_PROMPTS`):
+```bash
+python visual_match/initial_states_overlay.py
+```
+Saved under `DATA_DIR`.
+
+### Object alignment
+
+`obj_calibration_mujoco.py` aligns sim objects to a recorded episode — needed before exporting frames or replaying:
+```bash
+python visual_match/obj_calibration_mujoco.py --task place_mug --episode 24 --save-auto-align-cache   # single episode, overwrite cache with manual adjustment
+python visual_match/obj_calibration_mujoco.py --episode 0-4,95-99                                       # multiple episodes, autosave mode
+```
+Keys: `m` select mug · Arrows move X/Y · `w`/`s` move Z · `j`/`l` yaw · `x` reset pose · `+`/`-` alpha blend · Space replay from calibration frame · `q` save (and next, in range mode) · `Esc` discard/stop
+
+Add `--episode 24 --auto-align-force` on `compare_recorded_vs_mujoco.py` to recompute alignment even if a cache already exists.
+
+Other tool: `python tools/decomp_collision_mujoco.py` (collision mesh decomposition).
+
+### Color calibration
+
+Frame export has two goals, served by two flags on `compare_recorded_vs_mujoco.py`:
+
+1. **Color calibration (affine transform)** — needs sim/real frames that are geometrically precise matches, not distribution coverage. Use `--save-calibration-pairs`: only single episode, fixed frame list (`SAVE_CALIB_FRAMES`), writes to `<dataset_root_480640>/calibration_pairs_{stationary,wrist}/{gs_renders,real_captures}/`.
+2. **Image-to-image translation training** (pix2pix-turbo) — needs frames covering many object placements. Use `--save-replay-frames`: single episode or a headless batch across an episode range (stride-sampled), writes to `<root>/{gs_render or mujoco_render,real_captures,alpha_blending}/episode_*/{stationary,wrist}/`. `alpha_blending/` is only for visually checking sim/real geometry match, not for calibration.
+
+Frames from goal 2 can be reused for goal 1: `generate_color_calibrate_file.py` matches `gs_render/` + `real_captures/` pairs across exported episodes and writes them into the same `calibration_pairs_{stationary,wrist}/` layout.
+
+```bash
+# goal 2: dataset for the image-to-image model
+python visual_match/compare_recorded_vs_mujoco.py --save-replay-frames
+
+# goal 1: learn the affine transform directly
+python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
+# or reuse goal-2 frames instead:
+python visual_match/generate_color_calibrate_file.py --task book_shelving --clean
+
+# learn + verify
+python visual_match/calibrate_color.py --task book_shelving --camera wrist
+```
+Verify: check `calibration_pairs_wrist/calibrated/combined_*.png` (sim | real | calibrated side-by-side).
+
+Apply calibration during replay:
 ```bash
 python visual_match/compare_recorded_vs_mujoco.py --color-calibrate
 ```
-**deployment**:(use --select to select windows for different distributions) (--obs means replace obs with real world images;--obs_eval means replace with real world eval images)(--no_obs means deploy faster)
+
+### Deployment
+`--select` picks windows for different distributions; `--gemini` scores with Gemini; `--obs`/`--obs_eval` replace observations with real-world (eval) images; `--no_obs` deploys faster; `--color-calibrate` applies the learned affine transform; `--auto-align-initial-objects` aligns objects on startup.
 ```bash
 python visual_match/deploy_act_policy_mujoco.py --select --gemini
 ```
-(deploy multiple checkpoints at the same time; --all means raw_sim; kaifeng; and sim)
+Run with a checkpoint set via `lerobot-record` (`_DEFAULT_RECORD_POLICY_CHECKPOINT`):
+```bash
+lerobot-record
+python visual_match/deploy_act_policy_mujoco.py --color-calibrate
+```
+Deploy multiple checkpoints at once (`--all` = raw_sim + kaifeng + sim):
 ```bash
 python visual_match/deploy_act_policy_mujoco.py \
---task pick_shoe \
---policy-paths "outputs/diffusion_pick_shoe/checkpoints/002000/pretrained_model;outputs/diffusion_pick_shoe/checkpoints/004000/pretrained_model;/home/tina/Documents/lerobot_pi05/outputs/diffusion_pick_shoe/checkpoints/006000/pretrained_model;/home/tina/Documents/lerobot_pi05/outputs/diffusion_pick_shoe/checkpoints/008000/pretrained_model" \
---headless --no-mujoco-view --all
+  --task pick_shoe \
+  --policy-paths "outputs/diffusion_pick_shoe/checkpoints/002000/pretrained_model;outputs/diffusion_pick_shoe/checkpoints/004000/pretrained_model;/home/tina/Documents/lerobot_pi05/outputs/diffusion_pick_shoe/checkpoints/006000/pretrained_model;/home/tina/Documents/lerobot_pi05/outputs/diffusion_pick_shoe/checkpoints/008000/pretrained_model" \
+  --headless --no-mujoco-view --all
+```
+Deployment selection defaults come from `task_profiles.py`:
+- `pick_mug` -> mug
+- `place_mug` -> mug + saucer
+- `hang_mug` -> mug + rack
+
+### Gemini query tools
+```bash
+python tools/query_gemini.py -n 1 --stationary
+python tools/query_gemini.py -n 3 --wrist
 ```
 
+### USB permissions (dialout group, for xArm/GELLO serial)
 ```bash
 newgrp dialout
 conda activate gello_lerobot
@@ -271,88 +336,63 @@ sudo usermod -aG dialout $USER
 reboot
 ```
 
-```bash
-python tools/query_gemini.py -n 1 --stationary
-```
-```bash
-python tools/query_gemini.py -n 3 --wrist
-```
-
-Go to task_profiles.py to edit task configs.
-
-Collect dataset:
-Set _DEFAULT_RECORD_POLICY_CHECKPOINT = None in lerobot-record
-```bash
-python tools/gello_get_offset.py --port /dev/ttyUSB0
-lerobot-record
-```
-Make a copy before DS
-
-DS
-```bash
-python scripts/prepare_lerobot_dataset_224.py /path/to/your_dataset_name
-```
-
-Train
-Copy dataset to cluster
-
-Initial Dist:
-set DATA_DIR = copy before DS
-set TEXT_PROMPTS
-```bash
-python visual_match/initial_states_overlay.py
-# python visual_match/temp_pixel_masks_overlay_10ep.py
-python visual_match/obj_calibration_mujoco.py --episode 0-4,95-99
-python visual_match/compare_recorded_vs_mujoco.py --save-replay-frames
-```
-Saved under DATA_DIR.
-
-Align object for replay or color alignment:
-(python visual_match/obj_calibration_mujoco.py --task-id place_mug   --episode 24   --save-auto-align-cache to overwrite the obj alignment optimization cache with manual adjustment; or give multiple episodes: --episode 0-4,95-99 gives autosave mode)
-(python visual_match/compare_recorded_vs_mujoco.py   --episode 24   --save-replay-frames   --auto-align-force(to recompute even cache exist))
-m        select mug
-Arrows   move selected object in X/Y
-w / s    move selected object up/down in Z
-j / l    rotate yaw left/right
-x        reset editable poses
-+ / -    adjust alpha blend
-Space    replay from calibration frame
-q        save, or save and next episode in range mode
-Esc      discard/stop
-```bash
-python tools/decomp_collision_mujoco.py
-python visual_match/obj_calibration_mujoco.py --episode 0-4,95-99
-```
-
-Replay:
-```bash
-python visual_match/compare_recorded_vs_mujoco.py --save-replay-frames
-```
-
-Color Alignment:
-( --save-replay-frames: save every single frame under root/gs_render/episode_*/stationary/frame_XXXX.png and {root}/gs_render/episode_*/wrist/frame_XXXX.png; 
---auto-align-initial-objects)
-```bash
-python visual_match/compare_recorded_vs_mujoco.py --save-calibration-pairs
-python visual_match/generate_color_calibrate_file.py --data_book_shelving_copy --clean
-python visual_match/calibrate_color.py
-```
-Deployment:
-(--auto-align-initial-objects)
-Set policy checkpoint, run
-```bash
-lerobot-record
-python visual_match/deploy_act_policy_mujoco.py --color-calibrate
-```
-Then deployment selection defaults come from the task_profiles.py:
-pick_mug -> mug
-place_mug -> mug + saucer
-hang_mug -> mug + rack
-
+Current recipe (verified against the `pix2pix_turbo_sim2real` W&B project — finished runs `turbo_stationary_shoe_dinov3`/`turbo_wrist_shoe_dinov3` for pick_shoe, `turbo_stationary_hang_dinov3`/`turbo_wrist_hang_dinov3` for hang_mug, `book_stationary`/`book_wrist` for book_shelving):
 ```bash
 python sim2real/train.py \
-  --sim-dir data_place_mug_copy/calibration_pairs_stationary/gs_renders \
-  --real-dir data_place_mug_copy/calibration_pairs_stationary/real_captures \
+  --sim-dir data_place_mug_copy/gs_render \
+  --real-dir data_place_mug_copy/real_captures \
+  --dataset-dir data_transfer_pairs_stationary_dino \
+  --output-dir outputs/turbo_sim2real_stationary_dino --overwrite \
+  --max-train-steps 30002 \
+  --learning-rate 1e-4 \
+  --train-batch-size 3 \
+  --gradient-accumulation-steps 1 \
+  --checkpointing-steps 5000 \
+  --viz-freq 200 \
+  --eval-freq 200 \
+  --lambda-gan 0.25 \
+  --lambda-clipsim 0 \
+  --lambda-dinov3-pixel 4.0 \
+  --lambda-l2 0 \
+  --lambda-lpips 0 \
+  --dinov3-model-name facebook/dinov3-vits16-pretrain-lvd1689m \
+  --dinov3-trust-remote-code \
+  --enable-xformers \
+  --mixed-precision bf16 \
+  --resolution 224 \
+  --task place_mug
+```
+```bash
+python sim2real/train.py \
+  --sim-dir data_place_mug_copy/gs_render \
+  --real-dir data_place_mug_copy/real_captures \
+  --dataset-dir data_transfer_pairs_wrist_dino \
+  --output-dir outputs/turbo_sim2real_wrist_dino \
+  --overwrite \
+  --max-train-steps 30002 \
+  --learning-rate 1e-4 \
+  --train-batch-size 3 \
+  --gradient-accumulation-steps 1 \
+  --checkpointing-steps 5000 \
+  --viz-freq 200 \
+  --eval-freq 200 \
+  --lambda-gan 0.25 \
+  --lambda-clipsim 0 \
+  --lambda-dinov3-pixel 4.0 \
+  --lambda-l2 0 \
+  --lambda-lpips 0 \
+  --dinov3-model-name facebook/dinov3-vits16-pretrain-lvd1689m \
+  --dinov3-trust-remote-code \
+  --enable-xformers \
+  --mixed-precision bf16 \
+  --resolution 224 \
+  --task place_mug
+```
+(swap `--sim-dir`/`--real-dir`/`--dataset-dir`/`--output-dir`/`--task` for other tasks, e.g. `data_book_shelving_copy/calibration_pairs_stationary/...` → `outputs/turbo_sim2real_stationary_dino_book` with `--task book_shelving`. Older examples below (`--lambda-dinov3-pixel 1.0`, `--gradient-checkpointing`, `--mixed-precision no`, `--pair-selection odd`) predate the DINOv3 loss and are kept only for reference — do not use them for new training.)
+```bash
+python sim2real/train.py \
+  --sim-dir data_place_mug_copy/gs_render \
+  --real-dir data_place_mug_copy/real_captures \
   --dataset-dir data_transfer_pairs \
   --output-dir outputs/turbo_sim2real --overwrite \
   --max-train-steps 2002 \
@@ -395,7 +435,7 @@ python sim2real/train.py \
 ```bash
 python -m sim2real.img2img_turbo.inference_paired \
   --model_path outputs/turbo_sim2real/checkpoints/model_2001.pkl \
-  --input_image data_place_mug_copy/calibration_pairs_stationary/gs_renders/frame_0000.png \
+  --input_image data_place_mug_copy/calibration_pairs_stationary/gs_render/frame_0000.png \
   --prompt "a real-world robot camera image" \
   --output_dir data_place_mug_copy/calibration_pairs_stationary/ \
   --resolution 224 \

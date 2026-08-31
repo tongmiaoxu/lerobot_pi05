@@ -322,7 +322,8 @@ def parse_args() -> argparse.Namespace:
         description="Manually align task objects against recorded frames."
     )
     parser.add_argument(
-        "--task-id",
+        "--task",
+        dest="task_id",
         choices=sorted(get_task_profiles()),
         default=_DEFAULT_RECORD_TASK_ID,
         help="Task profile used for scene XML, dataset defaults, and editable objects.",
@@ -353,10 +354,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=_DEFAULT_ALPHA)
     parser.add_argument(
         "--save-auto-align-cache",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Save adjusted selection-object poses to the auto-align cache for this episode "
-            "instead of updating scene XML files."
+            "instead of updating scene XML files. Pass --no-save-auto-align-cache to write "
+            "adjusted poses (e.g. robot_table) directly into the scene XML."
         ),
     )
     parser.add_argument(
@@ -597,7 +600,10 @@ def main():
     renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer.enable_segmentation_rendering()
-    robot_geom_ids = get_robot_geom_ids(model)
+    robot_geom_ids = get_robot_geom_ids(model, extra_geom_names=[
+        "robot_table_leg_1", "robot_table_leg_2", "robot_table_leg_3",
+        "robot_table_leg_4", "robot_table_ledger",
+    ])
 
     yaw_rotatable = frozenset(task_profile.calibration_body_yaw_rotatable_names)
     free_edits: dict[str, _FreeJointEdit] = {}
@@ -916,6 +922,8 @@ def main():
         "book_shelf_target": "h",
         "left_shoe": "f",
         "right_shoe": "g",
+        "robot_table": "u",
+        "carton": "c",
     }
     select_help = " ".join(
         f"{selection_key_by_object[obj]}={obj}" for obj in adjustable_objects if obj in selection_key_by_object

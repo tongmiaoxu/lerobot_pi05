@@ -91,13 +91,13 @@ CAMERA_CONFIG = {
 
 
 def should_export_replay_frame(frame_idx: int, frame_stride: int) -> bool:
-    return frame_idx > 0 and frame_idx % frame_stride == 0
+    return frame_idx % frame_stride == 0
 
 
 def replay_export_sample_count(frame_count: int, frame_stride: int) -> int:
     if frame_count <= 0:
         return 0
-    return (frame_count - 1) // frame_stride
+    return (frame_count - 1) // frame_stride + 1
 
 
 def parse_episode_selector(value: int | str) -> list[int]:
@@ -211,7 +211,7 @@ from object_pose_auto_align import (
     selection_object_names,
 )
 
-_DEFAULT_RECORD_TASK_ID ="book_shelving"  # Keep in sync with lerobot-record defaults.
+_DEFAULT_RECORD_TASK_ID ="place_mug"  # Keep in sync with lerobot-record defaults.
 
 # ============================================================================
 # Forward Kinematics comparison utilities
@@ -622,6 +622,7 @@ def render_camera_frames(
     alpha: float,
     color_calib=None,
     color_calibrate: bool = False,
+    skip_gs: bool = False,
 ) -> dict:
     cam_renders = {}
     for cam_key, cam_cfg in CAMERA_CONFIG.items():
@@ -646,7 +647,7 @@ def render_camera_frames(
         robot_mask = np.isin(seg_labels, list(robot_geom_ids))
         mask_uint8 = (robot_mask.astype(np.uint8)) * 255
 
-        if gaussian_available and scene_data is not None:
+        if gaussian_available and scene_data is not None and not skip_gs:
             try:
                 camera_pose = get_mujoco_camera_pose(model, data, mujoco_cam)
                 w2c = mj_pose_to_gaussian_w2c(camera_pose, T_splat2mj)
@@ -783,7 +784,25 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
     seg_renderer = register_renderer(mujoco.Renderer(model, height=render_h, width=render_w))
     seg_renderer.enable_segmentation_rendering()
 
-    robot_geom_ids = get_robot_geom_ids(model)
+    if args.skip_gs:
+        # No Gaussian-Splatting background to fall back on: the robot table
+        # (top + legs + ledger) must come from the raw MuJoCo render too.
+        robot_geom_ids = get_robot_geom_ids(model, extra_geom_names=[
+            "robot_table_leg_1", "robot_table_leg_2", "robot_table_leg_3",
+            "robot_table_leg_4", "robot_table_ledger",
+        ])
+    else:
+        # GS already reconstructs the static robot_table (top + legs +
+        # ledger); keep it as background rather than compositing it as a
+        # foreground mesh alongside movable objects like mug/saucer.
+        # (robot_table_top is a box geom, so get_robot_geom_ids's default
+        # box sweep would otherwise pull it in as foreground.)
+        robot_geom_ids = get_robot_geom_ids(model)
+        for _name in (
+            "robot_table_top", "robot_table_leg_1", "robot_table_leg_2",
+            "robot_table_leg_3", "robot_table_leg_4", "robot_table_ledger",
+        ):
+            robot_geom_ids.discard(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, _name))
     print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
 
     auto_align_config = None
@@ -862,7 +881,10 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
     export_root = Path(args.replay_export_root)
     alpha_root = export_root / "alpha blending"
     print(f"[INFO] Writing real captures to: {export_root / 'real_captures'}")
-    print(f"[INFO] Writing renders to: {export_root / 'gs_render'}")
+    if args.skip_gs:
+        print(f"[INFO] --skip-gs: writing raw MuJoCo renders to: {export_root / 'mujoco_render'}")
+    else:
+        print(f"[INFO] Writing GS composite renders to: {export_root / 'gs_render'}")
     print(f"[INFO] Writing alpha blends to: {alpha_root}")
 
     for episode_idx in episode_indices:
@@ -935,7 +957,10 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
                 print(f"[WARN] Auto-align failed for episode {episode_idx}: {exc}")
 
         for cam_key in CAMERA_CONFIG:
-            (export_root / "gs_render" / episode_dir / cam_key).mkdir(parents=True, exist_ok=True)
+            if args.skip_gs:
+                (export_root / "mujoco_render" / episode_dir / cam_key).mkdir(parents=True, exist_ok=True)
+            else:
+                (export_root / "gs_render" / episode_dir / cam_key).mkdir(parents=True, exist_ok=True)
             (export_root / "real_captures" / episode_dir / cam_key).mkdir(parents=True, exist_ok=True)
         (alpha_root / episode_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1006,13 +1031,20 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
                 alpha=args.alpha,
                 color_calib=color_calib,
                 color_calibrate=args.color_calibrate,
+                skip_gs=args.skip_gs,
             )
 
             for cam_key, rend in cam_renders.items():
-                cv2.imwrite(
-                    str(export_root / "gs_render" / episode_dir / cam_key / f"frame_{frame_idx:04d}.png"),
-                    rend["composite_raw"],
-                )
+                if args.skip_gs:
+                    cv2.imwrite(
+                        str(export_root / "mujoco_render" / episode_dir / cam_key / f"frame_{frame_idx:04d}.png"),
+                        rend["mujoco"],
+                    )
+                else:
+                    cv2.imwrite(
+                        str(export_root / "gs_render" / episode_dir / cam_key / f"frame_{frame_idx:04d}.png"),
+                        rend["composite_raw"],
+                    )
                 cv2.imwrite(
                     str(export_root / "real_captures" / episode_dir / cam_key / f"frame_{frame_idx:04d}.png"),
                     rend["recorded"],
@@ -1033,7 +1065,7 @@ def export_selected_episode_replay_frames(args, task_profile, episode_indices: l
 
 def parse_args():
     p = argparse.ArgumentParser(description="Compare recorded xArm video with MuJoCo replay + composite")
-    p.add_argument("--task-id", type=str, choices=sorted(get_task_profiles()),
+    p.add_argument("--task", dest="task_id", type=str, choices=sorted(get_task_profiles()),
                    default=_DEFAULT_RECORD_TASK_ID,
                    help="Task ID used to pick task-specific defaults such as dataset path and MuJoCo scene XML.")
     p.add_argument("--dataset-path", type=str, default=None,
@@ -1059,6 +1091,10 @@ def parse_args():
                         "<root>/real_captures/episode_*/{stationary,wrist}/, plus "
                         "<root>/alpha blending/episode_*/. "
                         "Multiple episodes: run headless batch export for the selected episode range.")
+    p.add_argument("--skip-gs", action="store_true",
+                   help="Skip Gaussian-splat compositing entirely (faster). With --save-replay-frames, "
+                        "saves raw MuJoCo-only renders under <root>/mujoco_render/... instead of "
+                        "<root>/gs_render/....")
     p.add_argument("--headless", action="store_true",
                    help="Disable OpenCV image windows, MuJoCo viewer, and Open3D viewer. "
                         "Automatically enabled on SSH sessions or when no local display is available.")
@@ -1067,7 +1103,7 @@ def parse_args():
                         "(default: selected task's dataset_root_480640 from task_profiles)")
     p.add_argument("--replay-export-frame-stride", type=int, default=DEFAULT_REPLAY_EXPORT_FRAME_STRIDE,
                    help="Frame sampling stride for --save-replay-frames. "
-                        "Default saves frames 20, 40, ...")
+                        "Default saves frames 0, 20, 40, ...")
     p.add_argument("--cma-params", type=str, default="cma_result.pkl",
                    help="Path to cma_result.pkl for optimised stiffness/damping")
     p.add_argument("--cma", action="store_true",default=False,
@@ -1265,7 +1301,25 @@ def main():
     seg_renderer = register_renderer(mujoco.Renderer(model, height=RENDER_H, width=RENDER_W))
     seg_renderer.enable_segmentation_rendering()
 
-    robot_geom_ids = get_robot_geom_ids(model)
+    if args.skip_gs:
+        # No Gaussian-Splatting background to fall back on: the robot table
+        # (top + legs + ledger) must come from the raw MuJoCo render too.
+        robot_geom_ids = get_robot_geom_ids(model, extra_geom_names=[
+            "robot_table_leg_1", "robot_table_leg_2", "robot_table_leg_3",
+            "robot_table_leg_4", "robot_table_ledger",
+        ])
+    else:
+        # GS already reconstructs the static robot_table (top + legs +
+        # ledger); keep it as background rather than compositing it as a
+        # foreground mesh alongside movable objects like mug/saucer.
+        # (robot_table_top is a box geom, so get_robot_geom_ids's default
+        # box sweep would otherwise pull it in as foreground.)
+        robot_geom_ids = get_robot_geom_ids(model)
+        for _name in (
+            "robot_table_top", "robot_table_leg_1", "robot_table_leg_2",
+            "robot_table_leg_3", "robot_table_leg_4", "robot_table_ledger",
+        ):
+            robot_geom_ids.discard(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, _name))
     print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
 
     # Apply camera calibration.
@@ -1568,16 +1622,20 @@ def main():
         _episode_dir = f"episode_{args.episode:06d}"
         _alpha_root = _export / "alpha blending"
         for _cam in CAMERA_CONFIG:
-            (_export / "gs_render" / _episode_dir / _cam).mkdir(parents=True, exist_ok=True)
+            if args.skip_gs:
+                (_export / "mujoco_render" / _episode_dir / _cam).mkdir(parents=True, exist_ok=True)
+            else:
+                (_export / "gs_render" / _episode_dir / _cam).mkdir(parents=True, exist_ok=True)
             (_export / "real_captures" / _episode_dir / _cam).mkdir(parents=True, exist_ok=True)
         (_alpha_root / _episode_dir).mkdir(parents=True, exist_ok=True)
+        _render_subdir = "mujoco_render" if args.skip_gs else "gs_render"
         print(
             f"[INFO] --save-replay-frames: writing to "
-            f"{_export}/gs_render/{_episode_dir}/{{stationary,wrist}}/ "
+            f"{_export}/{_render_subdir}/{_episode_dir}/{{stationary,wrist}}/ "
             f"and {_export}/real_captures/{_episode_dir}/{{stationary,wrist}}/ "
             f"and {_alpha_root}/{_episode_dir}/"
         )
-        print(f"[INFO] Saving one replay frame every {args.replay_export_frame_stride} frame(s), starting at frame {args.replay_export_frame_stride}")
+        print(f"[INFO] Saving one replay frame every {args.replay_export_frame_stride} frame(s), starting at frame 0")
 
     # --- MuJoCo 3D Viewer Setup ---
     viewer = None
@@ -1715,7 +1773,7 @@ def main():
                 robot_mask = np.isin(seg_labels, list(robot_geom_ids))
                 mask_uint8 = (robot_mask.astype(np.uint8)) * 255
 
-                if gaussian_available and scene_data is not None:
+                if gaussian_available and scene_data is not None and not args.skip_gs:
                     try:
                         # Read camera world pose from MuJoCo data
                         # (includes any user delta adjustments)
@@ -1765,10 +1823,16 @@ def main():
                 _root = Path(args.replay_export_root)
                 _episode_dir = f"episode_{args.episode:06d}"
                 for _ck, _rend in cam_renders.items():
-                    cv2.imwrite(
-                        str(_root / "gs_render" / _episode_dir / _ck / f"frame_{frame_idx:04d}.png"),
-                        _rend["composite_raw"],
-                    )
+                    if args.skip_gs:
+                        cv2.imwrite(
+                            str(_root / "mujoco_render" / _episode_dir / _ck / f"frame_{frame_idx:04d}.png"),
+                            _rend["mujoco"],
+                        )
+                    else:
+                        cv2.imwrite(
+                            str(_root / "gs_render" / _episode_dir / _ck / f"frame_{frame_idx:04d}.png"),
+                            _rend["composite_raw"],
+                        )
                     cv2.imwrite(
                         str(_root / "real_captures" / _episode_dir / _ck / f"frame_{frame_idx:04d}.png"),
                         _rend["recorded"],

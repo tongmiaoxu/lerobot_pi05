@@ -106,7 +106,9 @@ class XarmFollowerConfig(RobotConfig):
     # (start episode / save episode) can move the arm to this pose first.
     # If ``deployment_reset_joint_deg`` is None, the joint angles read at ``connect()``
     # are used (place the arm in your desired start pose before launching record).
-    deployment_reset_joint_deg: list[float] | None = None
+    deployment_reset_joint_deg: list[float] | None = field(
+        default_factory=lambda: [0.0, 0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+    )
     # Optional gripper target in mm when resetting (open/close range as in gripper_*_mm).
     # If None, the gripper position at ``connect()`` is used.
-    deployment_reset_gripper_mm: float | None = None
+    deployment_reset_gripper_mm: float | None = 800.0

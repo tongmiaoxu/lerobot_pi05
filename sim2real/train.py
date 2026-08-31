@@ -115,7 +115,8 @@ def parse_args() -> argparse.Namespace:
         help="Tracker backend forwarded to the upstream trainer.",
     )
     parser.add_argument(
-        "--task-id",
+        "--task",
+        dest="task_id",
         type=str,
         default=None,
         help=(
@@ -129,7 +130,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "W&B / Accelerate tracker project name. If omitted: use --task-id's wandb_project, "
+            "W&B / Accelerate tracker project name. If omitted: use --task's wandb_project, "
             "else default pix2pix_turbo_sim2real."
         ),
     )

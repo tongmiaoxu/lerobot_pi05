@@ -25,14 +25,14 @@
     <material name="d_book_visual_mat" texture="d_book_texture" specular="0.1" shininess="0.1"/>
     <material name="bookend_visual_mat" rgba="0.05 0.32 0.85 1" specular="0.2" shininess="0.2"/>
     <material name="book_collision_mat" rgba="0.2 0.2 0.2 1"/>
-    <mesh name="book_visual" file="book/textured_mesh_center_aligned.obj"/>
-    <mesh name="book_collision" file="book/textured_mesh_center_aligned_convex.obj"/>
-    <mesh name="i_book_visual" file="i_book/textured_mesh_center_aligned.obj"/>
-    <mesh name="i_book_collision" file="i_book/textured_mesh_center_aligned_convex.obj"/>
-    <mesh name="l_book_visual" file="l_book/textured_mesh_center_aligned.obj"/>
-    <mesh name="l_book_collision" file="l_book/textured_mesh_center_aligned_convex.obj"/>
-    <mesh name="d_book_visual" file="d_book/textured_mesh_center_aligned.obj"/>
-    <mesh name="d_book_collision" file="d_book/textured_mesh_center_aligned_convex.obj"/>
+    <mesh name="book_visual" file="book/textured_mesh_center_aligned.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="book_collision" file="book/textured_mesh_center_aligned_convex.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="i_book_visual" file="i_book/textured_mesh_center_aligned.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="i_book_collision" file="i_book/textured_mesh_center_aligned_convex.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="l_book_visual" file="l_book/textured_mesh_center_aligned.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="l_book_collision" file="l_book/textured_mesh_center_aligned_convex.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="d_book_visual" file="d_book/textured_mesh_center_aligned.obj" scale="0.9 0.9 0.9"/>
+    <mesh name="d_book_collision" file="d_book/textured_mesh_center_aligned_convex.obj" scale="0.9 0.9 0.9"/>
     <mesh name="bookend" file="bookend.STL" scale="0.001 0.001 0.001"/>
   </asset>
 </mujoco>

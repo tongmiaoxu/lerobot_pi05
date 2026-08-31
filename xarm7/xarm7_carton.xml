@@ -1,4 +1,4 @@
-<mujoco model="xarm7">
+<mujoco model="xarm7 carton">
   <compiler angle="radian" autolimits="true" meshdir="assets"/>
 
   <option integrator="implicitfast"/>
@@ -70,25 +70,25 @@
         <geom type="mesh" group="3"/>
         <default class="pad_box1">
           <!-- <geom type="box" friction="3.0 0.1 0.02" condim="4" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.0015 0.014" rgba="0.0 0.1 0.7 1"/> -->
-           <geom type="box" 
-        friction="20 3 0.12" 
-        condim="6" 
-        solimp="0.99 0.9999 0.001" 
-        solref="0.002 1" 
-        mass="0" priority="2" 
-        size="0.015 0.0035 0.014" 
+           <geom type="box"
+        friction="6.0 0.8 0.08"
+        condim="6"
+        solimp="0.99 0.9999 0.001"
+        solref="0.002 1"
+        mass="0" priority="2"
+        size="0.015 0.0045 0.014"
         group="3"
         rgba="0.0 0.1 0.7 1"/>
         </default>
         <default class="pad_box2">
           <!-- <geom type="box" friction="3.0 0.1 0.02" condim="4" solimp="0.95 0.99 0.001" solref="0.004 1" mass="0" priority="1" size="0.015 0.0015 0.011" rgba="0.0 0.5 0.5 1"/> -->
-          <geom type="box" 
-        friction="20 3 0.12" 
-        condim="6" 
-        solimp="0.99 0.9999 0.001" 
-        solref="0.002 1" 
-        mass="0" priority="2" 
-        size="0.015 0.0035 0.011" 
+          <geom type="box"
+        friction="6.0 0.8 0.08"
+        condim="6"
+        solimp="0.99 0.9999 0.001"
+        solref="0.002 1"
+        mass="0" priority="2"
+        size="0.015 0.0045 0.011"
         group="3"
         rgba="0.0 0.5 0.5 1"/>
         </default>
@@ -242,7 +242,7 @@
   </actuator>
 
   <keyframe>
-    <!-- 13 robot DoFs + 7 shoe freejoint values (pos xyz + quat wxyz). -->
-    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0 0.4635 -0.1288 0.0077 0.4121 -0.4588 0.5443 -0.5687" ctrl="0 0 0 1.57 0 1.57 0 0"/>
+    <!-- 13 robot DoFs + 7 mug freejoint + 7 carton freejoint (each pos xyz + quat wxyz). -->
+    <key name="home" qpos="0 0 0 1.57 0 1.57 0 0 0 0 0 0 0 0.5500 -0.1000 -0.0439 0.7133 0.0000 0.0000 -0.7009 0.4000 0.1500 0.0214 1.0000 0.0000 0.0000 0.0000" ctrl="0 0 0 1.57 0 1.57 0 0"/>
   </keyframe>
 </mujoco>

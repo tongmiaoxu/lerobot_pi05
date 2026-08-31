@@ -81,3 +81,22 @@ def segment_object_mask(image_bgr, text_prompt: str = "plush toy"):
         return None
 
     return np.logical_or.reduce(np.stack(masks_list, axis=0), axis=0)
+
+
+def segment_point_mask(image_bgr, point_xy):
+    """Segment one object in a BGR image using a positive SAM2 point prompt."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _, _, image_predictor = get_segment_models(device)
+
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    image_predictor.set_image(image_rgb)
+    mask, _, _ = image_predictor.predict(
+        point_coords=np.array([point_xy], dtype=np.float32),
+        point_labels=np.array([1], dtype=np.int32),
+        box=None,
+        multimask_output=False,
+    )
+    if mask.ndim == 4:
+        mask = mask.squeeze(1)
+    mask = mask.squeeze(0)
+    return mask.astype(bool)

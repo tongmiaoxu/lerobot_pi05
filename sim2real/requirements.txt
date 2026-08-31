@@ -6,6 +6,7 @@ pillow
 torchvision
 tqdm
 requests
+openai
 # xformers: unpinned `xformers` on PyPI is now 0.0.34+ and declares torch>=2.10. If you use torch 2.7.x
 # (e.g. 2.7.1+cu118 for an older NVIDIA driver), pip will report a conflict. Pin a line built for your torch:
 #   torch 2.7.1 + cu118  ->  pip install "xformers==0.0.31"

@@ -26,6 +26,16 @@
            diffuse="0.5 0.5 0.5" specular="0 0 0"/>
     <geom type="cylinder" size=".06 .06" pos="0 0 .06" rgba="1 1 1 1"/>
 
+    <!-- Small table under the robot base: flat top + 4 black legs near the corners. -->
+    <body name="robot_table" pos="-0.1100 0.0050 0.0000" euler="0.0000 0.0000 -0.0349">
+      <geom name="robot_table_top" type="box" size="0.2 0.59 0.02" pos="0 0 -0.02" rgba="0.847 0.506 0.318 1"/>
+      <geom name="robot_table_leg_1" type="cylinder" size="0.04 0.2" pos="0.17 0.50 -0.24" rgba="0 0 0 1"/>
+      <geom name="robot_table_leg_2" type="cylinder" size="0.04 0.2" pos="-0.17 0.5 -0.24" rgba="0 0 0 1"/>
+      <geom name="robot_table_leg_3" type="cylinder" size="0.04 0.2" pos="0.17 -0.50 -0.24" rgba="0 0 0 1"/>
+      <geom name="robot_table_leg_4" type="cylinder" size="0.04 0.2" pos="-0.17 -0.5 -0.24" rgba="0 0 0 1"/>
+      <geom name="robot_table_ledger" type="cylinder" size="0.02" fromto="0.17 0.50 -0.08 0.17 -0.50 -0.08" rgba="0 0 0 1"/>
+    </body>
+
     <body name="table" pos="0.9600 0.0000 -0.0950" euler="0.0000 0.0000 -0.0349">
       <geom name="table" type="box" size="0.8 1.5 0.05"
             rgba="0 0 0 1"

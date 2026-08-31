@@ -88,6 +88,9 @@ class TrainPipelineConfig(HubMixin):
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     # save_freq: int = 20_000
     save_freq: int = 1000
+    # Optional explicit list of steps at which to save a checkpoint, e.g. [3000, 10000, 15000, 20000].
+    # When set, checkpoints are saved at exactly these steps (in addition to `save_freq` and the final step).
+    save_steps: list[int] | None = None
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None

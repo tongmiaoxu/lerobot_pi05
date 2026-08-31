@@ -24,7 +24,7 @@ def has_flag(args: list[str], prefix: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Launch lerobot-train with task-aware defaults.")
-    parser.add_argument("--task-id", required=True, choices=sorted(get_task_profiles()))
+    parser.add_argument("--task", dest="task_id", required=True, choices=sorted(get_task_profiles()))
     parser.add_argument("--policy-type", required=True, choices=SUPPORTED_POLICIES)
     parser.add_argument("--dry-run", action="store_true", help="Print the final lerobot-train command without running it.")
     args, passthrough = parser.parse_known_args()

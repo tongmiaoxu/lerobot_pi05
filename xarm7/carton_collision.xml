@@ -1,0 +1,7 @@
+<!-- Carton visual + single convex-hull collision geom.
+     Include inside <body name="carton"> in any scene file. -->
+<mujoco>
+  <geom name="carton_visual" type="mesh" mesh="carton_visual" material="carton_visual_mat"
+        contype="0" conaffinity="0" mass="0"/>
+  <geom name="carton_col" type="box" size="0.019 0.028 0.065" pos="-0.0005 0.0004 0" class="carton_collision"/>
+</mujoco>

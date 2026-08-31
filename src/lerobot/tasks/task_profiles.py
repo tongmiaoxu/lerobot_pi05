@@ -32,6 +32,13 @@ class TaskProfile:
     turbo_output_wrist: str | None = None
     #: Default checkpoint file inside each run's ``checkpoints/`` folder.
     turbo_checkpoint_filename: str = "model_30001.pkl"
+    #: Pix2pix-turbo training run dir trained on MuJoCo-rendered (rather than real-captured) sim images,
+    #: under ``outputs/<subdir>/checkpoints/`` (stationary / high cam).
+    turbo_mujoco_output_stationary: str | None = None
+    #: Same as ``turbo_mujoco_output_stationary`` but for the wrist cam.
+    turbo_mujoco_output_wrist: str | None = None
+    #: Default checkpoint file inside each MuJoCo-trained run's ``checkpoints/`` folder.
+    turbo_mujoco_checkpoint_filename: str = "model_30001.pkl"
     output_dirs_by_policy: dict[str, str] = field(default_factory=dict)
 
     def calibration_free_joint_pair_dict(self) -> dict[str, str]:
@@ -74,7 +81,7 @@ class TaskProfile:
         *,
         sim_variant: str = "default",
     ) -> str:
-        """Default sim eval under ``data_sim/``; ``kaifeng`` / ``turbo`` use sibling roots (see deploy script)."""
+        """Default sim eval under ``data_sim/``; ``kaifeng`` / ``turbo`` / ``turbo_mujoco`` use sibling roots (see deploy script)."""
         base = f"{self.sim_eval_dataset_root}{self._policy_suffix(policy_type, checkpoint_name)}"
         if sim_variant == "default":
             return base
@@ -90,7 +97,15 @@ class TaskProfile:
                     f"sim_variant='turbo' expects path containing 'data_sim/data_sim_eval', got {base!r}"
                 )
             return base.replace("data_sim/data_sim_eval", "data_sim_turbo/data_sim_eval", 1)
-        raise ValueError(f"Unknown sim_variant {sim_variant!r}; expected 'default', 'kaifeng', or 'turbo'.")
+        if sim_variant == "turbo_mujoco":
+            if "data_sim/data_sim_eval" not in base:
+                raise ValueError(
+                    f"sim_variant='turbo_mujoco' expects path containing 'data_sim/data_sim_eval', got {base!r}"
+                )
+            return base.replace("data_sim/data_sim_eval", "data_sim_turbo_mujoco/data_sim_eval", 1)
+        raise ValueError(
+            f"Unknown sim_variant {sim_variant!r}; expected 'default', 'kaifeng', 'turbo', or 'turbo_mujoco'."
+        )
 
     def turbo_default_checkpoint_paths(self, project_root: str | Path) -> tuple[str, str] | None:
         """Absolute paths to default pix2pix-turbo checkpoints for stationary and wrist cameras.
@@ -104,6 +119,20 @@ class TaskProfile:
         ck = self.turbo_checkpoint_filename
         stationary = root / "outputs" / self.turbo_output_stationary / "checkpoints" / ck
         wrist = root / "outputs" / self.turbo_output_wrist / "checkpoints" / ck
+        return (str(stationary), str(wrist))
+
+    def turbo_mujoco_default_checkpoint_paths(self, project_root: str | Path) -> tuple[str, str] | None:
+        """Absolute paths to default pix2pix-turbo checkpoints trained on MuJoCo-rendered sim images.
+
+        Returns ``None`` when this task does not define ``turbo_mujoco_output_stationary`` /
+        ``turbo_mujoco_output_wrist`` (caller must pass ``--turbo-checkpoint-*`` or policy config).
+        """
+        if self.turbo_mujoco_output_stationary is None or self.turbo_mujoco_output_wrist is None:
+            return None
+        root = Path(project_root).resolve()
+        ck = self.turbo_mujoco_checkpoint_filename
+        stationary = root / "outputs" / self.turbo_mujoco_output_stationary / "checkpoints" / ck
+        wrist = root / "outputs" / self.turbo_mujoco_output_wrist / "checkpoints" / ck
         return (str(stationary), str(wrist))
 
 
@@ -148,11 +177,13 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         scene_xml_candidates=("scene_saucer.xml",),
         xarm7_xml="xarm7_saucer.xml",
         deploy_adjustable_object_names=("mug", "saucer"),
-        calibration_adjustable_object_names=("mug", "saucer","table"),
+        calibration_adjustable_object_names=("mug", "saucer","table", "robot_table"),
         calibration_free_joint_pairs=(("mug", "mug_joint"),),
-        calibration_body_yaw_rotatable_names=("saucer",),
+        calibration_body_yaw_rotatable_names=("saucer", "robot_table"),
         turbo_output_stationary="turbo_sim2real_stationary_dino",
         turbo_output_wrist="turbo_sim2real_wrist_dino",
+        turbo_mujoco_output_stationary="turbo_sim2real_stationary_dino_mujoco",
+        turbo_mujoco_output_wrist="turbo_sim2real_wrist_dino_mujoco",
     ),
     "hang_mug": TaskProfile(
         task_id="hang_mug",
@@ -173,6 +204,7 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         calibration_body_yaw_rotatable_names=("rack",),
         turbo_output_stationary="turbo_sim2real_stationary_dino_hang",
         turbo_output_wrist="turbo_sim2real_wrist_dino_hang",
+
     ),
     "pick_shoe": TaskProfile(
         task_id="pick_shoe",
@@ -188,11 +220,13 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         scene_xml_candidates=("scene_shoe.xml",),
         xarm7_xml="xarm7_shoe.xml",
         deploy_adjustable_object_names=("right_shoe",),
-        calibration_adjustable_object_names=("left_shoe", "right_shoe", "table"),
+        calibration_adjustable_object_names=("left_shoe", "right_shoe", "table", "robot_table"),
         calibration_free_joint_pairs=(("right_shoe", "right_shoe_joint"),),
-        calibration_body_yaw_rotatable_names=("left_shoe",),
+        calibration_body_yaw_rotatable_names=("left_shoe", "robot_table"),
         turbo_output_stationary="turbo_sim2real_stationary_dino_shoe",
         turbo_output_wrist="turbo_sim2real_wrist_dino_shoe",
+        turbo_mujoco_output_stationary="turbo_sim2real_stationary_dino_shoe_mujoco",
+        turbo_mujoco_output_wrist="turbo_sim2real_wrist_dino_shoe_mujoco",
     ),
     "book_shelving": TaskProfile(
         task_id="book_shelving",
@@ -208,10 +242,14 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         scene_xml_candidates=("scene_book.xml",),
         xarm7_xml="xarm7_book.xml",
         deploy_adjustable_object_names=("book",),
-        calibration_adjustable_object_names=("book", "book_shelf_target", "table"),
+        calibration_adjustable_object_names=("book", "book_shelf_target", "table", "robot_table"),
         calibration_free_joint_pairs=(("book", "book_joint"),),
-        calibration_body_yaw_rotatable_names=("book","book_shelf_target"),
+        calibration_body_yaw_rotatable_names=("book","book_shelf_target", "robot_table"),
         object_body_name_aliases={"shelf": "book_shelf_target"},
+        turbo_output_stationary="turbo_sim2real_stationary_dino_book",
+        turbo_output_wrist="turbo_sim2real_wrist_dino_book",
+        turbo_mujoco_output_stationary="turbo_sim2real_stationary_dino_book_mujoco",
+        turbo_mujoco_output_wrist="turbo_sim2real_wrist_dino_book_mujoco",
     ),
     "pouring": TaskProfile(
         task_id="pouring",
@@ -227,9 +265,14 @@ _TASK_PROFILES: dict[str, TaskProfile] = {
         scene_xml_candidates=("scene_carton.xml",),
         xarm7_xml="xarm7_carton.xml",
         deploy_adjustable_object_names=("carton", "mug"),
-        calibration_adjustable_object_names=("carton", "mug", "table"),
-        calibration_free_joint_pairs=(("carton", "carton_joint"),),
-        calibration_body_yaw_rotatable_names=("carton",),
+        calibration_adjustable_object_names=("carton", "mug", "table", "robot_table"),
+        calibration_free_joint_pairs=(("mug", "mug_joint"), ("carton", "carton_joint")),
+        calibration_body_yaw_rotatable_names=("robot_table",),
+        calibration_xarm7_home_free_joint_body="carton",
+        turbo_output_stationary="turbo_sim2real_stationary_dino_pouring",
+        turbo_output_wrist="turbo_sim2real_wrist_dino_pouring",
+        turbo_mujoco_output_stationary="turbo_sim2real_stationary_dino_pouring_mujoco",
+        turbo_mujoco_output_wrist="turbo_sim2real_wrist_dino_pouring_mujoco",
     ),
 }
 

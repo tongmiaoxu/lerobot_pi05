@@ -18,6 +18,9 @@ Usage:
 
     # Faster sim: skip replay load and "Real:" windows unless --obs / --obs-eval (those keep Real):
     python visual_match/deploy_act_policy_mujoco.py --no_obs --fps 30
+
+    # Evaluate every known ACT/diffusion/GR00T checkpoint trained for a task, back-to-back:
+    python visual_match/deploy_act_policy_mujoco.py --task pick_shoe --allpolicy --headless --no-mujoco-view
 """
 
 import sys
@@ -51,6 +54,8 @@ _MAX_PREDICTION_EVENTS_PER_TRAJECTORY_BY_TASK = {
     "hang_mug": 10,
     "place_mug": 8,
     "pick_shoe": 10,
+    "book_shelving": 10,
+    "pouring": 9,
 }
 
 
@@ -1275,16 +1280,17 @@ def _fmt_euler_deg(euler: np.ndarray | None) -> str:
 
 # Flags that select a visual-input baseline; --all drives these itself, one per
 # subprocess run, so they are stripped from the forwarded argv.
-_ALL_VARIANT_FLAGS = ("--all", "--color-calibrate", "--turbo")
+_ALL_VARIANT_FLAGS = ("--all", "--color-calibrate", "--turbo", "--turbo_mujoco")
 _ALL_VARIANTS = (
     ("raw sim", ()),
     ("color-calibrate", ("--color-calibrate",)),
     ("turbo", ("--turbo",)),
+    ("turbo_mujoco", ("--turbo_mujoco",)),
 )
 
 
 def _run_all_variants() -> None:
-    """Re-run this script once per --all baseline (raw sim / color-calibrate / turbo).
+    """Re-run this script once per --all baseline (raw sim / color-calibrate / turbo / turbo_mujoco).
 
     Each run is a fresh subprocess with the same CLI args (minus the variant
     flags) plus its own variant flag, so each writes to the task profile's own
@@ -1304,15 +1310,161 @@ def _run_all_variants() -> None:
             )
             sys.exit(result.returncode)
 
-    print("\n[ALL] All three variants (raw sim, color-calibrate, turbo) completed.\n", flush=True)
+    print("\n[ALL] All four variants (raw sim, color-calibrate, turbo, turbo_mujoco) completed.\n", flush=True)
 
 
-def _run_all_checkpoints(policy_paths: list[str]) -> None:
+# Checkpoint steps to evaluate per policy type when --allpolicy is used.
+_ALLPOLICY_CHECKPOINT_STEPS = {
+    "act": (3000, 10000, 15000, 20000),
+    "diffusion": (2000, 4000, 8000, 10000),
+    "groot": (1000, 5000, 10000, 15000),
+}
+
+
+def _build_allpolicy_checkpoint_entries(task_id: str, project_root: Path) -> list[tuple[str, str]]:
+    """Build (task_id, path) entries for every known checkpoint of every policy type for *task_id*.
+
+    Looks under outputs/{policy_type}_{task_id}/checkpoints/{step:06d}/pretrained_model for
+    policy_type in act/diffusion/groot, using the fixed checkpoint steps requested for
+    --allpolicy. A task/policy-type/step combo that was never trained or saved is skipped
+    with a warning rather than raising, since not every task has all three policy types.
+    """
+    entries = []
+    for policy_type, steps in _ALLPOLICY_CHECKPOINT_STEPS.items():
+        for step in steps:
+            rel_path = f"outputs/{policy_type}_{task_id}/checkpoints/{step:06d}/pretrained_model"
+            abs_path = project_root / rel_path
+            if (abs_path / "config.json").exists():
+                entries.append((task_id, rel_path))
+            else:
+                print(f"[ALLPOLICY] Skipping missing checkpoint: {rel_path}", flush=True)
+    return entries
+
+
+# pi05 can't be loaded in-process like ACT/diffusion/GR00T (it needs a separate
+# openpi server process); --allpolicy folds it in by shelling out to
+# run_checkpoints_sequential.sh, which already handles starting/stopping that
+# server per checkpoint.
+_PI05_OPENPI_OUTPUTS_DIR = "/home/tina/openpi/outputs"
+_PI05_ALLPOLICY_STEPS = (1000, 2000, 3000, 5000)
+
+
+def _run_allpolicy_pi05_leg(args: argparse.Namespace, parser: argparse.ArgumentParser, project_root: Path) -> None:
+    """Run this task's pi05 checkpoints via run_checkpoints_sequential.sh, as part of --allpolicy.
+
+    Only steps that actually exist under outputs/pi05_xarm_<task>/pi05_xarm_<task>_v1 are
+    passed as --steps (missing ones are skipped with a warning, same as the local ACT/
+    diffusion/GR00T checkpoints above); the whole leg is skipped if none exist for this task.
+    Shared flags (--headless, --no-mujoco-view, --all, --color-calibrate, --turbo,
+    --turbo_mujoco, etc.) are read from the already-parsed args and translated into
+    deploy_pi05_remote_mujoco.py's identically-named flags -- only flags the user actually
+    set (differ from the parser default) are forwarded, so task-profile defaults resolve
+    independently and identically in both scripts.
+    """
+    task_id = args.task
+    ckpt_dir = Path(_PI05_OPENPI_OUTPUTS_DIR) / f"pi05_xarm_{task_id}" / f"pi05_xarm_{task_id}_v1"
+    if not ckpt_dir.is_dir():
+        print(f"[ALLPOLICY] Skipping pi05 (no checkpoint dir: {ckpt_dir})", flush=True)
+        return
+
+    existing_steps = [step for step in _PI05_ALLPOLICY_STEPS if (ckpt_dir / str(step)).is_dir()]
+    for step in _PI05_ALLPOLICY_STEPS:
+        if step not in existing_steps:
+            print(f"[ALLPOLICY] Skipping missing pi05 checkpoint: {ckpt_dir / str(step)}", flush=True)
+    if not existing_steps:
+        print(
+            f"[ALLPOLICY] Skipping pi05 (none of {_PI05_ALLPOLICY_STEPS} exist under {ckpt_dir})",
+            flush=True,
+        )
+        return
+
+    def _default(name):
+        return parser.get_default(name)
+
+    forwarded: list[str] = []
+    if args.headless:
+        forwarded.append("--headless")
+    if args.no_mujoco_view:
+        forwarded.append("--no-mujoco-view")
+    if args.all:
+        forwarded.append("--all")
+    if args.color_calibrate:
+        forwarded.append("--color-calibrate")
+    if args.turbo:
+        forwarded.append("--turbo")
+    if args.turbo_mujoco:
+        forwarded.append("--turbo_mujoco")
+    forwarded += ["--num_eval_episodes", str(args.num_eval_episodes)]
+    if args.prompt != _default("prompt"):
+        forwarded += ["--prompt", args.prompt]
+    if args.object_name != _default("object_name"):
+        forwarded += ["--object-name", args.object_name]
+    if args.initial_states_dir != _default("initial_states_dir"):
+        forwarded += ["--initial-states-dir", args.initial_states_dir]
+    if args.episode != _default("episode"):
+        forwarded += ["--episode", str(args.episode)]
+    if args.auto_align_cache_dir != _default("auto_align_cache_dir"):
+        forwarded += ["--auto-align-cache-dir", args.auto_align_cache_dir]
+    if args.auto_align_force:
+        forwarded.append("--auto-align-force")
+    if args.auto_align_optimize_z:
+        forwarded.append("--auto-align-optimize-z")
+    if args.no_save_sim_eval:
+        forwarded.append("--no-save-sim-eval")
+    if args.turbo_prompt is not None:
+        forwarded += ["--turbo-prompt", args.turbo_prompt]
+    if args.turbo_resolution is not None:
+        forwarded += ["--turbo-resolution", str(args.turbo_resolution)]
+    if args.turbo_device is not None:
+        forwarded += ["--turbo-device", args.turbo_device]
+
+    script_path = project_root / "scripts" / "run_checkpoints_sequential.sh"
+    cmd = [
+        "bash", str(script_path),
+        "--config", f"pi05_xarm_{task_id}",
+        "--ckpt-dir", str(ckpt_dir),
+        "--steps", ",".join(str(s) for s in existing_steps),
+        "--",
+        "--task", task_id,
+        *forwarded,
+    ]
+    print(
+        f"\n{'=' * 70}\n[ALLPOLICY] Running pi05 checkpoints: {existing_steps}\n{'=' * 70}\n",
+        flush=True,
+    )
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"[ALLPOLICY] pi05 leg exited with code {result.returncode}.", flush=True)
+        sys.exit(result.returncode)
+
+
+def _parse_checkpoint_entries(policy_paths: list[str], default_task_id: str) -> list[tuple[str, str]]:
+    """Split each --policy-paths entry into (task_id, path).
+
+    An entry may be prefixed with a known task id and a colon, e.g.
+    "pick_shoe:outputs/groot_pick_shoe/checkpoints/005000/pretrained_model", to run
+    that checkpoint against a different task than --task. Entries without a
+    recognized prefix fall back to default_task_id, so a single-task invocation
+    (the common case) needs no prefix at all.
+    """
+    known_task_ids = get_task_profiles()
+    entries = []
+    for raw in policy_paths:
+        task_id, sep, rest = raw.partition(":")
+        if sep and task_id in known_task_ids:
+            entries.append((task_id, rest))
+        else:
+            entries.append((default_task_id, raw))
+    return entries
+
+
+def _run_all_checkpoints(checkpoint_entries: list[tuple[str, str]]) -> None:
     """Re-run this script once per --policy-paths checkpoint, one subprocess each.
 
-    Mirrors _run_all_variants: strips --policy-path(s) from the forwarded argv and
-    sets --policy-path explicitly for each checkpoint, so each run derives its own
-    checkpoint-specific output directory (via _extract_checkpoint_name / policy.config.type).
+    Mirrors _run_all_variants: strips --policy-path(s)/--task/--allpolicy from the forwarded
+    argv and sets --policy-path/--task explicitly for each checkpoint, so each run derives
+    its own checkpoint-specific output directory (via _extract_checkpoint_name /
+    policy.config.type) under the correct task's profile.
     """
     base_argv = []
     skip_next = False
@@ -1320,31 +1472,78 @@ def _run_all_checkpoints(policy_paths: list[str]) -> None:
         if skip_next:
             skip_next = False
             continue
-        if a in ("--policy-path", "--policy-paths"):
+        if a in ("--policy-path", "--policy-paths", "--task"):
             skip_next = True
             continue
-        if a.startswith("--policy-path=") or a.startswith("--policy-paths="):
+        if a.startswith(("--policy-path=", "--policy-paths=", "--task=")):
+            continue
+        if a == "--allpolicy":
             continue
         base_argv.append(a)
     script_path = str(Path(__file__).resolve())
 
-    for i, policy_path in enumerate(policy_paths, start=1):
+    for i, (task_id, policy_path) in enumerate(checkpoint_entries, start=1):
         print(
-            f"\n{'=' * 70}\n[CHECKPOINTS] Running checkpoint {i}/{len(policy_paths)}: "
-            f"{policy_path}\n{'=' * 70}\n",
+            f"\n{'=' * 70}\n[CHECKPOINTS] Running checkpoint {i}/{len(checkpoint_entries)}: "
+            f"task={task_id} path={policy_path}\n{'=' * 70}\n",
             flush=True,
         )
-        cmd = [sys.executable, script_path, *base_argv, "--policy-path", policy_path]
+        cmd = [sys.executable, script_path, *base_argv, "--policy-path", policy_path, "--task", task_id]
         result = subprocess.run(cmd)
         if result.returncode != 0:
             print(
-                f"[CHECKPOINTS] Checkpoint {policy_path!r} exited with code "
+                f"[CHECKPOINTS] Checkpoint {policy_path!r} (task={task_id}) exited with code "
                 f"{result.returncode}; stopping remaining checkpoints.",
                 flush=True,
             )
             sys.exit(result.returncode)
 
-    print(f"\n[CHECKPOINTS] All {len(policy_paths)} checkpoints completed.\n", flush=True)
+    print(f"\n[CHECKPOINTS] All {len(checkpoint_entries)} checkpoints completed.\n", flush=True)
+
+
+# Tasks run back-to-back by --alltask.
+_ALLTASK_TASK_IDS = ("place_mug", "pick_shoe", "book_shelving")
+
+
+def _run_all_tasks() -> None:
+    """Re-run this script once per --alltask task (place_mug, pick_shoe, book_shelving).
+
+    Mirrors _run_all_checkpoints: strips --task/--alltask from the forwarded argv and sets
+    --task explicitly for each task, so each run uses that task's own scene/profile/output
+    dir. Any other flag (e.g. --allpolicy, --policy-paths, --all) is forwarded as-is, so
+    combining --alltask with --allpolicy fans out over every task's own checkpoints too.
+    """
+    base_argv = []
+    skip_next = False
+    for a in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--task":
+            skip_next = True
+            continue
+        if a.startswith("--task="):
+            continue
+        if a == "--alltask":
+            continue
+        base_argv.append(a)
+    script_path = str(Path(__file__).resolve())
+
+    for i, task_id in enumerate(_ALLTASK_TASK_IDS, start=1):
+        print(
+            f"\n{'=' * 70}\n[ALLTASK] Running task {i}/{len(_ALLTASK_TASK_IDS)}: {task_id}\n{'=' * 70}\n",
+            flush=True,
+        )
+        cmd = [sys.executable, script_path, *base_argv, "--task", task_id]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(
+                f"[ALLTASK] Task '{task_id}' exited with code {result.returncode}; stopping remaining tasks.",
+                flush=True,
+            )
+            sys.exit(result.returncode)
+
+    print(f"\n[ALLTASK] All {len(_ALLTASK_TASK_IDS)} tasks completed.\n", flush=True)
 
 
 def main():
@@ -1367,7 +1566,41 @@ def main():
             "--policy-paths 'outputs/act_place_mug/checkpoints/006000/pretrained_model;"
             "outputs/act_place_mug/checkpoints/003000/pretrained_model'. Takes priority "
             "over --policy-path. Each run re-invokes this script with --policy-path set to "
-            "one checkpoint, so each writes to that checkpoint's own output directory."
+            "one checkpoint, so each writes to that checkpoint's own output directory. "
+            "Prefix an entry with 'task_id:' to run that checkpoint against a different "
+            "task than --task, e.g. 'pick_shoe:outputs/groot_pick_shoe/checkpoints/005000/"
+            "pretrained_model;place_mug:outputs/act_place_mug/checkpoints/003000/pretrained_model'. "
+            "Entries without a recognized task_id: prefix use --task."
+        ),
+    )
+    parser.add_argument(
+        "--allpolicy",
+        action="store_true",
+        help=(
+            "Automatically evaluate every known checkpoint of every policy type (ACT, "
+            "diffusion, GR00T) trained for --task, back-to-back, one subprocess each "
+            "(same mechanism as --policy-paths). Checkpoint steps are fixed: ACT "
+            f"{_ALLPOLICY_CHECKPOINT_STEPS['act']}, diffusion "
+            f"{_ALLPOLICY_CHECKPOINT_STEPS['diffusion']}, GR00T "
+            f"{_ALLPOLICY_CHECKPOINT_STEPS['groot']}. Looks under "
+            "outputs/{act,diffusion,groot}_<task>/checkpoints/<step>/pretrained_model; "
+            "any missing checkpoint is skipped with a warning. Afterwards also runs this "
+            "task's pi05 checkpoints "
+            f"(steps {_PI05_ALLPOLICY_STEPS}, under "
+            f"{_PI05_OPENPI_OUTPUTS_DIR}/pi05_xarm_<task>/pi05_xarm_<task>_v1) via "
+            "scripts/run_checkpoints_sequential.sh, since pi05 needs a separate openpi "
+            "server rather than an in-process checkpoint load; missing steps are skipped "
+            "the same way, and the whole pi05 leg is skipped if none exist for this task. "
+            "Mutually exclusive with --policy-path(s)."
+        ),
+    )
+    parser.add_argument(
+        "--alltask",
+        action="store_true",
+        help=(
+            f"Run the deployment once per task in {_ALLTASK_TASK_IDS}, back-to-back, one "
+            "subprocess each, overriding --task for each run. Combine with --allpolicy (or "
+            "--policy-paths) to also fan out over each task's own checkpoints."
         ),
     )
     parser.add_argument(
@@ -1420,11 +1653,15 @@ def main():
         "--all",
         action="store_true",
         help=(
-            "Run the deployment three times back-to-back, once per visual-input baseline: "
-            "raw sim (no color calibration / translation), --color-calibrate, and --turbo. "
-            "Each variant re-invokes this script with the same arguments (minus --all/"
-            "--color-calibrate/--turbo) plus its own variant flag, so each writes to its own "
-            "task-profile output directory."
+            "Run the deployment four times back-to-back, once per visual-input baseline: "
+            "raw sim (no color calibration / translation), --color-calibrate, --turbo, and "
+            "--turbo_mujoco. The first three composite a Gaussian-Splatting background with "
+            "the MuJoCo robot foreground (robot_table/legs/ledge rendered by GS, excluded from "
+            "the MuJoCo foreground mask); --turbo_mujoco instead skips GS entirely and renders "
+            "robot_table + its legs/ledge as MuJoCo foreground (mirrors compare_recorded_vs_mujoco "
+            "--skip-gs). Each variant re-invokes this script with the same arguments (minus --all/"
+            "--color-calibrate/--turbo/--turbo_mujoco) plus its own variant flag, so each writes "
+            "to its own task-profile output directory."
         ),
     )
     obs_mode = parser.add_mutually_exclusive_group()
@@ -1613,6 +1850,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--turbo_mujoco",
+        action="store_true",
+        help=(
+            "Like --turbo, but defaults to the TaskProfile turbo_mujoco_output_* checkpoints "
+            "(pix2pix-turbo trained on MuJoCo-rendered rather than real-captured sim images). "
+            "If --turbo-checkpoint* are omitted, uses TaskProfile turbo_mujoco_output_* for this --task."
+        ),
+    )
+    parser.add_argument(
         "--turbo-checkpoint",
         type=str,
         default=None,
@@ -1675,11 +1921,32 @@ def main():
 
     args = parser.parse_args()
 
+    if args.alltask:
+        _run_all_tasks()
+        return
+
+    if args.allpolicy and args.policy_paths:
+        raise ValueError("Use either --allpolicy or --policy-paths, not both.")
+
+    if args.allpolicy:
+        checkpoint_entries = _build_allpolicy_checkpoint_entries(
+            args.task, Path(__file__).parent.parent
+        )
+        if not checkpoint_entries:
+            raise ValueError(
+                f"--allpolicy found no checkpoints for task '{args.task}' under "
+                f"outputs/{{act,diffusion,groot}}_{args.task}/checkpoints/*/pretrained_model"
+            )
+        _run_all_checkpoints(checkpoint_entries)
+        _run_allpolicy_pi05_leg(args, parser, Path(__file__).parent.parent)
+        return
+
     if args.policy_paths:
         policy_paths = [p.strip() for p in re.split(r"[;,]", args.policy_paths) if p.strip()]
         if not policy_paths:
             raise ValueError("--policy-paths was given but contained no non-empty paths")
-        _run_all_checkpoints(policy_paths)
+        checkpoint_entries = _parse_checkpoint_entries(policy_paths, default_task_id=args.task)
+        _run_all_checkpoints(checkpoint_entries)
         return
 
     if args.all:
@@ -1711,7 +1978,10 @@ def main():
     turbo_cfg = {}
     if isinstance(config_dict, dict):
         turbo_cfg = config_dict.get("turbo") or config_dict.get("sim2real") or {}
-    turbo_enabled = bool(args.turbo or turbo_cfg.get("enabled", False))
+    if args.turbo and args.turbo_mujoco:
+        raise ValueError("Use either --turbo or --turbo_mujoco, not both.")
+    turbo_mujoco_enabled = bool(args.turbo_mujoco)
+    turbo_enabled = bool(args.turbo or turbo_mujoco_enabled or turbo_cfg.get("enabled", False))
     turbo_prompt = args.turbo_prompt or turbo_cfg.get("prompt", "a real-world robot camera image")
     turbo_resolution = int(
         args.turbo_resolution
@@ -1733,7 +2003,9 @@ def main():
         args.output_dir = None
     elif args.output_dir is None:
         checkpoint_name = _extract_checkpoint_name(args.policy_path)
-        if turbo_enabled:
+        if turbo_mujoco_enabled:
+            sim_variant = "turbo_mujoco"
+        elif turbo_enabled:
             sim_variant = "turbo"
         elif args.color_calibrate:
             sim_variant = "kaifeng"
@@ -1754,9 +2026,24 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir is not None else None
     next_saved_episode_idx: int | None = None
     current_episode_output_dir: Path | None = None
+    existing_episode_count = 0
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
         # print(f"[INFO] Sim eval output directory: {output_dir.resolve()}")
+        existing_episode_count = _next_saved_episode_index(output_dir)
+        if existing_episode_count >= num_eval_episodes:
+            print(
+                f"[INFO] {output_dir} already has {existing_episode_count} episode(s) "
+                f"(>= --num_eval_episodes={num_eval_episodes}); skipping this run.",
+                flush=True,
+            )
+            return
+        if existing_episode_count > 0:
+            print(
+                f"[INFO] {output_dir} already has {existing_episode_count} episode(s); "
+                f"resuming from episode {existing_episode_count} up to {num_eval_episodes}.",
+                flush=True,
+            )
     else:
         # print("[INFO] Sim eval disk output disabled (--no-save-sim-eval)")
         pass
@@ -1919,7 +2206,26 @@ def main():
     seg_renderer = mujoco.Renderer(model, height=RENDER_H, width=RENDER_W)
     seg_renderer.enable_segmentation_rendering()
 
-    robot_geom_ids = get_robot_geom_ids(model)
+    if turbo_mujoco_enabled:
+        # --turbo_mujoco has no Gaussian-Splatting background, so robot_table
+        # and its legs/ledge must render as MuJoCo foreground instead of being
+        # left to GS (mirrors compare_recorded_vs_mujoco.py's --skip-gs).
+        robot_geom_ids = get_robot_geom_ids(model, extra_geom_names=[
+            "robot_table_leg_1", "robot_table_leg_2", "robot_table_leg_3",
+            "robot_table_leg_4", "robot_table_ledger",
+        ])
+    else:
+        # GS already reconstructs the static robot_table (top + legs +
+        # ledger); keep it as background rather than compositing it as a
+        # foreground mesh alongside movable objects like mug/saucer.
+        # (robot_table_top is a box geom, so get_robot_geom_ids's default
+        # box sweep would otherwise pull it in as foreground.)
+        robot_geom_ids = get_robot_geom_ids(model)
+        for _name in (
+            "robot_table_top", "robot_table_leg_1", "robot_table_leg_2",
+            "robot_table_leg_3", "robot_table_leg_4", "robot_table_ledger",
+        ):
+            robot_geom_ids.discard(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, _name))
     # print(f"[INFO] Found {len(robot_geom_ids)} robot geoms for masking")
 
     auto_align_config = None
@@ -1946,9 +2252,10 @@ def main():
     camera_intrinsics = {cam_key: cam_cfg["config"]["intrinsics"]
                          for cam_key, cam_cfg in CAMERA_CONFIG.items()}
 
-    # Load Gaussian Splatting scene
+    # Load Gaussian Splatting scene (skipped for --turbo_mujoco, which renders
+    # robot_table/legs/ledge as MuJoCo foreground instead of GS background).
     gaussian_data = None
-    if os.path.exists(args.scene_path):
+    if not turbo_mujoco_enabled and os.path.exists(args.scene_path):
         try:
             init_pose = get_mujoco_camera_pose(model, data, "stationary_cam")
             w2c_init = mj_pose_to_gaussian_w2c(init_pose, T_splat2mj)
@@ -2030,7 +2337,11 @@ def main():
     if turbo_enabled:
         from sim2real import SimToRealTranslator
 
-        turbo_task_defaults = task_profile.turbo_default_checkpoint_paths(project_root)
+        turbo_task_defaults = (
+            task_profile.turbo_mujoco_default_checkpoint_paths(project_root)
+            if turbo_mujoco_enabled
+            else task_profile.turbo_default_checkpoint_paths(project_root)
+        )
 
         def _ckpt_stationary() -> str | None:
             return (
@@ -2053,10 +2364,24 @@ def main():
         ckpt_stationary = _ckpt_stationary()
         ckpt_wrist = _ckpt_wrist()
         if not ckpt_stationary or not ckpt_wrist:
+            profile_field = (
+                "turbo_mujoco_output_stationary / turbo_mujoco_output_wrist"
+                if turbo_mujoco_enabled
+                else "turbo_output_stationary / turbo_output_wrist"
+            )
             raise ValueError(
                 "Turbo needs checkpoints for both cameras (--turbo-checkpoint-* or policy turbo.*), "
-                "or set turbo_output_stationary / turbo_output_wrist on the task profile for this --task."
+                f"or set {profile_field} on the task profile for this --task."
             )
+        missing_ckpts = [p for p in (ckpt_stationary, ckpt_wrist) if not Path(p).exists()]
+        if missing_ckpts:
+            variant_label = "turbo_mujoco" if turbo_mujoco_enabled else "turbo"
+            print(
+                f"[TURBO] Skipping {variant_label}: checkpoint(s) not found on disk: "
+                f"{missing_ckpts} (task {task_id!r} may not have this baseline trained yet).",
+                flush=True,
+            )
+            sys.exit(0)
         if ckpt_stationary == ckpt_wrist:
             tr = SimToRealTranslator(
                 checkpoint_path=ckpt_stationary,
@@ -2129,8 +2454,21 @@ def main():
         # )
         pass
 
-    # Initialize keyboard listener (ALOHA-style state machine)
-    listener, events = init_keyboard_listener()
+    # Initialize keyboard listener (ALOHA-style state machine).
+    # Skipped under --headless: pynput's listener is global (system-wide, not
+    # window-focused), so it would wait on / react to arrow-key presses made
+    # anywhere on the machine instead of just auto-running the batch.
+    if args.headless:
+        listener = None
+        events = {
+            "right_arrow": False,
+            "left_arrow": False,
+            "stop_recording": False,
+            "exit_early": False,
+            "rerecord_episode": False,
+        }
+    else:
+        listener, events = init_keyboard_listener()
 
     # OpenCV "Real:" dataset replay windows: off with --no_obs unless --obs / --obs-eval
     # (those modes need to see real images next to composite).
@@ -2212,8 +2550,8 @@ def main():
         print("[WARN] mujoco.viewer not available; 3D viewer disabled.")
 
     saved_episodes = []
-    completed_episodes = 0
-    episode_idx = 0
+    completed_episodes = existing_episode_count
+    episode_idx = existing_episode_count
     episode_window_writer: cv2.VideoWriter | None = None
     episode_window_tmp_path: Path | None = None
     pending_fast_replay_dirs: list[Path] = []

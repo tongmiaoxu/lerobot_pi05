@@ -60,12 +60,30 @@ lerobot-record \
   --dataset.num_episodes=25 \
   --dataset.single_task="Grab and handover the red cube to the other arm"
 ```
+
+To evaluate multiple policy checkpoints back-to-back with no --policy.path on the CLI,
+list them in _DEFAULT_RECORD_POLICY_CHECKPOINT below; each runs a full recording session
+in its own subprocess, writing to its own checkpoint-specific dataset.root.
+
+Example recording against a remote openpi pi05 checkpoint (server started separately, e.g.
+by scripts/record_pi05_checkpoints_sequential.sh, which cycles this through multiple
+checkpoint steps back-to-back the same way scripts/run_checkpoints_sequential.sh does for
+sim eval):
+```shell
+lerobot-record \
+    --robot.type=xarm7_follower \
+    --policy_remote_pi05=localhost:8011 \
+    --policy_remote_pi05_checkpoint_name=1000 \
+    --dataset.task_id=book_shelving
+```
 """
 
 import logging
 import json
+import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -156,10 +174,20 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 # Defaults for `lerobot-record` with no CLI args (xArm + GELLO + eval workflow).
-# Set to None to require --policy.path to be passed explicitly on the CLI.
-_DEFAULT_RECORD_POLICY_CHECKPOINT = "outputs/act_pick_shoe/checkpoints/006000/pretrained_model"
+# Set to None/[] to require --policy.path to be passed explicitly on the CLI.
+# List multiple checkpoints to record a full session for each, back-to-back
+# (one subprocess per checkpoint, each with its own checkpoint-specific dataset.root).
+_DEFAULT_RECORD_POLICY_CHECKPOINT: list[str] | None = [
+
+   
+    "outputs/groot_pouring/checkpoints/001000/pretrained_model",
+    "outputs/groot_pouring/checkpoints/005000/pretrained_model",
+    "outputs/groot_pouring/checkpoints/010000/pretrained_model",
+    "outputs/groot_pouring/checkpoints/015000/pretrained_model",
+  
+]
 # _DEFAULT_RECORD_POLICY_CHECKPOINT = None
-_DEFAULT_RECORD_TASK_ID = "pick_shoe"
+_DEFAULT_RECORD_TASK_ID = "pouring"
 _NUM_EPISODES = 10
 
 
@@ -342,6 +370,16 @@ class RecordConfig:
     teleop: TeleoperatorConfig | None = field(default_factory=lambda: GelloLeaderConfig())
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
+    # Connect to an already-running openpi pi05 server (started separately, e.g. via
+    # openpi/scripts/serve_policy.py or a run_checkpoints_sequential.sh-style wrapper) over
+    # websocket, instead of loading a local lerobot policy checkpoint in-process. Format is
+    # "host:port", e.g. "localhost:8011". Mutually exclusive with --policy.path.
+    policy_remote_pi05: str | None = None
+    # Checkpoint step label for the running pi05 server (e.g. "1000"), used only to name this
+    # session's dataset.root via task_profile.eval_root_for_policy("pi05", <this>) -- purely
+    # cosmetic for the output directory name, since the server already has the real checkpoint
+    # loaded.
+    policy_remote_pi05_checkpoint_name: str | None = None
     # Display all cameras on screen
     display_data: bool = True
     # Display data on a remote Rerun server
@@ -362,6 +400,10 @@ class RecordConfig:
     obs_episode: int = 0
     # Load initial-state contour overlays from initial_states_overlay.py output.
     select: bool = True
+    # Pick initial-state episodes by hand in a click UI. Default is automatic: the first
+    # ceil(N/2) and last floor(N/2) episodes (by index) that have a valid contour, so
+    # repeated runs always evaluate the same episodes.
+    select_interactive: bool = False
     # Dataset root containing initial_states_overlay.py output (e.g. data_place_mug/).
     initial_states_dir: str | Path | None = None
     # Object name(s) matching the segmentation prompt used in initial_states_overlay.py.
@@ -375,9 +417,16 @@ class RecordConfig:
         if (
             policy_path is None
             and self.policy is None
+            and self.policy_remote_pi05 is None
             and "pytest" not in sys.modules
         ):
-            policy_path = _DEFAULT_RECORD_POLICY_CHECKPOINT
+            policy_path = _DEFAULT_RECORD_POLICY_CHECKPOINT[0] if _DEFAULT_RECORD_POLICY_CHECKPOINT else None
+
+        if self.policy_remote_pi05 is not None and (policy_path or self.policy is not None):
+            raise ValueError(
+                "--policy_remote_pi05 (a remote openpi pi05 server) is mutually exclusive with "
+                "--policy.path (a local lerobot checkpoint)."
+            )
 
         if policy_path:
             cli_overrides = list(parser.get_cli_overrides("policy") or [])
@@ -385,7 +434,7 @@ class RecordConfig:
             self.policy.pretrained_path = policy_path
 
         task_profile = get_task_profile(self.dataset.task_id)
-        has_policy = self.policy is not None
+        has_policy = self.policy is not None or self.policy_remote_pi05 is not None
         if self.dataset.single_task is None:
             self.dataset.single_task = task_profile.single_task
         if self.dataset.repo_id is None:
@@ -393,10 +442,14 @@ class RecordConfig:
                 task_profile.eval_dataset_repo_id if has_policy else task_profile.dataset_repo_id
             )
         if self.dataset.root is None:
-            if has_policy:
+            if self.policy is not None:
                 checkpoint_name = _extract_checkpoint_name(self.policy.pretrained_path)
                 self.dataset.root = task_profile.eval_root_for_policy(
                     self.policy.type, checkpoint_name
+                )
+            elif self.policy_remote_pi05 is not None:
+                self.dataset.root = task_profile.eval_root_for_policy(
+                    "pi05", self.policy_remote_pi05_checkpoint_name
                 )
             else:
                 self.dataset.root = task_profile.dataset_root
@@ -410,7 +463,7 @@ class RecordConfig:
         if self.dataset.single_task is None:
             raise ValueError("You need to provide a task as argument in `dataset.single_task`.")
 
-        if self.teleop is None and self.policy is None:
+        if self.teleop is None and self.policy is None and self.policy_remote_pi05 is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
 
     @classmethod
@@ -449,6 +502,69 @@ class RecordConfig:
 """
 
 
+def _pi05_action_row_to_robot_action(action_row: np.ndarray) -> RobotAction:
+    """[joint1..7 deg, gripper mm] -> XarmFollower.send_action()-style action dict.
+
+    Mirrors visual_match/deploy_pi05_remote_xarm.py's action_row_to_dict.
+    """
+    action: RobotAction = {f"joint{i + 1}.pos": float(action_row[i]) for i in range(7)}
+    action["gripper.pos"] = float(action_row[7])
+    return action
+
+
+def _parse_host_port(value: str) -> tuple[str, int]:
+    host, _, port = value.rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError(f"--policy_remote_pi05 must be 'host:port', got {value!r}")
+    return host, int(port)
+
+
+class _RemotePi05Policy:
+    """Adapter around an already-running openpi pi05 server (openpi/scripts/serve_policy.py),
+    so record_loop can pull one action at a time from it the same way it does from a local
+    PreTrainedPolicy, instead of loading weights in-process. Mirrors the obs/action shapes used
+    by visual_match/deploy_pi05_remote_xarm.py's obs_to_state/action_row_to_dict.
+
+    The server itself is not managed here -- something else (e.g. a
+    run_checkpoints_sequential.sh-style wrapper) must already have it up at host:port before
+    RecordConfig.__post_init__ constructs this.
+    """
+
+    # How many actions to consume from each predicted chunk before querying the server again.
+    # Matches ACTIONS_PER_CHUNK in deploy_pi05_remote_xarm.py.
+    ACTIONS_PER_QUERY = 10
+
+    def __init__(self, host: str, port: int):
+        from openpi_client import websocket_client_policy
+
+        self._client = websocket_client_policy.WebsocketClientPolicy(host=host, port=port)
+        logging.info(
+            "[remote_pi05] connected to %s:%s, server metadata: %s",
+            host,
+            port,
+            self._client.get_server_metadata(),
+        )
+        self._action_queue: deque[np.ndarray] = deque()
+
+    def reset(self) -> None:
+        self._action_queue.clear()
+
+    def select_action(self, observation_frame: dict[str, np.ndarray], task: str) -> np.ndarray:
+        if not self._action_queue:
+            state = _to_numpy_1d(observation_frame[f"{OBS_STR}.state"])
+            image_prefix = f"{OBS_STR}.images."
+            images = {
+                key.removeprefix(image_prefix): observation_frame[key]
+                for key in observation_frame
+                if key.startswith(image_prefix)
+            }
+            result = self._client.infer({"images": images, "state": state, "prompt": task})
+            action_chunk = np.asarray(result["actions"], dtype=np.float32)
+            for row in action_chunk[: self.ACTIONS_PER_QUERY]:
+                self._action_queue.append(row)
+        return self._action_queue.popleft()
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -468,6 +584,7 @@ def record_loop(
     policy: PreTrainedPolicy | None = None,
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
+    remote_pi05: _RemotePi05Policy | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
@@ -510,6 +627,8 @@ def record_loop(
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
+    elif remote_pi05 is not None:
+        remote_pi05.reset()
 
     timestamp = 0
     loop_step = 0
@@ -537,7 +656,7 @@ def record_loop(
         obs_processed = robot_observation_processor(obs)
 
         source_item = None
-        if policy is not None or dataset is not None:
+        if policy is not None or remote_pi05 is not None or dataset is not None:
             if obs_source_dataset is not None:
                 source_item = obs_source_dataset[loop_step]
                 observation_frame = _source_item_to_observation_frame(
@@ -628,6 +747,13 @@ def record_loop(
                         gt_np.shape,
                     )
 
+        elif remote_pi05 is not None:
+            # Deliberately ignore policy_input_resize here and send raw camera-resolution
+            # images, matching deploy_pi05_remote_xarm.py's client: the openpi server applies
+            # its own resize/pad preprocessing, which may not match lerobot's client-side resize.
+            action_row = remote_pi05.select_action(observation_frame, single_task)
+            act_processed_policy: RobotAction = _pi05_action_row_to_robot_action(action_row)
+
         elif policy is None and isinstance(teleop, Teleoperator):
             act = teleop.get_action()
 
@@ -650,7 +776,7 @@ def record_loop(
             continue
 
         # Applies a pipeline to the action, default is IdentityProcessor
-        if policy is not None and act_processed_policy is not None:
+        if (policy is not None or remote_pi05 is not None) and act_processed_policy is not None:
             action_values = act_processed_policy
             robot_action_to_send = robot_action_processor((act_processed_policy, obs))
         else:
@@ -667,7 +793,7 @@ def record_loop(
             # observation in the same coordinate frame and avoids the GELLO-xArm
             # offset problem.  For policy deployment the predicted action is
             # already in robot frame, so use it directly.
-            if policy is not None:
+            if policy is not None or remote_pi05 is not None:
                 action_to_record = action_values
             else:
                 # Re-read robot state right after the command so the recorded
@@ -709,7 +835,7 @@ def _selection_grid_path(initial_states_dir: str | Path, object_name: str) -> Pa
 def load_initial_state_contours(
     initial_states_dir: str | Path | None = None,
     object_name: str = "mug",
-) -> list:
+) -> tuple[list, tuple[int, int] | None]:
     """
     Load per-episode object contours from masks generated by initial_states_overlay.py.
 
@@ -723,8 +849,14 @@ def load_initial_state_contours(
             segmentation prompts (default ``"mug"``).
 
     Returns:
-        list_of_contours – list (one entry per episode, sorted by episode
-        index) of ``list[np.ndarray]`` contour arrays.
+        (list_of_contours, mask_size) where list_of_contours is a list (one
+        entry per episode, sorted by episode index) of ``list[np.ndarray]``
+        contour arrays, and mask_size is the ``(height, width)`` of the mask
+        images the contours were extracted from (e.g. ``(224, 224)`` when the
+        dataset backing the masks was resized for training). Contour pixel
+        coordinates are only meaningful relative to this size and must be
+        rescaled before being drawn onto frames of a different resolution
+        (see ``warmup_contour_alignment``).
     """
     import cv2
     import numpy as np
@@ -750,6 +882,7 @@ def load_initial_state_contours(
 
     list_of_contours = []
     ep_ids = []
+    mask_size: tuple[int, int] | None = None
     for mask_path in first_mask_files:
         ep_id = int(mask_path.stem.replace("ep_", "").replace("_mask", ""))
         ep_ids.append(ep_id)
@@ -761,6 +894,8 @@ def load_initial_state_contours(
             if mask is None:
                 valid_all = False
                 break
+            if mask_size is None:
+                mask_size = (mask.shape[0], mask.shape[1])
             _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if len(contours) == 0:
@@ -771,9 +906,44 @@ def load_initial_state_contours(
 
     logging.info(
         f"Loaded contours for {len(list_of_contours)} episodes "
-        f"(eps {min(ep_ids)}–{max(ep_ids)}) from {', '.join(str(d[1]) for d in object_dirs)}"
+        f"(eps {min(ep_ids)}–{max(ep_ids)}) from {', '.join(str(d[1]) for d in object_dirs)} "
+        f"(mask size {mask_size})"
     )
-    return list_of_contours
+    return list_of_contours, mask_size
+
+
+def select_contours_auto(
+    list_of_contours: list,
+    num_eval_episodes: int,
+) -> tuple[list, list[int]]:
+    """
+    Deterministically pick which training-episode contours to evaluate: the
+    first ceil(num_eval_episodes/2) and last floor(num_eval_episodes/2)
+    episode indices (by index order) among those with a valid contour.
+
+    Deterministic (no UI, no randomness) so repeated runs always evaluate the
+    same set of episodes.
+
+    Returns:
+        (selected_contours, selected_indices), both sorted in ascending
+        episode order, mirroring select_contours_ui's return shape.
+    """
+    valid_indices = [i for i, contours in enumerate(list_of_contours) if contours]
+    if len(valid_indices) < num_eval_episodes:
+        raise ValueError(
+            f"Only {len(valid_indices)} episodes have a valid initial-state contour, "
+            f"but --dataset.num_episodes={num_eval_episodes} were requested."
+        )
+
+    first_half = (num_eval_episodes + 1) // 2
+    second_half = num_eval_episodes - first_half
+    selected_indices = valid_indices[:first_half]
+    if second_half:
+        selected_indices = selected_indices + valid_indices[-second_half:]
+    selected_indices = sorted(set(selected_indices))
+
+    selected_contours = [list_of_contours[i] for i in selected_indices]
+    return selected_contours, selected_indices
 
 
 def select_contours_ui(
@@ -967,6 +1137,9 @@ def warmup_contour_alignment(
     events: dict,
     cam_key: str = "cam_high",
     alpha: float = 0.4,
+    episode_idx: int | None = None,
+    num_episodes: int | None = None,
+    contour_size: tuple[int, int] | None = None,
 ) -> None:
     """
     Live RealSense alignment window: overlay a target contour on the camera feed.
@@ -981,8 +1154,20 @@ def warmup_contour_alignment(
         events: Keyboard event dict from :func:`init_keyboard_listener`.
         cam_key: Camera key in ``robot.cameras`` (default ``"cam_high"``).
         alpha: Blending weight for the contour fill overlay.
+        episode_idx: Current episode index (0-based), shown in the window
+            title and overlay when provided.
+        num_episodes: Total number of episodes to record, shown alongside
+            ``episode_idx`` when provided.
+        contour_size: ``(height, width)`` of the mask image the contour
+            coordinates were extracted from (see
+            :func:`load_initial_state_contours`). If this differs from the
+            live camera frame's resolution (e.g. masks were built from a
+            dataset resized to 224x224 for training, while the camera streams
+            at 640x480), the contour points are rescaled per-axis to line up
+            with the live frame before drawing. ``None`` skips rescaling.
     """
     import cv2
+    import numpy as np
 
     camera = robot.cameras.get(cam_key)
     if camera is None:
@@ -992,11 +1177,22 @@ def warmup_contour_alignment(
         )
         return
 
+    if episode_idx is not None:
+        episode_label = (
+            f"Episode {episode_idx}/{num_episodes - 1}" if num_episodes is not None else f"Episode {episode_idx}"
+        )
+    else:
+        episode_label = None
+
     window_name = "Align Object to Contour"
+    if episode_label is not None:
+        window_name = f"Align Object to Contour - {episode_label}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 640, 480)
 
     logging.info("Align the mug with the contour. Press RIGHT ARROW when ready.")
+
+    scaled_contour = None  # lazily computed once we know the live frame's shape
 
     while not events["right_arrow"] and not events["stop_recording"]:
         try:
@@ -1006,10 +1202,25 @@ def warmup_contour_alignment(
 
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
+        if scaled_contour is None:
+            frame_h, frame_w = frame_bgr.shape[:2]
+            if contour_size is not None and contour_size != (frame_h, frame_w):
+                mask_h, mask_w = contour_size
+                sx, sy = frame_w / mask_w, frame_h / mask_h
+                scaled_contour = [
+                    np.rint(c.astype(np.float64) * (sx, sy)).astype(np.int32) for c in contour
+                ]
+                logging.info(
+                    f"Rescaling alignment contour from mask size {contour_size} "
+                    f"to live frame size {(frame_h, frame_w)} (sx={sx:.3f}, sy={sy:.3f})"
+                )
+            else:
+                scaled_contour = contour
+
         overlay = frame_bgr.copy()
-        cv2.drawContours(overlay, contour, -1, (0, 255, 0), -1)
+        cv2.drawContours(overlay, scaled_contour, -1, (0, 255, 0), -1)
         cv2.addWeighted(overlay, alpha, frame_bgr, 1.0 - alpha, 0, frame_bgr)
-        cv2.drawContours(frame_bgr, contour, -1, (0, 255, 0), 2)
+        cv2.drawContours(frame_bgr, scaled_contour, -1, (0, 255, 0), 2)
 
         h = frame_bgr.shape[0]
         cv2.rectangle(frame_bgr, (0, h - 32), (frame_bgr.shape[1], h), (40, 40, 40), -1)
@@ -1019,6 +1230,14 @@ def warmup_contour_alignment(
             (8, h - 9),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA,
         )
+        if episode_label is not None:
+            cv2.rectangle(frame_bgr, (0, 0), (frame_bgr.shape[1], 28), (40, 40, 40), -1)
+            cv2.putText(
+                frame_bgr,
+                episode_label,
+                (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA,
+            )
 
         cv2.imshow(window_name, frame_bgr)
         cv2.waitKey(30)
@@ -1076,12 +1295,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
         dataset_exists = dataset_root.exists() and (dataset_root / INFO_PATH).is_file()
 
+        if cfg.resume and not dataset_exists:
+            logging.warning(
+                f"Cannot resume: no existing dataset found at {dataset_root}. "
+                "Creating a new dataset there instead."
+            )
+            cfg.resume = False
+
         if cfg.resume:
-            if not dataset_exists:
-                raise FileNotFoundError(
-                    f"Cannot resume: no existing dataset found at {dataset_root}. "
-                    "Remove --resume to create a new dataset."
-                )
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -1102,7 +1323,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     f"Dataset already exists at {dataset_root}. "
                     "Use --resume=true to continue recording."
                 )
-            sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
+            sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy or cfg.policy_remote_pi05)
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,
@@ -1120,6 +1341,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
         preprocessor = None
         postprocessor = None
+        remote_pi05 = None
+        if cfg.policy_remote_pi05 is not None:
+            host, port = _parse_host_port(cfg.policy_remote_pi05)
+            remote_pi05 = _RemotePi05Policy(host, port)
         if cfg.policy is not None:
             policy_dataset_stats = (
                 obs_reference_dataset.meta.stats
@@ -1146,17 +1371,29 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         list_of_contours = None
         selected_contours = None
         selected_episode_indices = None
-        if cfg.select and cfg.policy is not None:
-            list_of_contours = load_initial_state_contours(
+        contour_mask_size = None
+        if cfg.select and (cfg.policy is not None or cfg.policy_remote_pi05 is not None):
+            list_of_contours, contour_mask_size = load_initial_state_contours(
                 initial_states_dir=cfg.initial_states_dir,
                 object_name=cfg.object_name,
             )
-            selected_contours, selected_episode_indices = select_contours_ui(
-                list_of_contours,
-                cfg.dataset.num_episodes,
-                initial_states_dir=cfg.initial_states_dir,
-                object_name=cfg.object_name,
-            )
+            if cfg.select_interactive:
+                selected_contours, selected_episode_indices = select_contours_ui(
+                    list_of_contours,
+                    cfg.dataset.num_episodes,
+                    initial_states_dir=cfg.initial_states_dir,
+                    object_name=cfg.object_name,
+                )
+            else:
+                selected_contours, selected_episode_indices = select_contours_auto(
+                    list_of_contours,
+                    cfg.dataset.num_episodes,
+                )
+                logging.info(
+                    "Auto-selected %s initial-state episodes (first/last half): %s",
+                    len(selected_episode_indices),
+                    selected_episode_indices,
+                )
             if not selected_contours:
                 logging.warning("No episodes selected, exiting.")
                 return dataset
@@ -1197,11 +1434,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             return source_dataset
 
         with VideoEncodingManager(dataset):
-            recorded_episodes = 0
+            recorded_episodes = dataset.num_episodes if cfg.resume else 0
             # State machine: WARMUP <-> RECORDING (ALOHA-style)
             state = "WARMUP"
             move_to_initial_pose_on_right_arrow = (
-                isinstance(robot, XarmFollower) and _DEFAULT_RECORD_POLICY_CHECKPOINT is not None
+                isinstance(robot, XarmFollower) and bool(_DEFAULT_RECORD_POLICY_CHECKPOINT)
             )
 
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
@@ -1229,6 +1466,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         events["exit_early"] = False
                         warmup_contour_alignment(
                             robot, warmup_contour, events,
+                            episode_idx=recorded_episodes,
+                            num_episodes=cfg.dataset.num_episodes,
+                            contour_size=contour_mask_size,
                         )
                         if events["stop_recording"]:
                             break
@@ -1244,7 +1484,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         # During deployment (policy provided) do NOT follow the GELLO –
                         # the robot should hold its current position until recording
                         # begins and the policy takes over.
-                        warmup_teleop = None if policy is not None else teleop
+                        warmup_teleop = None if (policy is not None or remote_pi05 is not None) else teleop
                         record_loop(
                             robot=robot,
                             events=events,
@@ -1306,6 +1546,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         policy=policy,
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
+                        remote_pi05=remote_pi05,
                         dataset=dataset,
                         control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
@@ -1373,8 +1614,54 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     return dataset
 
 
+def _run_all_policy_checkpoints(policy_paths: list[str]) -> None:
+    """Re-run this script once per entry in _DEFAULT_RECORD_POLICY_CHECKPOINT, one full
+    recording session each.
+
+    Sets --policy.path explicitly for each checkpoint, so each session derives its own
+    checkpoint-specific dataset.root (via _extract_checkpoint_name / policy.type in
+    RecordConfig.__post_init__), just like a single --policy.path run would.
+    """
+    base_argv = [a for a in sys.argv[1:] if not a.startswith("--policy.path=")]
+
+    for i, policy_path in enumerate(policy_paths, start=1):
+        print(
+            f"\n{'=' * 70}\n[CHECKPOINTS] Running checkpoint {i}/{len(policy_paths)}: "
+            f"{policy_path}\n{'=' * 70}\n",
+            flush=True,
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "lerobot.scripts.lerobot_record",
+            *base_argv,
+            f"--policy.path={policy_path}",
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(
+                f"[CHECKPOINTS] Checkpoint {policy_path!r} exited with code "
+                f"{result.returncode}; stopping remaining checkpoints.",
+                flush=True,
+            )
+            sys.exit(result.returncode)
+
+    print(f"\n[CHECKPOINTS] All {len(policy_paths)} checkpoints completed.\n", flush=True)
+
+
 def main():
     register_third_party_plugins()
+
+    # An explicit --policy.path or --policy_remote_pi05 on the CLI always wins over the
+    # default local-checkpoint list.
+    if (
+        parser.get_path_arg("policy") is None
+        and parser.parse_arg("policy_remote_pi05") is None
+        and len(_DEFAULT_RECORD_POLICY_CHECKPOINT or []) > 1
+    ):
+        _run_all_policy_checkpoints(_DEFAULT_RECORD_POLICY_CHECKPOINT)
+        return
+
     record()
 
 

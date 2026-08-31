@@ -1,6 +1,7 @@
-<mujoco model="xarm7 shoe scene">
-  <include file="xarm7_shoe.xml"/>
-  <include file="shoe.xml"/>
+<mujoco model="xarm7 carton scene">
+  <include file="xarm7_carton.xml"/>
+  <include file="mug.xml"/>
+  <include file="carton.xml"/>
 
   <statistic center="0.2 0 0.4" extent=".65"/>
 
@@ -22,6 +23,8 @@
     <!-- All positions are in MuJoCo world frame: origin at (0,0,0), Z up. -->
     <light pos="0 0 1.5" dir="0 0 -1" directional="true" castshadow="false"
            diffuse="0.5 0.5 0.5" specular="0 0 0"/>
+    <geom type="cylinder" size=".06 .06" pos="0 0 .06" rgba="1 1 1 1"/>
+
     <!-- Small table under the robot base: flat top + 4 black legs near the corners. -->
     <body name="robot_table" pos="-0.1100 0.0050 0.0000" euler="0.0000 0.0000 -0.0349">
       <geom name="robot_table_top" type="box" size="0.2 0.59 0.02" pos="0 0 -0.02" rgba="0.847 0.506 0.318 1"/>
@@ -32,7 +35,7 @@
       <geom name="robot_table_ledger" type="cylinder" size="0.02" fromto="0.17 0.50 -0.08 0.17 -0.50 -0.08" rgba="0 0 0 1"/>
     </body>
 
-    <body name="table" pos="0.9700 0.0000 -0.0950" euler="0.0000 0.0000 -0.0524">
+    <body name="table" pos="0.9700 0.0000 -0.0950" euler="0.0000 0.0000 -0.0349">
       <geom name="table" type="box" size="0.8 1.5 0.05"
             rgba="0 0 0 1"
             friction="2 0.05 0.01"
@@ -40,15 +43,17 @@
             solimp="0.95 0.99 0.001"/>
     </body>
 
-    <!-- The mesh's long axis is local Z; rotate it so the shoe lies flat on the table. -->
-    <body name="right_shoe" pos="0.4635 -0.1288 0.0077" quat="0.4121 -0.4588 0.5443 -0.5687">
-      <freejoint name="right_shoe_joint"/>
-      <include file="right_shoe_collision.xml"/>
+    <!-- Placeholder initial pose; both mug and carton get re-posed per episode via
+         visual_match/obj_calibration_mujoco.py --task pouring (they carry various
+         initial (x, y) placements across recordings). -->
+    <body name="mug" pos="0.5500 -0.1000 -0.0439" euler="0.0000 0.0000 -1.5533">
+      <freejoint name="mug_joint"/>
+      <include file="mug_collision.xml"/>
     </body>
 
-    <!-- Fixed target shoe, analogous to the saucer in the place_mug task. -->
-    <body name="left_shoe" pos="0.5000 0.2350 0.0077"  quat="0.4828 -0.5259 0.4798 -0.5100">
-      <include file="left_shoe_collision.xml"/>
+    <body name="carton" pos="0.4000 0.1500 0.0214" euler="0.0000 0.0000 0.0000">
+      <freejoint name="carton_joint"/>
+      <include file="carton_collision.xml"/>
     </body>
 
     <!-- Stationary camera: pose overridden at runtime from visual_match/configs/stationary_cam.json -->

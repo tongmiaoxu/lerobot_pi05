@@ -1,0 +1,19 @@
+<!-- Shared carton mesh assets and collision defaults.
+     Include at the <mujoco> level in any scene that uses the carton. -->
+<mujoco>
+  <default>
+    <default class="carton_collision">
+      <geom material="carton_collision_mat" mass="0.05"
+            friction="50.0 5.0 0.5" condim="6" priority="1"
+            solref="0.002 1" solimp="0.99 0.9999 0.001" group="3"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture type="2d" name="carton_texture" file="assets/carton/material_0.png"/>
+    <material name="carton_visual_mat" texture="carton_texture" specular="0.1" shininess="0.1"/>
+    <material name="carton_collision_mat" rgba="0.2 0.2 0.2 1"/>
+    <mesh name="carton_visual" file="carton/textured_mesh_center_aligned.obj"/>
+    <mesh name="carton_collision" file="carton/textured_mesh_center_aligned_convex.obj"/>
+  </asset>
+</mujoco>

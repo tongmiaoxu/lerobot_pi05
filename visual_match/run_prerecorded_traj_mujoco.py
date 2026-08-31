@@ -129,7 +129,7 @@ def parse_cli() -> Args:
         description="Replay xArm LeRobot dataset in MuJoCo."
     )
     p.add_argument(
-        "--task-id", type=str,
+        "--task", dest="task_id", type=str,
         choices=sorted(get_task_profiles()),
         default=_DEFAULT_RECORD_TASK_ID,
         help="Task ID used to pick the MuJoCo scene XML. The default replay parquet follows this task.",

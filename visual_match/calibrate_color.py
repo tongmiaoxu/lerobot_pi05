@@ -18,10 +18,21 @@ CAMERA = "wrist"
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Fit per-camera sim-to-real color calibration.")
-    parser.add_argument("--task-id", default=_DEFAULT_RECORD_TASK_ID)
+    parser.add_argument("--task", dest="task_id", default=_DEFAULT_RECORD_TASK_ID)
     parser.add_argument("--camera", choices=("stationary", "wrist"), default=CAMERA)
-    parser.add_argument("--segment-prompt", default="floor,book,gripper")
-    parser.add_argument("--segment-weight", default="0.99,0.99,0.99")
+    parser.add_argument("--segment-prompt", default="floor,gripper")
+    parser.add_argument("--segment-weight", default="0.5,1")
+    parser.add_argument(
+        "--void-threshold",
+        type=int,
+        default=8,
+        help=(
+            "Source (gs_renders) pixels with all channels below this value (0-255) are treated as "
+            "unreconstructed Gaussian-Splat void and protected from the brightness-based sample "
+            "weighting (which would otherwise starve the fit of dark-background samples) and from "
+            "segmentation-based down-weighting."
+        ),
+    )
     parser.add_argument(
         "--max-images",
         type=int,
@@ -74,11 +85,18 @@ def _get_aug(x: np.ndarray, add_ones: bool = True) -> np.ndarray:
     return np.hstack([x ** 2, x])
 
 
-def _solve_from_samples(S, R, spatial_weights=None, spatial_mask=None):
+def _solve_from_samples(S, R, spatial_weights=None, spatial_mask=None, protect_mask=None):
     S_aug = _get_aug(S)
 
     weight = np.linalg.norm(R, axis=1) ** 1.0  # NOTE: tunable parameter
     weight = weight / np.max(weight)
+    if protect_mask is not None and protect_mask.any():
+        # This brightness weighting systematically discounts dark targets (e.g. a
+        # large, fairly uniform dark background). Left unprotected, that silently
+        # starves the fit of the samples needed to anchor the bias term to the
+        # correct (dark) color, and the whole frame drifts toward a brighter
+        # "compromise" tone once other, brighter pixels dominate the fit instead.
+        weight[protect_mask] = 1.0
     S_aug = S_aug * weight[:, None]
     R = R * weight[:, None]
 
@@ -200,16 +218,32 @@ def main():
     )
     spatial_w_list = []
     spatial_mask_list = []
-    for ref_img_path in ref_img_paths:
+    void_mask_list = []
+    total_void_pct = []
+    for src_img_path, ref_img_path in zip(src_img_paths, ref_img_paths):
         ref_img_rgb = np.array(Image.open(ref_img_path).convert("RGB"))
+        src_img_rgb = np.array(Image.open(src_img_path).convert("RGB"))
         w_img = np.ones((image_height, image_width), dtype=np.float64)
         m_img = np.zeros((image_height, image_width), dtype=bool)
+
+        # Gaussian-Splat "void": source render has no reconstructed color here
+        # (e.g. unmodeled dark tabletop), so it's a large, fairly consistent dark
+        # patch in every frame. It must stay OUT of the segmentation-based
+        # up/down-weighting below (handled separately via protect_mask in
+        # _solve_from_samples) so it isn't re-suppressed after being protected
+        # from the brightness-based initial weight.
+        void_mask = np.all(src_img_rgb < args.void_threshold, axis=-1)
+        total_void_pct.append(void_mask.mean() * 100)
+        void_mask_list.append(void_mask.ravel())
+
         line_parts: list[str] = []
         for prompt, seg_w in zip(prompts, SEGMENT_WEIGHT):
             seg_mask = segment_object_mask(ref_img_rgb, text_prompt=prompt)
             if seg_mask is not None and seg_mask.any():
-                w_img[seg_mask] = np.minimum(w_img[seg_mask], seg_w)
-                m_img[seg_mask] = True
+                seg_mask = seg_mask & ~void_mask
+                if seg_mask.any():
+                    w_img[seg_mask] = np.minimum(w_img[seg_mask], seg_w)
+                    m_img[seg_mask] = True
                 pct = seg_mask.sum() / seg_mask.size * 100
                 line_parts.append(f"{prompt!r} {pct:.1f}%→{seg_w}")
         base = os.path.basename(ref_img_path)
@@ -221,15 +255,23 @@ def main():
         spatial_mask_list.append(m_img.ravel())
     spatial_w_flat = np.concatenate(spatial_w_list)
     spatial_mask_flat = np.concatenate(spatial_mask_list)
+    void_mask_flat = np.concatenate(void_mask_list)
     seg_pct = np.mean(spatial_mask_flat) * 100
     print(
         f"[INFO] Spatial weight: {seg_pct:.1f}% of pixels overridden "
         f"(per-class weights {list(zip(prompts, SEGMENT_WEIGHT))})"
     )
+    print(
+        f"[INFO] GS void (source pixels < {args.void_threshold}/255, protected from "
+        f"brightness down-weighting so the bias term still anchors to it): "
+        f"avg {np.mean(total_void_pct):.1f}% per frame (min {np.min(total_void_pct):.1f}%, "
+        f"max {np.max(total_void_pct):.1f}%)"
+    )
 
     A, b, w = _solve_from_samples(pixel_src, pixel_ref,
                                    spatial_weights=spatial_w_flat,
-                                   spatial_mask=spatial_mask_flat)
+                                   spatial_mask=spatial_mask_flat,
+                                   protect_mask=void_mask_flat)
 
     print("Color correction matrix A:", A)
     print("Color correction bias b:", b)
