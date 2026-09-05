@@ -38,8 +38,15 @@ def get_segment_models(device: str):
     )
 
 
-def segment_object_mask(image_bgr, text_prompt: str = "plush toy"):
-    """Segment an object in a BGR image using Grounding-DINO + SAM2."""
+def segment_candidate_masks(
+    image_bgr,
+    text_prompt: str = "plush toy",
+    box_threshold: float = 0.325,
+    text_threshold: float = 0.3,
+):
+    """Like segment_object_mask(), but returns each detected object's mask separately
+    instead of merging every match into one mask. Useful when a text prompt may match
+    more than one object in the scene and the caller needs to disambiguate."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor, grounding_model, image_predictor = get_segment_models(device)
 
@@ -54,14 +61,14 @@ def segment_object_mask(image_bgr, text_prompt: str = "plush toy"):
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        threshold=0.325,
-        text_threshold=0.3,
+        threshold=box_threshold,
+        text_threshold=text_threshold,
         target_sizes=[image_pil.size[::-1]],
     )
 
     input_boxes = results[0]["boxes"].cpu().numpy()
     if len(input_boxes) == 0:
-        return None
+        return []
 
     image_predictor.set_image(np.array(image_pil.convert("RGB")))
     masks_list = []
@@ -76,10 +83,22 @@ def segment_object_mask(image_bgr, text_prompt: str = "plush toy"):
             mask = mask.squeeze(1)
         mask = mask.squeeze(0)
         masks_list.append(mask.astype(bool))
+    return masks_list
 
+
+def segment_object_mask(
+    image_bgr,
+    text_prompt: str = "plush toy",
+    box_threshold: float = 0.325,
+    text_threshold: float = 0.3,
+):
+    """Segment an object in a BGR image using Grounding-DINO + SAM2. If the prompt
+    matches multiple objects, their masks are merged into one."""
+    masks_list = segment_candidate_masks(
+        image_bgr, text_prompt=text_prompt, box_threshold=box_threshold, text_threshold=text_threshold
+    )
     if not masks_list:
         return None
-
     return np.logical_or.reduce(np.stack(masks_list, axis=0), axis=0)
 
 

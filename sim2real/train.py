@@ -320,6 +320,50 @@ def write_split(
         json.dump(prompts, handle, indent=2)
 
 
+def write_symlinked_split(pairs: list[tuple[Path, Path]], dataset_dir: Path, split: str) -> None:
+    """Like write_split(), but symlinks the source files instead of copying+re-encoding them.
+    For read-only eval sets: results always reflect the live source directory, and nothing
+    goes stale if the source is edited/renumbered after the fact (no `_prompts.json` either,
+    since the vendored pix2pix trainer never reads it — that file is a pix2pix-turbo artifact).
+    """
+    input_dir = dataset_dir / f"{split}_A"
+    output_dir = dataset_dir / f"{split}_B"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, (sim_path, real_path) in enumerate(pairs):
+        filename = f"{idx:06d}.png"
+        (input_dir / filename).symlink_to(sim_path.resolve())
+        (output_dir / filename).symlink_to(real_path.resolve())
+
+
+def prepare_test_only_dataset(
+    sim_dir: Path,
+    real_dir: Path,
+    camera: str | None,
+    dataset_dir: Path,
+    overwrite: bool,
+) -> int:
+    """Build a `test_A`/`test_B` pix2pix dataset directly from a sim/real directory pair,
+    with no train/val split. For evaluating on data that was never part of any training run's
+    split (e.g. a dedicated data_val_set_<task> holdout), as opposed to `prepare_dataset()`'s
+    train/val split carved out of the same collection used for training.
+    """
+    pairs = match_pairs(sim_dir, real_dir)
+    pairs = filter_pairs_by_camera(pairs, camera)
+
+    if dataset_dir.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"Dataset directory already exists: {dataset_dir}. Use --overwrite to replace it."
+            )
+        shutil.rmtree(dataset_dir)
+
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    write_symlinked_split(pairs, dataset_dir, "test")
+    return len(pairs)
+
+
 def build_image_prep(resolution: int) -> str:
     """Tag passed to training_utils.build_transform; supports any N via resize_NxN."""
     if resolution <= 0:
@@ -346,7 +390,7 @@ def prepare_dataset(args: argparse.Namespace) -> tuple[int, int]:
     return len(train_pairs), len(val_pairs)
 
 
-def launch_training(args: argparse.Namespace) -> None:
+def check_cuda() -> None:
     import torch
 
     if not torch.cuda.is_available():
@@ -372,6 +416,10 @@ def launch_training(args: argparse.Namespace) -> None:
             f"Original error: {err!r}\n"
         )
         raise SystemExit(1) from err
+
+
+def launch_training(args: argparse.Namespace) -> None:
+    check_cuda()
 
     image_prep = build_image_prep(args.resolution)
     train_argv = [

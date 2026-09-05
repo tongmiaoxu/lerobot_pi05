@@ -22,6 +22,10 @@ wandb>=0.20.0,<0.22.0
 # lerobot 0.4.x expects headless OpenCV in many setups
 opencv-python-headless>=4.9.0,<4.13.0
 
+# pix2pix training (vendored sim2real/pix2pix/, from junyanz/pytorch-CycleGAN-and-pix2pix)
+# additionally needs:
+dominate
+
 # OpenAI CLIP (`import clip`): install from https://github.com/openai/CLIP (see upstream img2img-turbo requirements.txt)
 #   pip install "git+https://github.com/openai/CLIP.git"
 #
