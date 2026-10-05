@@ -186,3 +186,13 @@ data*/
 *.pkl
 *.npz
 *.png
+### Project-local ###
+# model weights (SAM2 large: weights/sam2/download_ckpts.sh)
+weights/
+# MuJoCo auto-generated dumps
+MJMODEL.TXT
+mjmodel.mjb
+MUJOCO_LOG.TXT
+# archives
+*.zip
+*.tar.gz
