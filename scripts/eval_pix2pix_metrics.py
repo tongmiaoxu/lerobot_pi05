@@ -72,6 +72,7 @@ from pix2pix_mask_common import (  # noqa: E402
     default_overrides_path,
     find_triplet_indices,
     get_override_candidate_index,
+    get_override_mask,
     get_override_point,
     is_override_missing,
     load_overrides,
@@ -151,13 +152,14 @@ def main() -> int:
     }
 
     def get_mask(image_bgr, obj_name, idx, role):
+        override_mask = get_override_mask(overrides, idx, obj_name, role)
         override_point = get_override_point(overrides, idx, obj_name, role)
         override_missing = is_override_missing(overrides, idx, obj_name, role)
         override_candidate_index = get_override_candidate_index(overrides, idx, obj_name, role)
         mask, n, src, _ = resolve_mask(
             image_bgr, obj_name, args.box_threshold, args.text_threshold,
             override_point=override_point, override_missing=override_missing,
-            override_candidate_index=override_candidate_index,
+            override_candidate_index=override_candidate_index, override_mask=override_mask,
         )
         return mask, n, src
 

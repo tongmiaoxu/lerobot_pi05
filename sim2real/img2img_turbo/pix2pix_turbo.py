@@ -301,6 +301,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         return output_image
 
     def save_model(self, outf):
+        os.makedirs(os.path.dirname(outf), exist_ok=True)
         sd = {}
         sd["unet_lora_target_modules"] = self.target_modules_unet
         sd["vae_lora_target_modules"] = self.target_modules_vae

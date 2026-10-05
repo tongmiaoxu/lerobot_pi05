@@ -6,6 +6,7 @@ pass in one script is reused by the other, and the DAVIS J/F mask-comparison met
 """
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -18,6 +19,19 @@ import sys
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "visual_match"))
 from segmentation_utils import segment_candidate_masks, segment_point_mask  # noqa: E402
+
+
+# Single source of truth for each task's pix2pix `--name` prefix -> Grounding-DINO --text-prompt.
+# Order here is the canonical review/report order used throughout this project (see
+# .claude/skills/eval-turbo-checkpoint/SKILL.md's task metadata table, which must match this).
+# Used by scripts/review_pix2pix_masks.py's --checkpoint-dir auto-discovery to avoid needing
+# --text-prompt typed out per task/camera result set.
+TASK_PROMPTS: dict[str, str] = {
+    "place_mug": "mug, saucer",
+    "pick_shoe": "shoe",
+    "book_shelving": "book",
+    "pouring": "juice, mug",
+}
 
 
 def find_triplet_indices(images_dir: Path) -> list[str]:
@@ -71,6 +85,43 @@ def get_override_candidate_index(overrides: dict, idx: str, obj_name: str, role:
     no fresh SAM2 point-prompt needed."""
     index = overrides.get(idx, {}).get(obj_name, {}).get(role, {}).get("candidate_index")
     return int(index) if index is not None else None
+
+
+def _encode_mask(mask: np.ndarray) -> dict:
+    ok, buf = cv2.imencode(".png", (mask.astype(np.uint8) * 255))
+    if not ok:
+        raise RuntimeError("Failed to PNG-encode mask override")
+    return {"png_b64": base64.b64encode(buf.tobytes()).decode("ascii"), "shape": list(mask.shape)}
+
+
+def _decode_mask(blob: dict) -> np.ndarray:
+    raw = base64.b64decode(blob["png_b64"])
+    arr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    return arr > 127
+
+
+def get_override_mask(overrides: dict, idx: str, obj_name: str, role: str) -> np.ndarray | None:
+    """A reviewer-confirmed mask saved verbatim (as a PNG blob), the current/preferred override
+    kind — unlike `point`/`candidate_index`, this needs no re-detection to reproduce and so can
+    never drift if Grounding-DINO's output for the same image isn't bit-for-bit stable across
+    runs (it usually is, but GPU float nondeterminism occasionally reorders/drops a close-scoring
+    box). Older overrides predating this (still `point`/`candidate_index`/`missing` only) simply
+    have no `mask` key here; callers fall back to re-deriving from those as before."""
+    blob = overrides.get(idx, {}).get(obj_name, {}).get(role, {}).get("mask")
+    return _decode_mask(blob) if blob is not None else None
+
+
+def set_override_mask(
+    overrides: dict, idx: str, obj_name: str, role: str, mask: np.ndarray, point: tuple[int, int] | None = None,
+) -> None:
+    """`point`, if given, is kept alongside the mask (not just the mask alone) so manual-mode's
+    cross-role point borrowing in scripts/review_pix2pix_masks.py keeps working — a role with
+    only a mask on file (e.g. a numbered-candidate pick) has no point for another role to reuse,
+    but a role reviewed by clicking a point does."""
+    entry = {"mask": _encode_mask(mask)}
+    if point is not None:
+        entry["point"] = list(point)
+    overrides.setdefault(idx, {}).setdefault(obj_name, {})[role] = entry
 
 
 def set_override_point(overrides: dict, idx: str, obj_name: str, role: str, point: tuple[int, int]) -> None:
@@ -213,6 +264,7 @@ def resolve_mask(
     override_point: tuple[int, int] | None = None,
     override_missing: bool = False,
     override_candidate_index: int | None = None,
+    override_mask: np.ndarray | None = None,
 ):
     """Get one object mask from `image_bgr`. Returns (mask_or_None, n_candidates, source_tag,
     point_or_None) — `point_or_None` is always None here (kept for call-site symmetry with the
@@ -220,12 +272,18 @@ def resolve_mask(
     created). When Grounding-DINO returns more than one box, this always takes the first
     (highest-confidence) candidate — review the mask_overrides.json workflow in
     scripts/review_pix2pix_masks.py beforehand to fix any frame where that isn't the right box.
+    `override_mask` (a reviewer-saved mask, the current/preferred override kind) is used verbatim
+    with no re-detection when present — checked first since it can never drift. The remaining
+    override kinds are legacy fallbacks for frames saved before mask-caching existed:
     `override_missing=True` (set via review_pix2pix_masks.py's 'x' key) means a reviewer
     confirmed the object is genuinely absent here — distinct from an unreviewed empty detection,
     which is just "not found" rather than "confirmed absent". `override_candidate_index` (set by
     picking a number key in the reviewer) re-selects that exact candidate from a fresh detection
-    pass instead of taking #0 — detection is deterministic, so this reproduces the exact mask
-    the reviewer saw, rather than re-segmenting a fresh mask from a point."""
+    pass instead of taking #0 — detection is usually but not always bit-stable across runs, so
+    this can occasionally reproduce a different candidate than the one the reviewer actually
+    picked (see get_override_mask)."""
+    if override_mask is not None:
+        return override_mask, -1, "override_mask", None
     if override_missing:
         return None, -1, "override_missing", None
     if override_point is not None:

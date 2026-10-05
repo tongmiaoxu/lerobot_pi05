@@ -242,7 +242,7 @@ Go to `task_profiles.py` to edit task configs.
 
 Collect dataset (`_DEFAULT_RECORD_POLICY_CHECKPOINT = None` in `lerobot_record.py`):
 ```bash
-python tools/gello_get_offset.py --port /dev/ttyUSB0
+# python tools/gello_get_offset.py --port /dev/ttyUSB0
 lerobot-record
 ```
 Make a copy of the raw dataset before downsampling (DS), then copy it to the training cluster:
@@ -461,4 +461,33 @@ python tools/query_gpt_image.py \
   --input-image data_place_mug_copy/gs_render/stationary/frame_0000.png \
   --style-image data_place_mug_copy/real_captures/stationary/frame_0000.png \
   --prompt "Transfer style while preserving geometry."
+```
+
+### Sim2real eval (turbo checkpoint on held-out `data_val_set_<task>`)
+Automated by the `eval-turbo-checkpoint` Claude skill (`.claude/skills/eval-turbo-checkpoint/SKILL.md`). Text prompts per task: place_mug `"mug, saucer"`, pick_shoe `"shoe"`, book_shelving `"book"`, pouring `"juice, mug"`.
+```bash
+# 1. inference -> outputs/<out>/results/<name>/test_latest/images/{idx}_{real_A,fake_B,real_B}.png
+#    (pix2pix baseline: sim2real/eval_pix2pix.py, same args minus --checkpoint)
+python sim2real/eval_turbo.py \
+  --sim-dir data_val_set_<task>/<camera>/gs_renders \
+  --real-dir data_val_set_<task>/<camera>/real_captures \
+  --dataset-dir outputs/<out>/eval_dataset \
+  --checkpoint outputs/<out>/checkpoints/model_30001.pkl \
+  --output-dir outputs/<out> --name <name>
+
+# 2. reuse already-reviewed real_A/real_B masks from a baseline run (only fake_B needs review)
+python scripts/seed_turbo_overrides.py --src <baseline>/mask_overrides.json \
+  --dst outputs/<out>/results/<name>/test_latest/mask_overrides.json
+
+# 3. manual mask review (writes mask_overrides.json); --checkpoint-dir reviews every task/camera set
+python scripts/review_pix2pix_masks.py --checkpoint-dir outputs/<out>
+python scripts/review_pix2pix_masks.py --images-dir outputs/<out>/results/<name>/test_latest/images --text-prompt "<prompt>"
+
+# 4. freeze reviewed masks (deterministic re-runs) + grid for a final visual check
+python scripts/freeze_pix2pix_masks.py --images-dir <images-dir> --text-prompt "<prompt>"
+python scripts/make_mask_grid.py --images-dir <images-dir> --text-prompt "<prompt>" --role fake_B \
+  --out data_mask/<out>/<name>_fake_B.png
+
+# 5. metrics -> metrics.json (report lpips.mean, jf_af_avg_objects.mean, missing_masks)
+python scripts/eval_pix2pix_metrics.py --images-dir <images-dir> --text-prompt "<prompt>"
 ```
